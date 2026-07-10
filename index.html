@@ -1,6 +1,6 @@
 <!DOCTYPE html>
 <html>
-  <head><title>Wasm Bare Metal WebGL</title></head>
+  <head><title>Wasm 2D Bouncing Balls</title></head>
   <body style="margin: 0; background: #111; display: flex; justify-content: center; align-items: center; height: 100vh;">
     <canvas id="canvas" width="600" height="600"></canvas>
     
@@ -8,22 +8,19 @@
       const canvas = document.getElementById('canvas');
       const gl = canvas.getContext('webgl');
 
-      // Shaders
+      // 2D Shader Setup
       const vsSource = `
             attribute vec3 position;
-            attribute vec3 color;
-            varying vec3 vColor;
             uniform mat4 mvp;
             void main() {
                 gl_Position = mvp * vec4(position, 1.0);
-                vColor = color;
             }
         `;
       const fsSource = `
             precision mediump float;
-            varying vec3 vColor;
+            uniform vec3 uColor;
             void main() {
-                gl_FragColor = vec4(vColor, 1.0);
+                gl_FragColor = vec4(uColor, 1.0);
             }
         `;
 
@@ -41,73 +38,65 @@
       gl.useProgram(program);
 
       const mvpLocation = gl.getUniformLocation(program, "mvp");
+      const colorLocation = gl.getUniformLocation(program, "uColor");
+      const posAttrib = gl.getAttribLocation(program, "position");
       
-      gl.enable(gl.DEPTH_TEST);
-      gl.clearColor(1.0, 1.0, 1.0, 1.0);
+      gl.enableVertexAttribArray(posAttrib);
+      gl.clearColor(0.05, 0.05, 0.05, 1.0);
 
-      // Engine
       let wasmInstance = null;
+      let circleVBO, boxVBO;
 
       const importObject = {
-          env: {
-              js_sin: Math.sin,
-			  js_cos: Math.cos,
-			  js_log_string: (charPtr) => {
-				  const memory = new Uint8Array(wasmInstance.exports.memory.buffer);
-				  let str = "";
-				  while (memory[charPtr] !== 0) {
-					  str += String.fromCharCode(memory[charPtr]);
-					  charPtr++;
-				  }
-				  console.log("C String:", str);
+		  env: {
+			  gl_clear: () => {
+				  gl.clear(gl.COLOR_BUFFER_BIT);
 			  },
-			  js_log_float: (value) => {
-				  console.log("C Float:", value);
+			  gl_set_color: (r, g, b) => {
+				  gl.uniform3f(colorLocation, r, g, b);
 			  },
-              gl_clear: () => {
-                  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
-              },
-              gl_draw_triangles: () => {
-                  gl.drawArrays(gl.TRIANGLES, 0, 36);
-              },
-              gl_update_matrix: (matrixPtr) => {
-                  // Read the 16 floats (4x4 matrix) directly from C memory
-                  const matrix = new Float32Array(wasmInstance.exports.memory.buffer, matrixPtr, 16);
-                  gl.uniformMatrix4fv(mvpLocation, false, matrix);
-              }
-          }
+			  gl_draw_circle: () => {
+				  gl.bindBuffer(gl.ARRAY_BUFFER, circleVBO);
+				  gl.vertexAttribPointer(posAttrib, 3, gl.FLOAT, false, 12, 0);
+				  gl.drawArrays(gl.TRIANGLE_FAN, 0, 18); // Center + 16 segments + 1 closing point
+			  },
+			  gl_draw_box: () => {
+				  gl.bindBuffer(gl.ARRAY_BUFFER, boxVBO);
+				  gl.vertexAttribPointer(posAttrib, 3, gl.FLOAT, false, 12, 0);
+				  gl.drawArrays(gl.LINE_LOOP, 0, 4); // 4 corners
+			  },
+			  gl_update_matrix: (matrixPtr) => {
+				  const matrix = new Float32Array(wasmInstance.exports.memory.buffer, matrixPtr, 16);
+				  gl.uniformMatrix4fv(mvpLocation, false, matrix);
+			  }
+		  }
       };
 
       WebAssembly.instantiateStreaming(fetch('main.wasm'), importObject).then(result => {
-          wasmInstance = result.instance;
-          const exports = wasmInstance.exports;
+		  wasmInstance = result.instance;
+		  const exports = wasmInstance.exports;
 
-          // Upload the vertex data from C memory to WebGL exactly once
-          const vbo = gl.createBuffer();
-          gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-          
-          const vertices = new Float32Array(
-              exports.memory.buffer, 
-              exports.get_vertices(), 
-              exports.get_vertex_byte_size() / 4 // bytes to float count
-          );
-          gl.bufferData(gl.ARRAY_BUFFER, vertices, gl.STATIC_DRAW);
+		  // Tell C to generate the circle/box vertices in its memory
+		  exports.init_engine();
 
-          // Tell WebGL how to read the vertex data (3 floats for pos, 3 for color)
-          const posAttrib = gl.getAttribLocation(program, "position");
-          gl.enableVertexAttribArray(posAttrib);
-          gl.vertexAttribPointer(posAttrib, 3, gl.FLOAT, false, 24, 0);
+		  // Map C Memory to WebGL VBOs
+		  circleVBO = gl.createBuffer();
+		  gl.bindBuffer(gl.ARRAY_BUFFER, circleVBO);
+		  const circleData = new Float32Array(exports.memory.buffer, exports.get_circle_vertices(), 18 * 3);
+		  gl.bufferData(gl.ARRAY_BUFFER, circleData, gl.STATIC_DRAW);
 
-          const colAttrib = gl.getAttribLocation(program, "color");
-          gl.enableVertexAttribArray(colAttrib);
-          gl.vertexAttribPointer(colAttrib, 3, gl.FLOAT, false, 24, 12);
+		  boxVBO = gl.createBuffer();
+		  gl.bindBuffer(gl.ARRAY_BUFFER, boxVBO);
+		  const boxData = new Float32Array(exports.memory.buffer, exports.get_box_vertices(), 4 * 3);
+		  gl.bufferData(gl.ARRAY_BUFFER, boxData, gl.STATIC_DRAW);
 
-          // Start the Render Loop dictated by C
-          function loop(time) {
-              exports.render_frame(time);
+		  // Render Loop
+		  function loop(time) {
+			  exports.render_frame(time);
 			  requestAnimationFrame(loop);
-          }
-          requestAnimationFrame(loop);
+		  }
+
+		  requestAnimationFrame(loop);
       });
     </script>
   </body>
