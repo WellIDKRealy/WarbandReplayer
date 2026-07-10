@@ -2,6 +2,7 @@
 # Wasm Bare-Metal WebGL Cube
 A minimal project demonstrating how to render a rotating 3D cube using WebGL and bare-metal WebAssembly (Wasm) written in C. 
 This project bypasses heavy runtimes like Emscripten , establishing a direct pipeline between C memory, JavaScript, and the GPU. It uses the [`cglm`](https://github.com/recp/cglm) library for 3D math operations. 
+[Click here to view the live demo](https://wellidkrealy.github.io/WebGL-Cube/)
 ## Project Structure
 - [`index.html`](index.html): Initializes the WebGL context, streams and compiles the WebAssembly binary, exposes JS/WebGL hooks to C, and manages the animation render loop.
 - [`main.c`](main.c): Contains the 3D cube vertex data, rotation/projection logic, and orchestrates the frame calculations.
