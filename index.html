@@ -1,34 +1,142 @@
 <!DOCTYPE html>
 <html>
-  <head><title>Wasm 2D Bouncing Balls</title></head>
-  <body style="margin: 0; background: #111; display: flex; justify-content: center; align-items: center; height: 100vh;">
-    <canvas id="canvas" width="600" height="600"></canvas>
+  <head>
+    <title>Wasm Bare Metal WebGL Simulation</title>
+    <style>
+      body, html {
+          margin: 0; padding: 0;
+          width: 100vw; height: 100vh;
+          overflow: hidden; background: #050505;
+          position: relative; font-family: 'Courier New', Courier, monospace;
+      }
+      canvas {
+          position: absolute; top: 0; left: 0;
+          width: 100%; height: 100%; display: block;
+      }
+	  #center-crosshair {
+        position: absolute;
+        top: 50%; left: 50%;
+        width: 20px; height: 20px;
+        transform: translate(-50%, -50%);
+        pointer-events: none;
+        z-index: 4;
+      }
+      #center-crosshair::before, #center-crosshair::after {
+        content: '';
+        position: absolute;
+        background: rgba(180, 0, 0, 0.7); /* Subtle crimson target marker */
+      }
+      #center-crosshair::before {
+        top: 9px; left: 0; width: 20px; height: 2px;
+      }
+      #center-crosshair::after {
+        top: 0; left: 9px; width: 2px; height: 20px;
+      }
+      #log-box {
+          position: absolute; bottom: 20px; left: 20px;
+          color: #00ff00; background: rgba(0, 0, 0, 0.85);
+          padding: 12px; border: 1px solid #333; border-radius: 4px;
+          pointer-events: none; font-size: 13px; line-height: 1.4;
+          width: 320px; min-height: 90px; white-space: pre-wrap;
+          box-shadow: 0 4px 12px rgba(0,0,0,0.6); z-index: 5;
+      }
+	  #reset-btn {
+        position: absolute; top: 20px; right: 20px;
+        background: #111; border: 1px solid #444; color: #fff;
+        padding: 8px 16px; cursor: pointer; border-radius: 4px;
+        font-family: inherit; z-index: 5; display: none; font-size: 12px;
+      }
+      #reset-btn:hover { background: #222; border-color: #00ff00; color: #00ff00; }
+      .overlay {
+          position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+          background: rgba(10, 10, 10, 0.95);
+          display: flex; justify-content: center; align-items: center;
+          z-index: 10; color: #fff;
+      }
+      .card {
+          background: #111; border: 1px solid #333;
+          padding: 30px; border-radius: 6px; text-align: center;
+          box-shadow: 0 10px 30px rgba(0,0,0,0.7); width: 420px;
+      }
+      .card h2 { margin-top: 0; color: #00ff00; font-size: 18px; }
+      .card p { color: #aaa; font-size: 13px; line-height: 1.5; }
+      .file-btn {
+          margin-top: 15px; display: inline-block; background: #222;
+          border: 1px solid #555; color: #fff; padding: 10px 20px;
+          cursor: pointer; border-radius: 4px; font-family: inherit;
+      }
+      .file-btn:hover { background: #333; border-color: #00ff00; }
+      .progress-container {
+          width: 100%; background: #222; border: 1px solid #444;
+          height: 20px; border-radius: 10px; overflow: hidden; margin: 20px 0 10px 0;
+      }
+      .progress-bar {
+          width: 0%; height: 100%; background: #00ff00; transition: width 0.05s ease;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="canvas"></canvas>
+	<div id="center-crosshair"></div>
+    <div id="log-box">System standby.</div>
+	<button id="reset-btn" onclick="triggerReset()">Load Different File</button> ```
+
+    <div id="upload-overlay" class="overlay">
+      <div class="card">
+        <h2>Simulation Configuration</h2>
+        <p>Please select a configuration file (<code>balls.txt</code>) specifying initial layout positions.</p>
+        <input type="file" id="file-input" accept=".txt" style="display:none;">
+        <button class="file-btn" onclick="document.getElementById('file-input').click()">Choose File</button>
+      </div>
+    </div>
+
+    <div id="loading-overlay" class="overlay" style="display: none;">
+      <div class="card">
+        <h2>Processing Coordinates inside C Engine</h2>
+        <div class="progress-container">
+          <div id="progress-fill" class="progress-bar"></div>
+        </div>
+        <div id="progress-text" style="color: #00ff00; font-size: 14px;">0%</div>
+      </div>
+    </div>
     
     <script>
       const canvas = document.getElementById('canvas');
       const gl = canvas.getContext('webgl');
+      const logBox = document.getElementById('log-box');
+      const uploadOverlay = document.getElementById('upload-overlay');
+      const loadingOverlay = document.getElementById('loading-overlay');
+      const progressFill = document.getElementById('progress-fill');
+      const progressText = document.getElementById('progress-text');
+	  const resetBtn = document.getElementById('reset-btn'); 
 
-      // 2D Shader Setup
-      const vsSource = `
-            attribute vec3 position;
-            uniform mat4 mvp;
-            void main() {
-                gl_Position = mvp * vec4(position, 1.0);
-            }
-        `;
-      const fsSource = `
-            precision mediump float;
-            uniform vec3 uColor;
-            void main() {
-                gl_FragColor = vec4(uColor, 1.0);
-            }
-        `;
+      let currentSimulationState = "AWAITING_FILE"; 
+      let activeLogs = ["Awaiting data config validation..."];
+
+	  
+	  function triggerReset() {
+          document.getElementById('file-input').value = ""; // Clear file selector cache
+          uploadOverlay.style.display = 'flex';
+          loadingOverlay.style.display = 'none';
+          resetBtn.style.display = 'none';
+          currentSimulationState = "AWAITING_FILE";
+          appendToConsoleLog("[System] Reset requested. Awaiting config...");
+      }
+	  
+      function appendToConsoleLog(message) {
+          activeLogs.push(message);
+          if (activeLogs.length > 6) activeLogs.shift();
+          logBox.innerText = activeLogs.join('\n');
+      }
+
+      const vsSource = `attribute vec3 position; uniform mat4 mvp; void main() { gl_Position = mvp * vec4(position, 1.0); }`;
+      const fsSource = `precision mediump float; uniform vec3 uColor; void main() { gl_FragColor = vec4(uColor, 1.0); }`;
 
       function compileShader(type, source) {
-          const shader = gl.createShader(type);
-          gl.shaderSource(shader, source);
-          gl.compileShader(shader);
-          return shader;
+      const shader = gl.createShader(type);
+      gl.shaderSource(shader, source);
+      gl.compileShader(shader);
+      return shader;
       }
 
       const program = gl.createProgram();
@@ -42,62 +150,219 @@
       const posAttrib = gl.getAttribLocation(program, "position");
       
       gl.enableVertexAttribArray(posAttrib);
-      gl.clearColor(0.05, 0.05, 0.05, 1.0);
+      gl.clearColor(1.0, 1.0, 1.0, 1.0);
+
+	  // --- ADD DESMOS INFINITE GRID PROGRAM CAPABILITIES ---
+      const gridVsSource = `
+        attribute vec2 position;
+        varying vec2 screenUV;
+        void main() {
+            screenUV = position;
+            gl_Position = vec4(position, 0.0, 1.0);
+        }
+      `;
+      const gridFsSource = `
+        precision mediump float;
+        varying vec2 screenUV;
+        uniform vec2 u_camOffset;
+        uniform float u_zoom;
+        uniform vec2 u_resolution;
+
+        void main() {
+            float aspect = u_resolution.x / u_resolution.y;
+            // Reconstruct actual world coordinates for this pixel fragment
+            vec2 worldPos = screenUV * vec2(13.5 * aspect, 13.5) / u_zoom + u_camOffset;
+            
+            // Generate dynamic grid densities that scale adaptively with fractional logs
+            float logZoom = log2(u_zoom);
+            float level = floor(logZoom);
+            float f = fract(logZoom);
+            
+            float scale1 = pow(2.0, -level);
+            float scale2 = pow(2.0, -level - 1.0);
+
+            // Compute lines grid distances
+            vec2 grid1 = abs(fract(worldPos / scale1 - 0.5) - 0.5) / (fwidth(worldPos) / scale1);
+            vec2 grid2 = abs(fract(worldPos / scale2 - 0.5) - 0.5) / (fwidth(worldPos) / scale2);
+            
+            float line1 = min(grid1.x, grid1.y);
+            float line2 = min(grid2.x, grid2.y);
+            
+            // Antialias edge lines smoothly
+            float c1 = smoothstep(1.0, 0.0, line1) * 0.08;
+            float c2 = smoothstep(1.0, 0.0, line2) * 0.08;
+            
+            float gridIntensity = mix(c1, c2, f) + c1 * 0.4;
+            
+            // Render subtle low brightness grey gridlines atop white background
+            gl_FragColor = vec4(1.0 - vec3(gridIntensity), 1.0);
+        }
+      `;
+
+      const gridProg = gl.createProgram();
+      gl.attachShader(gridProg, compileShader(gl.VERTEX_SHADER, gridVsSource));
+      gl.attachShader(gridProg, compileShader(gl.FRAGMENT_SHADER, gridFsSource));
+      gl.linkProgram(gridProg);
+
+      const gridPosAttr = gl.getAttribLocation(gridProg, "position");
+      const gridCamLoc = gl.getUniformLocation(gridProg, "u_camOffset");
+      const gridZoomLoc = gl.getUniformLocation(gridProg, "u_zoom");
+      const gridResLoc = gl.getUniformLocation(gridProg, "u_resolution");
+
+      // Full screen quad buffer for grid rendering
+      const quadVBO = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1]), gl.STATIC_DRAW);
 
       let wasmInstance = null;
       let circleVBO, boxVBO;
 
       const importObject = {
-		  env: {
-			  gl_clear: () => {
-				  gl.clear(gl.COLOR_BUFFER_BIT);
-			  },
-			  gl_set_color: (r, g, b) => {
-				  gl.uniform3f(colorLocation, r, g, b);
-			  },
-			  gl_draw_circle: () => {
-				  gl.bindBuffer(gl.ARRAY_BUFFER, circleVBO);
-				  gl.vertexAttribPointer(posAttrib, 3, gl.FLOAT, false, 12, 0);
-				  gl.drawArrays(gl.TRIANGLE_FAN, 0, 18); // Center + 16 segments + 1 closing point
-			  },
-			  gl_draw_box: () => {
-				  gl.bindBuffer(gl.ARRAY_BUFFER, boxVBO);
-				  gl.vertexAttribPointer(posAttrib, 3, gl.FLOAT, false, 12, 0);
-				  gl.drawArrays(gl.LINE_LOOP, 0, 4); // 4 corners
-			  },
-			  gl_update_matrix: (matrixPtr) => {
-				  const matrix = new Float32Array(wasmInstance.exports.memory.buffer, matrixPtr, 16);
-				  gl.uniformMatrix4fv(mvpLocation, false, matrix);
-			  }
-		  }
+      env: {
+      js_sin: Math.sin, js_cos: Math.cos, js_sqrt: Math.sqrt,
+      gl_clear: () => { gl.clear(gl.COLOR_BUFFER_BIT); },
+      gl_set_color: (r, g, b) => { gl.uniform3f(colorLocation, r, g, b); },
+      gl_draw_circle: () => {
+      gl.bindBuffer(gl.ARRAY_BUFFER, circleVBO);
+      gl.vertexAttribPointer(posAttrib, 3, gl.FLOAT, false, 12, 0);
+      gl.drawArrays(gl.TRIANGLE_FAN, 0, 18);
+      },
+      gl_draw_box: () => {
+      gl.bindBuffer(gl.ARRAY_BUFFER, boxVBO);
+      gl.vertexAttribPointer(posAttrib, 3, gl.FLOAT, false, 12, 0);
+      gl.drawArrays(gl.LINE_LOOP, 0, 4);
+      },
+      gl_update_matrix: (matrixPtr) => {
+      const matrix = new Float32Array(wasmInstance.exports.memory.buffer, matrixPtr, 16);
+      gl.uniformMatrix4fv(mvpLocation, false, matrix);
+      },
+      js_log_string: (charPtr) => {
+      const memory = new Uint8Array(wasmInstance.exports.memory.buffer);
+      let str = "";
+      while (memory[charPtr] !== 0) {
+      str += String.fromCharCode(memory[charPtr]);
+      charPtr++;
+      }
+      appendToConsoleLog(str);
+      }
+      }
       };
 
+      function handleResize() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      if (wasmInstance && wasmInstance.exports.set_screen_dimensions) {
+      wasmInstance.exports.set_screen_dimensions(canvas.width, canvas.height);
+      }
+      }
+      window.addEventListener('resize', handleResize);
+
       WebAssembly.instantiateStreaming(fetch('main.wasm'), importObject).then(result => {
-		  wasmInstance = result.instance;
-		  const exports = wasmInstance.exports;
+      wasmInstance = result.instance;
+      const exports = wasmInstance.exports;
 
-		  // Tell C to generate the circle/box vertices in its memory
-		  exports.init_engine();
+      exports.init_engine();
+      handleResize();
 
-		  // Map C Memory to WebGL VBOs
-		  circleVBO = gl.createBuffer();
-		  gl.bindBuffer(gl.ARRAY_BUFFER, circleVBO);
-		  const circleData = new Float32Array(exports.memory.buffer, exports.get_circle_vertices(), 18 * 3);
-		  gl.bufferData(gl.ARRAY_BUFFER, circleData, gl.STATIC_DRAW);
+      circleVBO = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, circleVBO);
+      const circleData = new Float32Array(exports.memory.buffer, exports.get_circle_vertices(), 18 * 3);
+      gl.bufferData(gl.ARRAY_BUFFER, circleData, gl.STATIC_DRAW);
 
-		  boxVBO = gl.createBuffer();
-		  gl.bindBuffer(gl.ARRAY_BUFFER, boxVBO);
-		  const boxData = new Float32Array(exports.memory.buffer, exports.get_box_vertices(), 4 * 3);
-		  gl.bufferData(gl.ARRAY_BUFFER, boxData, gl.STATIC_DRAW);
+      boxVBO = gl.createBuffer();
+      gl.bindBuffer(gl.ARRAY_BUFFER, boxVBO);
+      const boxData = new Float32Array(exports.memory.buffer, exports.get_box_vertices(), 4 * 3);
+      gl.bufferData(gl.ARRAY_BUFFER, boxData, gl.STATIC_DRAW);
 
-		  // Render Loop
-		  function loop(time) {
-			  exports.render_frame(time);
-			  requestAnimationFrame(loop);
-		  }
+      document.getElementById('file-input').addEventListener('change', (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
 
-		  requestAnimationFrame(loop);
-      });
+      const reader = new FileReader();
+      reader.onload = function(evt) {
+      const text = evt.target.result;
+      const bytes = new TextEncoder().encode(text);
+      
+      const maxBufSize = exports.get_file_buffer_max_size();
+      const bufPtr = exports.get_file_buffer_ptr();
+      const copyLength = Math.min(bytes.length, maxBufSize);
+      
+      const wasmHeap = new Uint8Array(exports.memory.buffer);
+      for (let i = 0; i < copyLength; i++) {
+						  wasmHeap[bufPtr + i] = bytes[i];
+						  }
+
+						  exports.prepare_simulation_loading(copyLength);
+
+						  uploadOverlay.style.display = 'none';
+						  loadingOverlay.style.display = 'flex';
+						  currentSimulationState = "LOADING";
+						  };
+						  reader.readAsText(file);
+						  });
+
+						  window.addEventListener('keydown', (e) => {
+        if (e.key === 'w' || e.key === 'W') exports.set_key_state(0, 1);
+        if (e.key === 'a' || e.key === 'A') exports.set_key_state(1, 1);
+        if (e.key === 's' || e.key === 'S') exports.set_key_state(2, 1);
+        if (e.key === 'd' || e.key === 'D') exports.set_key_state(3, 1);
+        });
+
+        window.addEventListener('keyup', (e) => {
+        if (e.key === 'w' || e.key === 'W') exports.set_key_state(0, 0);
+        if (e.key === 'a' || e.key === 'A') exports.set_key_state(1, 0);
+        if (e.key === 's' || e.key === 'S') exports.set_key_state(2, 0);
+        if (e.key === 'd' || e.key === 'D') exports.set_key_state(3, 0);
+        });
+
+        window.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        exports.apply_zoom(e.deltaY);
+        }, { passive: false });
+
+        function loop(time) {
+			if (currentSimulationState === "RUNNING") {
+// Extract runtime uniform matrices from the WASM Memory structure heap safely
+                  const c_camX = new Float32Array(wasmInstance.exports.memory.buffer, wasmInstance.exports.cam_x.value || wasmInstance.exports.memory.buffer, 1)[0] || 0;
+                  const memoryView = new DataView(wasmInstance.exports.memory.buffer);
+                  
+                  // Extract camera parameters directly from public WASM exports
+                  const camX_offset = memoryView.getFloat32(wasmInstance.exports.cam_x, true);
+                  const camY_offset = memoryView.getFloat32(wasmInstance.exports.cam_y, true);
+                  const zoom_val = memoryView.getFloat32(wasmInstance.exports.cam_zoom, true);
+
+                  // 1. First Pass: Render the Infinite Grid background
+                  gl.useProgram(gridProg);
+                  gl.uniform2f(gridCamLoc, camX_offset, camY_offset);
+                  gl.uniform1f(gridZoomLoc, zoom_val);
+                  gl.uniform2f(gridResLoc, canvas.width, canvas.height);
+                  
+                  gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+                  gl.vertexAttribPointer(gridPosAttr, 2, gl.FLOAT, false, 0, 0);
+                  gl.enableVertexAttribArray(gridPosAttr);
+                  gl.drawArrays(gl.TRIANGLES, 0, 6);
+
+                  // 2. Second Pass: Activate the standard shader program and pass execution to the frame render loop
+                  gl.useProgram(program);
+                  gl.enableVertexAttribArray(posAttrib);
+        exports.render_frame(time);
+        } else if (currentSimulationState === "LOADING") {
+        const progress = exports.execute_loading_step();
+        progressFill.style.width = progress + "%";
+        progressText.innerText = Math.floor(progress) + "%";
+
+        if (progress >= 100.0) {
+        loadingOverlay.style.display = 'none';
+        currentSimulationState = "RUNNING";
+		resetBtn.style.display = 'block';
+        appendToConsoleLog("[System] Simulation activated.");
+        }
+        }
+        requestAnimationFrame(loop);
+        }
+        requestAnimationFrame(loop);
+		});
     </script>
   </body>
 </html>
