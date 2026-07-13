@@ -1,31 +1,32 @@
 <!DOCTYPE html>
 <html>
   <head>
-    <title>Wasm Bare Metal WebGL Simulation</title>
+    <title>Warband Replay Match Viewer</title>
     <link rel="stylesheet" href="main.css">
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/sql-wasm.js"></script>
   </head>
   <body>
     <canvas id="canvas"></canvas>
     <div id="center-crosshair"></div>
-    <div id="log-box">System standby.</div>
-    <button id="reset-btn" onclick="triggerReset()">Load Different File</button>
+    <div id="log-box">Replay engine offline. Upload database.</div>
+    <button id="reset-btn" onclick="triggerReset()">Load Different Log</button>
 
     <div id="upload-overlay" class="overlay">
       <div class="card">
-        <h2>Simulation Configuration</h2>
-        <p>Please select a configuration file (<code>balls.txt</code>) specifying initial layout positions.</p>
-        <input type="file" id="file-input" accept=".txt" style="display:none;">
-        <button class="file-btn" onclick="document.getElementById('file-input').click()">Choose File</button>
+        <h2>Warband Replay Viewer</h2>
+        <p>Select a recorded <code>replayLog_...sqlite</code> database to visualize.</p>
+        <input type="file" id="file-input" accept=".sqlite" style="display:none;">
+        <button class="file-btn" onclick="document.getElementById('file-input').click()">Load Replay Database</button>
       </div>
     </div>
 
     <div id="loading-overlay" class="overlay" style="display: none;">
       <div class="card">
-        <h2>Processing Coordinates inside C Engine</h2>
+        <h2>Parsing Database...</h2>
         <div class="progress-container">
-          <div id="progress-fill" class="progress-bar"></div>
+          <div id="progress-fill" class="progress-bar" style="width: 75%;"></div>
         </div>
-        <div id="progress-text" style="color: #00ff00; font-size: 14px;">0%</div>
+        <div id="progress-text" style="color: #00ff00; font-size: 14px; margin-top: 10px;">Compiling Match Boundaries</div>
       </div>
     </div>
     

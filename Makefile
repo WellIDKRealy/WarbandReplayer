@@ -10,7 +10,7 @@ CFLAGS = --target=wasm32 -fno-builtin -nostdlib -static -Os -msimd128 -D__EMSCRI
 # --no-entry: We don't have a standard main() entry point for an OS
 # --export-all: Makes all your C functions available to JavaScript
 # --allow-undefined: Crucial for WebGL. Allows you to call JS/WebGL functions from C even if they aren't defined at compile time.
-LDFLAGS = -fuse-ld=/usr/bin/wasm-ld-19 -Wl,--no-entry -Wl,--import-undefined
+LDFLAGS = -fuse-ld=/usr/bin/wasm-ld -Wl,--no-entry -Wl,--import-undefined
 
 # The target output
 TARGETS = main.wasm benchmark.wasm
