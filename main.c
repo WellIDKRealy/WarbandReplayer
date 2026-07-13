@@ -1,3 +1,4 @@
+#include <math.h>
 #include <cglm/cglm.h>
 
 extern void gl_clear();
@@ -5,9 +6,6 @@ extern void gl_draw_circle();
 extern void gl_draw_box();
 extern void gl_update_matrix(float* matrix_ptr);
 extern void gl_set_color(float r, float g, float b);
-extern float js_sqrt(float v);
-extern float js_sin(float v);
-extern float js_cos(float v);
 extern void js_log_string(const char* msg);
 
 #define NUM_BALLS 60
@@ -160,8 +158,8 @@ void init_engine() {
     for (int i = 0; i <= CIRCLE_SEGS; i++) {
         float angle = 2.0f * 3.14159265f * ((float)i / CIRCLE_SEGS);
         int idx = (i + 1) * 3;
-        circle_vertices[idx + 0] = js_cos(angle);
-        circle_vertices[idx + 1] = js_sin(angle);
+        circle_vertices[idx + 0] = cosf(angle);
+        circle_vertices[idx + 1] = sinf(angle);
         circle_vertices[idx + 2] = 0.0f;
     }
     float b = BOUNDS;
@@ -208,7 +206,7 @@ void render_frame(float time) {
                 float radius_sum = BALL_RADIUS * 2.0f;
 
                 if (dist_sq < radius_sum * radius_sum && dist_sq > 0.0001f) {
-                    float dist = js_sqrt(dist_sq);
+                    float dist = sqrtf(dist_sq);
                     float nx = dx / dist;
                     float ny = dy / dist;
 
@@ -235,8 +233,6 @@ void render_frame(float time) {
             }
         }
     }
-
-    gl_clear();
 
     float aspect = (float)screen_width / (float)screen_height;
     float base_view_size = BOUNDS + 1.5f;
