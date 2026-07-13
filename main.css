@@ -1,0 +1,85 @@
+body, html {
+    margin: 0; padding: 0;
+    width: 100vw; height: 100vh;
+    overflow: hidden; background: #050505;
+    position: relative; font-family: 'Courier New', Courier, monospace;
+}
+canvas {
+    position: absolute; top: 0; left: 0;
+    width: 100%; height: 100%; display: block;
+}
+#center-crosshair {
+    position: absolute;
+    top: 50%; left: 50%;
+    width: 20px; height: 20px;
+    transform: translate(-50%, -50%);
+    pointer-events: none;
+    z-index: 4;
+}
+#center-crosshair::before, #center-crosshair::after {
+    content: '';
+    position: absolute;
+    background: rgba(180, 0, 0, 0.7);
+}
+#center-crosshair::before {
+    top: 9px; left: 0; width: 20px; height: 2px;
+}
+#center-crosshair::after {
+    top: 0; left: 9px; width: 2px; height: 20px;
+}
+#log-box {
+    position: absolute; bottom: 20px; left: 20px;
+    color: #00ff00; background: rgba(0, 0, 0, 0.85);
+    padding: 12px; border: 1px solid #333; border-radius: 4px;
+    pointer-events: none; font-size: 13px; line-height: 1.4;
+    width: 320px; min-height: 90px; white-space: pre-wrap;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.6); z-index: 5;
+}
+#reset-btn {
+    position: absolute; top: 20px; right: 20px;
+    background: #111; border: 1px solid #444; color: #fff;
+    padding: 8px 16px; cursor: pointer; border-radius: 4px;
+    font-family: inherit; z-index: 5; display: none; font-size: 12px;
+}
+#reset-btn:hover {
+    background: #222;
+    border-color: #00ff00;
+    color: #00ff00;
+}
+.overlay {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    background: rgba(10, 10, 10, 0.95);
+    display: flex; justify-content: center; align-items: center;
+    z-index: 10; color: #fff;
+}
+.card {
+    background: #111; border: 1px solid #333;
+    padding: 30px; border-radius: 6px; text-align: center;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.7);
+    width: 420px;
+}
+.card h2 {
+    margin-top: 0;
+    color: #00ff00;
+    font-size: 18px;
+}
+.card p {
+    color: #aaa;
+    font-size: 13px;
+    line-height: 1.5;
+}
+.file-btn {
+    margin-top: 15px; display: inline-block; background: #222;
+    border: 1px solid #555; color: #fff; padding: 10px 20px;
+    cursor: pointer; border-radius: 4px; font-family: inherit;
+}
+.file-btn:hover {
+    background: #333; border-color: #00ff00;
+}
+.progress-container {
+    width: 100%; background: #222; border: 1px solid #444;
+    height: 20px; border-radius: 10px; overflow: hidden; margin: 20px 0 10px 0;
+}
+.progress-bar {
+    width: 0%; height: 100%; background: #00ff00; transition: width 0.05s ease;
+}
