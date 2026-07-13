@@ -1,28 +1,29 @@
 #ifndef _MATH_H_
 #define _MATH_H_
 
-extern float fabs(float x);
-extern float fabsf(float x);
-extern int abs(int x);
+float fabs(float x);
+float fabsf(float x);
+int abs(int x);
 
-extern int isinf(float x);
-extern int isnan(float x);
+int isinf(float x);
+int isnan(float x);
 
-extern float floorf(float x);
-extern float fminf(float a, float b);
-extern float fmodf(float x, float y);
-extern float modff(float value, float* iptr);
+float floorf(float x);
+float fminf(float a, float b);
+float fmodf(float x, float y);
+float modff(float value, float* iptr);
 
-extern float sqrtf(float x);
-extern float powf(float base, float exponent);
+double sqrt(double x);
+float sqrtf(float x);
+float powf(float base, float exponent);
 
-extern float sinf(float x);
-extern float cosf(float x);
-extern float tanf(float x);
+float sinf(float x);
+float cosf(float x);
+float tanf(float x);
 
-extern float atanf(float x);
-extern float atan2f(float y, float x);
-extern float asinf(float x);
-extern float acosf(float x);
+float atanf(float x);
+float atan2f(float y, float x);
+float asinf(float x);
+float acosf(float x);
 
 #endif

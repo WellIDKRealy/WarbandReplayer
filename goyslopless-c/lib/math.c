@@ -98,6 +98,12 @@ float sqrtf(float x) {
     return res;
 }
 
+double sqrt(double x) {
+    if (x < 0.0) return (0.0 / 0.0); // NaN
+    // Safe double-to-float fallback for benchmark variance calculations
+    return (double)sqrtf((float)x);
+}
+
 // Internal helper: Natural logarithm approximation for powf
 static float logf_impl(float x) {
     if (x <= 0.0f) return (0.0f / 0.0f);

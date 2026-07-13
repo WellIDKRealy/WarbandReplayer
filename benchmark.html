@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8">
+    <title>WASM Graphics Engine Math Benchmark</title>
+    <style>
+      body {
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+          background-color: #0f172a;
+          color: #e2e8f0;
+          margin: 0;
+          padding: 24px;
+      }
+      .container {
+          max-width: 1100px;
+          margin: 0 auto;
+      }
+      header {
+          display: flex;
+          justify-content: space-between;
+          align-items: center;
+          border-bottom: 1px solid #334155;
+          padding-bottom: 16px;
+          margin-bottom: 24px;
+      }
+      h1 { margin: 0; font-size: 24px; color: #f8fafc; }
+      .btn {
+          background-color: #3b82f6;
+          color: white;
+          border: none;
+          padding: 10px 20px;
+          font-size: 14px;
+          font-weight: 600;
+          border-radius: 6px;
+          cursor: pointer;
+          transition: background-color 0.2s;
+      }
+      .btn:hover { background-color: #2563eb; }
+      table {
+          width: 100%;
+          border-collapse: collapse;
+          background-color: #1e293b;
+          border-radius: 8px;
+          overflow: hidden;
+          box-shadow: 0 4px 6px -1px rgba(0,0,0,0.3);
+          margin-bottom: 24px;
+      }
+      th, td {
+          padding: 14px 16px;
+          text-align: left;
+          border-bottom: 1px solid #334155;
+      }
+      th {
+          background-color: #1e293b;
+          color: #94a3b8;
+          font-weight: 600;
+          font-size: 13px;
+          text-transform: uppercase;
+      }
+      tr:last-child td { border-bottom: none; }
+      .status-badge {
+          display: inline-flex;
+          padding: 4px 8px;
+          font-size: 12px;
+          font-weight: 700;
+          border-radius: 4px;
+      }
+      .status-running { background-color: #eab30822; color: #eab308; }
+      .status-ok { background-color: #22c55e22; color: #22c55e; }
+      .status-failed { background-color: #ef444422; color: #ef4444; }
+      
+      .console-panel {
+          background-color: #020617;
+          border: 1px solid #1e293b;
+          border-radius: 8px;
+          padding: 16px;
+          font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+          font-size: 13px;
+          max-height: 250px;
+          overflow-y: auto;
+          color: #38bdf8;
+          white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+
+	<div class="container">
+      <header>
+        <div>
+          <h1>Custom Math Library Performance Dashboard</h1>
+          <p style="color: #94a3b8; margin: 4px 0 0 0;">Target Environment: Wasm32 Standalone Engine Runtime</p>
+        </div>
+        <button class="btn" id="runBtn" onclick="runBenchmarks()">Execute Benchmark Suite</button>
+      </header>
+
+      <table id="resultsTable">
+        <thead>
+          <tr>
+            <th>Benchmark Configuration</th>
+            <th>Status</th>
+            <th>Mean Performance Time</th>
+            <th>Confidence Threshold (99% CI)</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td colspan="4" style="text-align: center; color: #64748b;">Click "Execute Benchmark Suite" to compute performance metrics.</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <h3 style="color: #94a3b8; font-size: 14px; text-transform: uppercase;">Raw Terminal Stream Output</h3>
+      <div class="console-panel" id="consoleOut">Ready. System standing by...</div>
+	</div>
+
+	<script>
+      let wasmMemory;
+      let rawOutputBuffer = "";
+	  let lineBuffer = ""; // holds partial line(s) across handleCPrint calls
+
+      // Read null-terminated string segments directly out of WASM linear memory
+      function readStringFromWasm(ptr) {
+          const memoryView = new Uint8Array(wasmMemory.buffer);
+          let end = ptr;
+          while (memoryView[end] !== 0) end++;
+          return new TextDecoder().decode(memoryView.subarray(ptr, end));
+      }
+
+      // Capture prints from C and parse them line by line
+	  function handleCPrint(ptr) {
+		  const text = readStringFromWasm(ptr);
+		  rawOutputBuffer += text;
+		  
+		  const consoleEl = document.getElementById("consoleOut");
+		  consoleEl.textContent = rawOutputBuffer;
+		  consoleEl.scrollTop = consoleEl.scrollHeight;
+
+		  // Parse only whole lines
+		  lineBuffer += text;
+		  let nl;
+		  while ((nl = lineBuffer.indexOf("\n")) !== -1) {
+			  const fullLine = lineBuffer.slice(0, nl);
+			  lineBuffer = lineBuffer.slice(nl + 1);
+			  parseBenchmarkOutput(fullLine);
+		  }
+	  }
+
+	  function parseBenchmarkOutput(text) {
+          const lines = text.split('\n');
+          const tbody = document.querySelector("#resultsTable tbody");
+
+		  const reRun = /^\[\s*RUN\s*\]\s*(.+?)\s*$/;
+		  // OK line example:
+		  // [       OK ] Graphics_cglm.VectorNormalize (mean 0.000(null), confidence interval +- 0.000000%)
+		  const reOk = /^\[\s*OK\s*\]\s*(.+?)\s*\(mean\s+([^,]+),\s*confidence interval\s*\+\-\s*([0-9.]+)%\)\s*$/;
+
+		  // FAILED line example:
+		  // [  FAILED  ] Graphics_cglm.EulerRotation (mean 0.000(null), confidence interval +- 0.000000%)
+		  const reFailed = /^\[\s*FAILED\s*\]\s*(.+?)\s*(?:\(|$)/;
+
+		  for (const line of lines) {
+			  let m;
+
+			  console.log(line)
+			  
+			  if ((m = line.match(reRun))) {
+				  console.log("NIGGER1")
+				  const testName = m[1].trim();
+
+				  if (tbody.querySelector("td[colspan]")) tbody.innerHTML = "";
+
+				  const row = document.createElement("tr");
+				  row.id = "row_" + testName.replace(".", "_");
+				  row.innerHTML = `
+        <td style="font-weight: 500;">${testName}</td>
+        <td><span class="status-badge status-running">RUNNING</span></td>
+        <td style="color: #64748b;">Computing...</td>
+        <td style="color: #64748b;">Calculating...</td>
+      `;
+				  tbody.appendChild(row);
+				  continue;
+			  }
+
+			  if ((m = line.match(reOk))) {
+				  console.log("NIGGER2")
+				  const testName = m[1].trim();
+				  const meanVal = m[2].trim();          // "0.000(null)"
+				  const confidenceVal = m[3].trim();   // "0.000000"
+
+				  const row = document.getElementById("row_" + testName.replace(".", "_"));
+				  if (row) {
+					  row.cells[1].innerHTML = `<span class="status-badge status-ok">SUCCESS</span>`;
+					  row.cells[2].innerHTML = `<strong style="color: #38bdf8;">${meanVal}</strong>`;
+					  row.cells[3].textContent = `± ${confidenceVal}`;
+				  }
+				  continue;
+			  }
+
+			  if ((m = line.match(reFailed))) {
+				  console.log("NIGGER3")
+				  const testName = m[1].trim();
+
+				  const row = document.getElementById("row_" + testName.replace(".", "_"));
+				  if (row) {
+					  row.cells[1].innerHTML = `<span class="status-badge status-failed">FAILED</span>`;
+					  row.cells[2].textContent = "N/A";
+					  row.cells[3].textContent = "Variance Error";
+				  }
+			  }
+			  
+			  console.log("NIGGER4")
+		  }
+	  }
+
+      async function runBenchmarks() {
+          document.getElementById("consoleOut").textContent = "Initializing environment components...\n";
+          document.querySelector("#resultsTable tbody").innerHTML = `<tr><td colspan="4" style="text-align: center; color: #eab308;">Running benchmarks. Please wait...</td></tr>`;
+          rawOutputBuffer = "";
+          
+          document.getElementById("runBtn").disabled = true;
+
+		  let wasmInstance;
+
+		  const DATA_ADDR = 16;     // must point to valid memory for the asyncify data struct
+		  const DATA_STACK_END = 1024; // choose an end address within your wasm memory
+		  let view;
+
+		  let sleeping = false; 
+		  
+          const importObject = {
+			  env: {
+				  js_print_string: handleCPrint,
+				  emscripten_performance_now: () => performance.now(),
+				  yield_thread: () => {
+					  if (!sleeping) {
+						  // First time: start unwinding
+						  view[DATA_ADDR >> 2] = (DATA_ADDR + 8);                 // stack start location
+						  view[(DATA_ADDR + 4) >> 2] = DATA_STACK_END;          // stack end location (free region)
+						  wasmInstance.exports.asyncify_start_unwind(DATA_ADDR);
+						  sleeping = true;
+
+						  setTimeout(() => {
+							  // Resume: start rewinding, then re-enter the function that should run again
+							  wasmInstance.exports.asyncify_start_rewind(DATA_ADDR);
+							  wasmInstance.exports.main();
+							  // IMPORTANT: do NOT call asyncify_stop_rewind() here
+						  }, 0);
+					  } else {
+						  // Second time (resume path): finish rewinding
+						  wasmInstance.exports.asyncify_stop_rewind();
+						  sleeping = false;
+					  }
+				  }
+			  }
+          };
+
+          try {
+			  // Load your generated standalone WebAssembly binary
+			  const response = await fetch('benchmark.wasm');
+			  const bytes = await response.arrayBuffer();
+			  const { instance } = await WebAssembly.instantiate(bytes, importObject);
+			  
+			  wasmInstance = instance; 
+			  wasmMemory = instance.exports.memory;
+
+			  view = new Int32Array(wasmInstance.exports.memory.buffer);
+			  
+			  // Execute the entrypoint main definition
+			  instance.exports.main(0, 0);
+          } catch (err) {
+			  document.getElementById("consoleOut").textContent += `\nRuntime Instantiation Error: ${err.message}`;
+          } finally {
+			  document.getElementById("runBtn").disabled = false;
+          }
+	  }
+	</script>
+  </body>
+</html>

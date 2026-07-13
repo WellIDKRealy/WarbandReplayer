@@ -5,25 +5,30 @@ CC = clang
 # --target=wasm32 tells clang we want wasm output
 # -nostdlib strips out all the standard library garbage you don't need
 # -O3 optimizes for speed and size
-CFLAGS = --target=wasm32 -fno-builtin -nostdlib -static -Os -msimd128 -I./cglm/include -I./goyslopless-c/include/ -std=c99
+CFLAGS = --target=wasm32 -fno-builtin -nostdlib -static -Os -msimd128 -D__EMSCRIPTEN__ -I./cglm/include -I./goyslopless-c/include/ -std=gnu99 
 # Linker flags passed through Clang to wasm-ld
 # --no-entry: We don't have a standard main() entry point for an OS
 # --export-all: Makes all your C functions available to JavaScript
 # --allow-undefined: Crucial for WebGL. Allows you to call JS/WebGL functions from C even if they aren't defined at compile time.
-LDFLAGS = -fuse-ld=/usr/bin/wasm-ld-19 -Wl,--no-entry -Wl,--export-all -Wl,--allow-undefined
+LDFLAGS = -fuse-ld=/usr/bin/wasm-ld-19 -Wl,--no-entry -Wl,--import-undefined
 
 # The target output
-TARGET = main.wasm
-SRC = main.c goyslopless-c/lib/math.c
+TARGETS = main.wasm benchmark.wasm
+LIBS-SRC = goyslopless-c/lib/*.c
 
 # Default rule
-all: $(TARGET)
+all: $(TARGETS)
 
-$(TARGET): $(SRC)
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ $^
+
+main.wasm: $(LIB-SRC) main.c Makefile
+	$(CC) $(CFLAGS) $(LDFLAGS) -o main.wasm main.c -Wl,--export-all $(LIBS-SRC)
+
+benchmark.wasm: $(LIB-SRC) benchmark.c Makefile
+	$(CC) $(CFLAGS) -I./ubench $(LDFLAGS) -o benchmark.wasm benchmark.c -Wl,--export=main $(LIBS-SRC)
+	wasm-opt -Os --asyncify benchmark.wasm -o benchmark.wasm
 
 # Clean rule
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGETS)
 
 .PHONY: clean all
