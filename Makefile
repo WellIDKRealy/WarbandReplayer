@@ -20,10 +20,10 @@ LIBS-SRC = goyslopless-c/lib/*.c
 all: $(TARGETS)
 
 
-main.wasm: $(LIB-SRC) main.c Makefile
+main.wasm: $(LIBS-SRC) main.c
 	$(CC) $(CFLAGS) $(LDFLAGS) -o main.wasm main.c -Wl,--export-all $(LIBS-SRC)
 
-benchmark.wasm: $(LIB-SRC) benchmark.c Makefile
+benchmark.wasm: $(LIBS-SRC) benchmark.c
 	$(CC) $(CFLAGS) -I./ubench $(LDFLAGS) -o benchmark.wasm benchmark.c -Wl,--export=main $(LIBS-SRC)
 	wasm-opt -Os --asyncify benchmark.wasm -o benchmark.wasm
 

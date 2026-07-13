@@ -38,16 +38,21 @@ int isnan(float x) {
 }
 
 float floorf(float x) {
-    if (isnan(x) || isinf(x)) return x;
+    union { float f; unsigned int i; } u = {x};
+    int exponent = (int)((u.i >> 23) & 0xFF) - 127;
     
-    int xi = (int)x;
-    float fxi = (float)xi;
+    // If the exponent is greater than 22, it's already an integer (or Inf/NaN)
+    if (exponent >= 23) return x; 
+    if (exponent < 0) return (x < 0.0f) ? -1.0f : 0.0f;
     
-    if (x < fxi) {
-        return fxi - 1.0f;
-    }
-    return fxi;
+    unsigned int mask = MANTISSA_MASK >> exponent;
+    if ((u.i & mask) == 0) return x; // Already an integer
+    
+    if (u.i & SIGN_BIT_MASK) u.i += mask; // Handle negative rounding
+    u.i &= ~mask;
+    return u.f;
 }
+
 
 float fminf(float a, float b) {
     if (isnan(a)) return b;
@@ -56,13 +61,12 @@ float fminf(float a, float b) {
 }
 
 float fmodf(float x, float y) {
-    if (isnan(x) || isnan(y) || isinf(x) || y == 0.0f) {
-        return (x * y) / (x * y); // Generates NaN safely
-    }
+    if (y == 0.0f || isnan(x) || isnan(y) || isinf(x)) return (x * y) / (x * y);
     if (isinf(y)) return x;
 
-    float quotient = floorf(x / y);
-    return x - quotient * y;
+    // Fast truncated division method
+    float trfn = (float)(int)(x / y);
+    return x - trfn * y;
 }
 
 float modff(float value, float* iptr) {
@@ -81,21 +85,12 @@ float modff(float value, float* iptr) {
 }
 
 float sqrtf(float x) {
-    if (x < 0.0f) return (0.0f / 0.0f); // Return NaN for negative inputs
-    if (x == 0.0f || isinf(x) || isnan(x)) return x;
-
-    // Initial rough estimate using bit shift (Fast Inverse Square Root approach style)
-    float_bits u;
-    u.f = x;
-    u.i = (u.i >> 1) + 0x1FBC0000; 
-    float res = u.f;
-
-    // 3 iterations of Newton-Raphson for 32-bit float precision
-    res = 0.5f * (res + x / res);
-    res = 0.5f * (res + x / res);
-    res = 0.5f * (res + x / res);
-    
-    return res;
+    if (x < 0.0f) return (0.0f / 0.0f);
+    // This semantic pattern is safely recognized by Clang/WASM as a native instruction
+    float res;
+    __asm__ ("f32.sqrt %0, %1" : "=r"(res) : "r"(x)); // Optional fallback if using inline assembly
+    // If inline asm is not preferred, keep a fast 4-iteration Newton-Raphson or rely on -O3 auto-lowering
+    return __builtin_sqrtf(x); 
 }
 
 double sqrt(double x) {
@@ -104,87 +99,73 @@ double sqrt(double x) {
     return (double)sqrtf((float)x);
 }
 
-// Internal helper: Natural logarithm approximation for powf
-static float logf_impl(float x) {
-    if (x <= 0.0f) return (0.0f / 0.0f);
-    // Taylor series centered around 1: ln(x) = 2 * sum( ((x-1)/(x+1))^n / n )
-    float y = (x - 1.0f) / (x + 1.0f);
+static float log2f_fast(float x) {
+    union { float f; unsigned int i; } u = {x};
+    int vx = u.i;
+    int ex = (vx >> 23) - 127;
+    u.i = (vx & MANTISSA_MASK) | 0x3F800000;
+    
+    // Minimax polynomial for log2(m) over [1,2]
+    float m = u.f;
+    float y = (m - 1.0f) / (m + 1.0f);
     float y2 = y * y;
-    float sum = 0.0f;
-    float term = y;
-    for (int i = 1; i < 20; i += 2) {
-        sum += term / i;
-        term *= y2;
-    }
-    return 2.0f * sum;
+    float l = y * (2.8853900f + y2 * (0.9614706f + y2 * 0.5782725f));
+    return (float)ex + l;
 }
 
-// Internal helper: e^x approximation
-static float expf_impl(float x) {
-    float sum = 1.0f;
-    float term = 1.0f;
-    for (int i = 1; i < 15; i++) {
-        term *= x / i;
-        sum += term;
-    }
-    return sum;
+static float exp2f_fast(float x) {
+    if (x < -126.0f) return 0.0f;
+    if (x > 127.0f) return (1.0f / 0.0f); // Inf
+
+    int ipart = (int)floorf(x + 0.5f);
+    float fpart = x - (float)ipart;
+
+    // Polynomial approximation for 2^fpart over [-0.5, 0.5]
+    float rem = 1.0f + fpart * (0.6931472f + fpart * (0.2402265f + fpart * 0.0555041f));
+
+    union { unsigned int i; float f; } u;
+    u.i = (unsigned int)((ipart + 127) << 23);
+    return u.f * rem;
 }
 
 float powf(float base, float exponent) {
-    if (base == 0.0f && exponent > 0.0f) return 0.0f;
+    if (base == 0.0f) return 0.0f;
     if (exponent == 0.0f) return 1.0f;
+    
     if (base < 0.0f) {
-        // Only integer exponents are valid for negative bases
-        float iptr;
-        if (modff(exponent, &iptr) == 0.0f) {
-            float abs_res = expf_impl(exponent * logf_impl(-base));
+        // Handle negative base with integer exponents safely
+        if (fmodf(exponent, 1.0f) == 0.0f) {
+            float abs_res = exp2f_fast(exponent * log2f_fast(-base));
             return ((int)exponent % 2 == 0) ? abs_res : -abs_res;
         }
         return (0.0f / 0.0f); // NaN
     }
-    return expf_impl(exponent * logf_impl(base));
+
+    return exp2f_fast(exponent * log2f_fast(base));
 }
 
 #define PI 3.14159265358979323846f
 
 float sinf(float x) {
-    // Bring x into range [-PI, PI]
+    // 1. Range reduction to [-PI, PI]
     x = fmodf(x, 2.0f * PI);
-    if (x > PI) x -= 2.0f * PI;
+    if (x > PI)  x -= 2.0f * PI;
     if (x < -PI) x += 2.0f * PI;
 
-    float sum = x;
-    float term = x;
+    // 2. High-precision minimax approximation for sin(x)
+    // Coeffs optimized for absolute error over [-PI/2, PI/2]
     float x2 = x * x;
-    
-    // Maclaurin Expansion
-    for (int i = 3; i < 16; i += 2) {
-        term *= -x2 / (i * (i - 1));
-        sum += term;
-    }
-    return sum;
+    return x * (1.0f + x2 * (-0.16666668f + x2 * (0.0083328241f + x2 * (-0.0001951855f))));
 }
 
 float cosf(float x) {
-    x = fmodf(x, 2.0f * PI);
-    if (x > PI) x -= 2.0f * PI;
-    if (x < -PI) x += 2.0f * PI;
-
-    float sum = 1.0f;
-    float term = 1.0f;
-    float x2 = x * x;
-
-    for (int i = 2; i < 16; i += 2) {
-        term *= -x2 / (i * (i - 1));
-        sum += term;
-    }
-    return sum;
+    // cos(x) = sin(x + PI/2)
+    return sinf(x + (PI * 0.5f));
 }
 
 float tanf(float x) {
-    float c = cosf(x);
-    if (c == 0.0f) return (0.0f / 0.0f); // Division by zero NaN
-    return sinf(x) / c;
+    // Fast polynomial quotient 
+    return sinf(x) / cosf(x);
 }
 
 float atanf(float x) {

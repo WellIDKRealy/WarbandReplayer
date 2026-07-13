@@ -41,7 +41,7 @@ UBENCH(Graphics_cglm, EulerRotation) {
 
 // 3. Perspective Projection (Stresses: tanf)
 UBENCH(Graphics_cglm, PerspectiveProjection) {
-  for(int j = 0; j < 100; j ++) {
+  for(int j = 0; j < 100; j++) {
 	float fov = glm_rad(90.0f); // Uses your fmodf/fabs if glm_rad triggers it, but mostly constants
 	float aspect = 16.0f / 9.0f;
 	float nearZ = 0.1f;
@@ -56,15 +56,17 @@ UBENCH(Graphics_cglm, PerspectiveProjection) {
 
 // 4. View Matrix / LookAt (Stresses: sqrtf, cross products, f32 ops)
 UBENCH(Graphics_cglm, CameraLookAt) {
-  vec3 up = {0.0f, 1.0f, 0.0f};
-  vec3 target_offset = {1.0f, -0.5f, 2.0f};
+  for(int j = 0; j < 100; j++) {
+	vec3 up = {0.0f, 1.0f, 0.0f};
+	vec3 target_offset = {1.0f, -0.5f, 2.0f};
     
-  for (int i = 0; i < NUM_ELEMENTS; i++) {
-    vec3 target;
-    glm_vec3_add(vectors_in[i], target_offset, target);
+	for (int i = 0; i < NUM_ELEMENTS; i++) {
+      vec3 target;
+      glm_vec3_add(vectors_in[i], target_offset, target);
         
-    // glm_lookat stresses vector subtraction, cross products, and normalization (sqrtf)
-    glm_lookat(vectors_in[i], target, up, matrices_out[i]);
+      // glm_lookat stresses vector subtraction, cross products, and normalization (sqrtf)
+      glm_lookat(vectors_in[i], target, up, matrices_out[i]);
+	}
   }
 }
 
