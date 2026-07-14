@@ -86,7 +86,7 @@ void set_map_bounds(float min_x, float max_x, float min_y, float max_y) {
     float span_y = fabsf(max_y - min_y);
     float max_span = (span_x > span_y) ? span_x : span_y;
     if (max_span > 0.0f) {
-        cam_zoom = 20.0f / max_span;
+        cam_zoom = 40.0f / max_span;
         if (cam_zoom < 0.05f) cam_zoom = 0.05f;
         if (cam_zoom > 10.0f) cam_zoom = 10.0f;
     }
