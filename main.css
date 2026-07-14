@@ -117,37 +117,99 @@ canvas {
     color: #00ff00;
 }
 
+/* Minimalist Overlays */
 .overlay {
-    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
-    background: rgba(10, 10, 10, 0.95);
-    display: flex; justify-content: center; align-items: center;
-    z-index: 20; color: #fff; /* Lifted z-index to stay on top of panels */
+    position: absolute; 
+    top: 0; 
+    left: 0; 
+    width: 100%; 
+    height: 100%;
+    background: #0a0a0a;
+    display: flex; 
+    justify-content: center; 
+    align-items: center;
+    z-index: 20; 
+    color: #ffffff;
 }
 
 .card {
-    background: #111; border: 1px solid #333;
-    padding: 30px; border-radius: 6px; text-align: center;
-    box-shadow: 0 10px 30px rgba(0,0,0,0.7);
-    width: 420px;
+    background: #121212; 
+    border: 1px solid #222222;
+    padding: 40px; 
+    border-radius: 0px; 
+    text-align: center;
+    width: 360px;
+}
+
+.card h2 {
+    font-size: 15px;
+    font-weight: normal;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+    margin-top: 0;
+    margin-bottom: 15px;
+    color: #ffffff;
+}
+
+.card p {
+    font-family: 'Courier New', Courier, monospace;
+    color: #777777;
+    font-size: 11px;
+    line-height: 1.6;
+    margin: 0 0 25px 0;
+}
+
+.card code {
+    background: #1a1a1a;
+    color: #aaaaaa;
+    padding: 2px 5px;
+    font-size: 11px;
+    border: 1px solid #2a2a2a;
 }
 
 .file-btn {
-    background: #00ff00; border: none; color: #000;
-    padding: 12px 24px; font-weight: bold; cursor: pointer;
-    font-family: inherit; margin-top: 15px; border-radius: 4px;
-    text-transform: uppercase; transition: background 0.2s;
+    background: transparent; 
+    border: 1px solid #00ff00; 
+    color: #00ff00;
+    padding: 10px 20px; 
+    font-size: 11px;
+    cursor: pointer;
+    font-family: inherit; 
+    margin-top: 10px; 
+    border-radius: 0px;
+    text-transform: uppercase; 
+    letter-spacing: 1.5px;
+    transition: all 0.15s ease;
 }
 
 .file-btn:hover {
-    background: #00dd00;
+    background: #00ff00;
+    color: #000000;
 }
 
 .progress-container {
-    width: 100%; height: 8px; background: #222; border-radius: 4px; overflow: hidden; margin-top: 15px;
+    width: 100%; 
+    height: 2px; 
+    background: #222222; 
+    border-radius: 0px;
+    overflow: hidden; 
+    margin-top: 25px;
 }
 
 .progress-bar {
-    height: 100%; background: #00ff00; width: 0%; transition: width 0.1s;
+    height: 100%; 
+    background: #00ff00; 
+    width: 0%; 
+    transition: width 0.1s;
+}
+
+#progress-text {
+    font-family: 'Courier New', Courier, monospace !important;
+    color: #777777 !important;
+    font-size: 11px !important;
+    margin-top: 12px !important;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
 }
 
 #tl-slider {
