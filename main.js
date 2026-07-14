@@ -635,6 +635,7 @@ Promise.all([
                     playBtn.style.borderColor = isPaused ? '#ffaa00' : '#00ff00';
                 }
             }
+	    e.preventDefault();
         });
 
         window.addEventListener('keyup', (e) => {
