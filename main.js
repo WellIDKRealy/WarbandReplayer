@@ -649,6 +649,35 @@ Promise.all([
             exports.apply_zoom(e.deltaY);
         }, { passive: false });
 
+// Mouse drag panning state
+        let isDragging = false;
+        let lastMouseX = 0;
+        let lastMouseY = 0;
+
+        canvas.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            lastMouseX = e.clientX;
+            lastMouseY = e.clientY;
+        });
+
+        window.addEventListener('mousemove', (e) => {
+            if (isDragging) {
+                const dx = e.clientX - lastMouseX;
+                const dy = e.clientY - lastMouseY;
+                lastMouseX = e.clientX;
+                lastMouseY = e.clientY;
+                
+                // Call the new C function
+                if (exports.pan_camera) {
+                    exports.pan_camera(dx, dy);
+                }
+            }
+        });
+
+        window.addEventListener('mouseup', () => {
+            isDragging = false;
+        });
+	
         let lastFrameTime = 0;
 
 	function loop(time) {

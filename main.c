@@ -116,6 +116,25 @@ void apply_zoom(float delta_y) {
     if (cam_zoom > 40.0f) cam_zoom = 40.0f;
 }
 
+void pan_camera(float dx_pixels, float dy_pixels) {
+    float aspect = (float)screen_width / (float)screen_height;
+    float x_bound = 30.0f; 
+    float y_bound = 30.0f;
+    
+    if (aspect > 1.0f) { 
+        x_bound *= aspect; 
+    } else { 
+        y_bound /= aspect; 
+    }
+    
+    // Convert screen pixel delta to world coordinate delta
+    float world_dx = (dx_pixels / (float)screen_width) * (2.0f * x_bound) / cam_zoom;
+    float world_dy = (dy_pixels / (float)screen_height) * (2.0f * y_bound) / cam_zoom;
+    
+    cam_x -= world_dx;
+    cam_y += world_dy; 
+}
+
 int compile_shader_program(const char* vs_src, const char* fs_src) {
     int vs = gl_create_shader(GL_VERTEX_SHADER);
     gl_shader_source(vs, vs_src); gl_compile_shader(vs);
