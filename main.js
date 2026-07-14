@@ -10,6 +10,7 @@ let activeLogs = ["Ready to process Warband SQLite replay..."];
 let wasmInstance = null;
 
 // Replay and Timeline State
+let replayTime = 0.0;
 let replayDb = null;
 let ticks = [];             // Array of { id, time }
 let matches = [];           // Array of { startTickIdx, endTickIdx, label, map, factions }
@@ -22,6 +23,7 @@ let lastDisplayedTickIndex = -1;
 
 // Compiled SQLite Statement (for loop performance optimization)
 let agentStmt = null;
+let corpseStmt = null;
 
 const glObjects = { programs: [], shaders: [], buffers: [], uniforms: [] };
 
@@ -250,37 +252,44 @@ function createTimelineUI() {
     trackWrapper.style.overflow = 'hidden';
 
     // Highlight segments on track represent matches
+    const totalTime = ticks[ticks.length - 1].time - ticks[0].time;
+
     matches.forEach((m, idx) => {
-        const startPct = (m.startTickIdx / ticks.length) * 100;
-        const endPct = (m.endTickIdx / ticks.length) * 100;
-        const widthPct = endPct - startPct;
+        const startTime = ticks[m.startTickIdx].time - ticks[0].time;
+        const endTime = ticks[m.endTickIdx].time - ticks[0].time;
+        
+        const startPct = (startTime / totalTime) * 100;
+        const widthPct = ((endTime - startTime) / totalTime) * 100;
 
         const block = document.createElement('div');
         block.style.position = 'absolute';
         block.style.left = startPct + '%';
         block.style.width = widthPct + '%';
         block.style.height = '100%';
-        // Alternating color blocks for visual division
         block.style.background = idx % 2 === 0 ? 'rgba(0, 150, 255, 0.12)' : 'rgba(0, 255, 150, 0.08)';
         block.style.borderLeft = '2px solid #00ff00';
         block.style.cursor = 'pointer';
         block.title = `Jump to ${m.label} (Scene: ${m.map}, Factions: ${m.factions})`;
         block.onclick = (e) => {
             e.stopPropagation();
+            replayTime = ticks[m.startTickIdx].time;
             currentTickIndex = m.startTickIdx;
+            const slider = document.getElementById('tl-slider');
+            if (slider) slider.value = replayTime.toString();
             updateSliderPosition();
+            updateChatDisplay();
         };
 
         trackWrapper.appendChild(block);
     });
 
-    // Slider overlay
     const slider = document.createElement('input');
     slider.id = 'tl-slider';
     slider.type = 'range';
-    slider.min = '0';
-    slider.max = (ticks.length - 1).toString();
-    slider.value = '0';
+    slider.min = ticks[0].time.toString();
+    slider.max = ticks[ticks.length - 1].time.toString();
+    slider.step = "0.01";
+    slider.value = ticks[0].time.toString();
     slider.style.position = 'absolute';
     slider.style.top = '0';
     slider.style.left = '0';
@@ -292,8 +301,15 @@ function createTimelineUI() {
     slider.style.cursor = 'pointer';
     slider.style.opacity = '0.95';
     slider.oninput = (e) => {
-        currentTickIndex = parseInt(e.target.value);
+        replayTime = parseFloat(e.target.value);
+        // Fast seek instead of O(N) from 0
+        if (replayTime > ticks[currentTickIndex].time) {
+            while (currentTickIndex < ticks.length - 1 && ticks[currentTickIndex + 1].time <= replayTime) currentTickIndex++;
+        } else {
+            while (currentTickIndex > 0 && ticks[currentTickIndex].time > replayTime) currentTickIndex--;
+        }
         updateSliderPosition();
+        updateChatDisplay();
     };
 
     trackWrapper.appendChild(slider);
@@ -313,17 +329,26 @@ function removeTimelineUI() {
 }
 
 function updateSliderPosition() {
-    const slider = document.getElementById('tl-slider');
     const timeDisplay = document.getElementById('tl-time-display');
     const matchDetails = document.getElementById('tl-match-details');
 
-    if (slider) slider.value = currentTickIndex.toString();
+    let activeMatchIdx = -1;
+    if (matches.length > 0) {
+        activeMatchIdx = matches.findIndex(m => currentTickIndex >= m.startTickIdx && currentTickIndex <= m.endTickIdx);
+    }
+
     if (timeDisplay) {
-        timeDisplay.innerText = `Frame: ${currentTickIndex + 1} / ${ticks.length}`;
+        let relativeTime = 0.0;
+        if (activeMatchIdx !== -1) {
+            relativeTime = replayTime - ticks[matches[activeMatchIdx].startTickIdx].time;
+        } else if (matches.length > 0 && currentTickIndex > matches[matches.length - 1].endTickIdx) {
+            // Handle scrubbing past the very end of the final match
+            relativeTime = replayTime - ticks[matches[matches.length - 1].startTickIdx].time;
+        }
+        timeDisplay.innerText = `Time: +${relativeTime.toFixed(2)}s`;
     }
 
     if (matchDetails && matches.length > 0) {
-        const activeMatchIdx = matches.findIndex(m => currentTickIndex >= m.startTickIdx && currentTickIndex <= m.endTickIdx);
         if (activeMatchIdx !== -1) {
             const m = matches[activeMatchIdx];
             matchDetails.innerText = `${m.label.toUpperCase()} | Scene: ${m.map} | Factions: ${m.factions}`;
@@ -393,7 +418,7 @@ function processDatabaseAndCompileMatches() {
                 startTickIdx: startIdx,
                 endTickIdx: endIdx,
                 label: `Match #${matches.length + 1}`,
-                map: meta.sceneNo !== "Unknown" ? `Scene ${meta.sceneNo}` : "Unknown Map",
+                map: meta.sceneNo !== "Unknown" ? `${meta.sceneNo}` : "Unknown Map",
                 factions: meta.factions
             });
             startIdx = endIdx + 1;
@@ -406,7 +431,7 @@ function processDatabaseAndCompileMatches() {
             startTickIdx: startIdx,
             endTickIdx: ticks.length - 1,
             label: `Match #${matches.length + 1}`,
-            map: meta.sceneNo !== "Unknown" ? `Scene ${meta.sceneNo}` : "Unknown Map",
+            map: meta.sceneNo !== "Unknown" ? `${meta.sceneNo}` : "Unknown Map",
             factions: meta.factions
         });
     }
@@ -419,7 +444,9 @@ function processDatabaseAndCompileMatches() {
         SELECT 
             a.pos_x, 
             a.pos_y, 
-            s.team AS active_team
+            s.team AS active_team,
+            a.agent_id,
+            s.event_id
         FROM agent_states a
         JOIN (
             SELECT s2.agent_id, MAX(s2.event_id) AS max_event_id
@@ -430,6 +457,30 @@ function processDatabaseAndCompileMatches() {
         ) latest_spawns ON a.agent_id = latest_spawns.agent_id
         JOIN spawns s ON latest_spawns.max_event_id = s.event_id
         WHERE a.tick_id = ? AND s.is_human = 1
+    `);
+
+    if (corpseStmt) {
+        corpseStmt.free();
+    }
+    
+    // The subquery guarantees we get the team of this specific life-cycle, 
+    // ignoring any future spawns of the same agent_id.
+    corpseStmt = replayDb.prepare(`
+        SELECT 
+            k.dead_x, 
+            k.dead_y, 
+            s.team
+        FROM kills k
+        JOIN (
+            SELECT s2.agent_id, MAX(s2.event_id) AS max_event_id
+            FROM spawns s2
+            JOIN events e2 ON s2.event_id = e2.id
+            WHERE e2.tick_id >= ? AND e2.tick_id <= ?
+            GROUP BY s2.agent_id
+        ) latest_spawns ON k.dead_id = latest_spawns.agent_id
+        JOIN spawns s ON latest_spawns.max_event_id = s.event_id
+        JOIN events e ON k.event_id = e.id
+        WHERE s.is_human = 1 AND e.tick_id >= ? AND e.tick_id <= ?
     `);
 
     // 2.5 Cache Chat Logs mapped to Tick Indices
@@ -557,6 +608,7 @@ Promise.all([
                         resetBtn.style.display = 'block';
                         currentSimulationState = "RUNNING";
                         currentTickIndex = 0;
+			replayTime = ticks[0].time;
                         lastTickTime = performance.now();
                         appendToConsoleLog(`[Replay Engine] Parse Complete! Matches detected: ${matches.length}`);
                     } catch (err) {
@@ -598,69 +650,141 @@ Promise.all([
         }, { passive: false });
 
         let lastFrameTime = 0;
-        
-        function loop(time) {
+
+	function loop(time) {
             const dt = (time - lastFrameTime) * 0.001;
             lastFrameTime = time;
 
-            if (currentSimulationState === "RUNNING" && replayDb && agentStmt) {
+	    if (currentSimulationState === "RUNNING" && replayDb && agentStmt && ticks.length > 0) {
                 if (!isPaused) {
-                    const stepIntervalMs = 66.6 / playbackSpeed; // ~15 FPS step rate
-                    if (time - lastTickTime > stepIntervalMs) {
-                        if (currentTickIndex < ticks.length - 1) {
-                            currentTickIndex++;
-                            updateSliderPosition();
-			    updateChatDisplay();
-                        } else {
-                            isPaused = true;
-                            const playBtn = document.getElementById('tl-play-btn');
-                            if (playBtn) playBtn.innerText = 'Play';
-                        }
-                        lastTickTime = time;
+                    replayTime += dt * playbackSpeed;
+                    
+                    while (currentTickIndex < ticks.length - 2 && ticks[currentTickIndex + 1].time <= replayTime) {
+                        currentTickIndex++;
                     }
+
+                    if (currentTickIndex >= ticks.length - 2) {
+                        isPaused = true;
+                        const playBtn = document.getElementById('tl-play-btn');
+                        if (playBtn) playBtn.innerText = 'Play';
+                    }
+                    
+                    const slider = document.getElementById('tl-slider');
+                    if (slider) slider.value = replayTime.toString();
+                    updateSliderPosition();
                 }
 
-		updateChatDisplay();
-		
-                const currentTickId = ticks[currentTickIndex].id;
+                updateChatDisplay();
 
-                // Bind parameters safely & evaluate agent frames
-                agentStmt.bind([currentTickId, currentTickId]);
-                let renderedCount = 0;
+                const tickA = ticks[currentTickIndex];
+                const tickB = currentTickIndex + 1 < ticks.length ? ticks[currentTickIndex + 1] : tickA;
+                
+                let alpha = 0;
+                if (tickB.time > tickA.time) {
+                    alpha = (replayTime - tickA.time) / (tickB.time - tickA.time);
+                    alpha = Math.max(0, Math.min(1, alpha));
+                }
 
-                const maxAgentsToRender = 1000;
-		
-		const agentBufferPtr = exports.get_agent_buffer_ptr();
-		const floatView = new Float32Array(
-		    wasmInstance.exports.memory.buffer, 
-		    agentBufferPtr, 
-		    maxAgentsToRender * 3
-		);
-
-                while (agentStmt.step() && renderedCount < maxAgentsToRender) {
+                agentStmt.bind([tickA.id, tickA.id]);
+                const stateA = new Map();
+                while (agentStmt.step()) {
                     const row = agentStmt.get();
-                    floatView[renderedCount * 3 + 0] = parseFloat(row[0]); // pos_x
-                    floatView[renderedCount * 3 + 1] = parseFloat(row[1]); // pos_y
+                    stateA.set(row[3], { 
+                        x: parseFloat(row[0]), 
+                        y: parseFloat(row[1]), 
+                        team: parseInt(row[2]),
+                        spawn_id: parseInt(row[4])
+                    });
+                }
+                agentStmt.reset();
+
+                agentStmt.bind([tickB.id, tickB.id]);
+                const stateB = new Map();
+                while (agentStmt.step()) {
+                    const row = agentStmt.get();
+                    stateB.set(row[3], { 
+                        x: parseFloat(row[0]), 
+                        y: parseFloat(row[1]),
+                        spawn_id: parseInt(row[4])
+                    });
+                }
+                agentStmt.reset();
+
+                const agentBufferPtr = exports.get_agent_buffer_ptr();
+                const floatView = new Float32Array(
+                    wasmInstance.exports.memory.buffer, 
+                    agentBufferPtr, 
+                    1000 * 3
+                );
+
+                let renderedCount = 0;
+                
+                for (const [agentId, a] of stateA.entries()) {
+                    if (renderedCount >= 1000) break;
+                    
+                    let x = a.x;
+                    let y = a.y;
+                    
+                    const b = stateB.get(agentId);
+                    // Gatekeeper: Only interpolate if the agent exists in tick B 
+                    // AND belongs to the exact same spawn cycle.
+                    if (b && a.spawn_id === b.spawn_id) {
+                        x = a.x + (b.x - a.x) * alpha;
+                        y = a.y + (b.y - a.y) * alpha;
+                    }
+                    
+                    floatView[renderedCount * 3 + 0] = x;
+                    floatView[renderedCount * 3 + 1] = y;
                     
                     let teamScalar = -1.0;
-                    const parsedTeam = parseInt(row[2]);
-                    if (parsedTeam === 0) teamScalar = 0.0;
-                    else if (parsedTeam === 1) teamScalar = 1.0;
-
+                    if (a.team === 0) teamScalar = 0.0;
+                    else if (a.team === 1) teamScalar = 1.0;
                     floatView[renderedCount * 3 + 2] = teamScalar;
+                    
                     renderedCount++;
                 }
-                agentStmt.reset(); // Crucial reset for sql.js prepared statements
 
-                exports.update_frame_data(renderedCount);
-                exports.render_frame(dt);
+                // Find the starting tick of the current match to avoid drawing corpses from previous rounds
+                let matchStartTickId = ticks[0].id;
+                const activeMatchIdx = matches.findIndex(m => currentTickIndex >= m.startTickIdx && currentTickIndex <= m.endTickIdx);
+                if (activeMatchIdx !== -1) {
+                    matchStartTickId = ticks[matches[activeMatchIdx].startTickIdx].id;
+                } else if (matches.length > 0 && currentTickIndex > matches[matches.length - 1].endTickIdx) {
+                    matchStartTickId = ticks[matches[matches.length - 1].startTickIdx].id;
+                }
+
+                // Process Corpses
+                corpseStmt.bind([matchStartTickId, tickA.id, matchStartTickId, tickA.id]);
+                while (corpseStmt.step()) {
+                    if (renderedCount >= 1000) break; // Respect the C Engine MAX_AGENTS limit
+                    
+                    const row = corpseStmt.get();
+                    floatView[renderedCount * 3 + 0] = parseFloat(row[0]);
+                    floatView[renderedCount * 3 + 1] = parseFloat(row[1]);
+
+                    let parsedTeam = parseInt(row[2]);
+                    if (parsedTeam === 0) {
+                        floatView[renderedCount * 3 + 2] = 2.0; // Dead Red
+                    } else if (parsedTeam === 1) {
+                        floatView[renderedCount * 3 + 2] = 3.0; // Dead Blue
+                    } else {
+                        floatView[renderedCount * 3 + 2] = 4.0; // Other
+                    }
+                    
+                    renderedCount++;
+                }
+                corpseStmt.reset();
+
+
+		exports.update_frame_data(renderedCount);
+		exports.render_frame(dt);
             }
             requestAnimationFrame(loop);
-        }
-        requestAnimationFrame(loop);
+	}
+	requestAnimationFrame(loop);
     }).catch(err => {
-        console.error("Wasm initialization error:", err);
-        appendToConsoleLog("[WASM ERROR] " + err.message);
+	console.error("Wasm initialization error:", err);
+	appendToConsoleLog("[WASM ERROR] " + err.message);
     });
 }).catch(err => {
     console.error("Initialization failure:", err);

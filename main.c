@@ -232,6 +232,10 @@ void render_frame(float dt_seconds) {
             gl_uniform3f(loc_uColor, 0.95f, 0.25f, 0.25f);
         } else if (team == 1.0f) {
             gl_uniform3f(loc_uColor, 0.25f, 0.45f, 0.95f);
+        } else if (team == 2.0f) {
+            gl_uniform3f(loc_uColor, 0.45f, 0.1f, 0.1f); // Darker Red (Casualty)
+        } else if (team == 3.0f) {
+            gl_uniform3f(loc_uColor, 0.1f, 0.15f, 0.45f); // Darker Blue (Casualty)
         } else {
             gl_uniform3f(loc_uColor, 0.6f, 0.6f, 0.6f);
         }
