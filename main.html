@@ -1,35 +1,54 @@
 <!DOCTYPE html>
 <html>
-  <head>
-    <title>Warband Replay Match Viewer</title>
-    <link rel="stylesheet" href="main.css">
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/sql-wasm.js"></script>
-  </head>
-  <body>
-    <canvas id="canvas"></canvas>
-    <div id="center-crosshair"></div>
-    <div id="log-box">Replay engine offline. Upload database.</div>
-    <button id="reset-btn" onclick="triggerReset()">Load Different Log</button>
+    <head>
+	<title>Warband Replay Match Viewer</title>
+	<link rel="stylesheet" href="main.css">
+	<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/sql-wasm.js"></script>
+    </head>
+    <body>
+	<canvas id="canvas"></canvas>
+	<div id="center-crosshair"></div>
 
-    <div id="upload-overlay" class="overlay">
-      <div class="card">
-        <h2>Warband Replay Viewer</h2>
-        <p>Select a recorded <code>replayLog_...sqlite</code> database to visualize.</p>
-        <input type="file" id="file-input" accept=".sqlite" style="display:none;">
-        <button class="file-btn" onclick="document.getElementById('file-input').click()">Load Replay Database</button>
-      </div>
-    </div>
+	<div id="chat-box" class="ui-panel">
+	    <div class="panel-header" onclick="toggleMinimize('chat-content')">
+		<span>[Chat Replay]</span>
+		<span class="toggle-icon">-</span>
+	    </div>
+	    <div id="chat-content" class="panel-content">
+		<div>System: Chat initialized...</div>
+	    </div>
+	</div>
 
-    <div id="loading-overlay" class="overlay" style="display: none;">
-      <div class="card">
-        <h2>Parsing Database...</h2>
-        <div class="progress-container">
-          <div id="progress-fill" class="progress-bar" style="width: 75%;"></div>
-        </div>
-        <div id="progress-text" style="color: #00ff00; font-size: 14px; margin-top: 10px;">Compiling Match Boundaries</div>
-      </div>
-    </div>
-    
-    <script src="main.js"></script>
-  </body>
+	<div id="log-box" class="ui-panel minimized">
+	    <div class="panel-header" onclick="toggleMinimize('log-content')">
+		<span>[System Logs]</span>
+		<span class="toggle-icon">-</span>
+	    </div>
+	    <div id="log-content" class="panel-content">
+		Replay engine offline. Upload database.
+	    </div>
+	</div>
+	<button id="reset-btn" onclick="triggerReset()">Load Different Log</button>
+
+	<div id="upload-overlay" class="overlay">
+	    <div class="card">
+		<h2>Warband Replay Viewer</h2>
+		<p>Select a recorded <code>replayLog_...sqlite</code> database to visualize.</p>
+		<input type="file" id="file-input" accept=".sqlite" style="display:none;">
+		<button class="file-btn" onclick="document.getElementById('file-input').click()">Load Replay Database</button>
+	    </div>
+	</div>
+
+	<div id="loading-overlay" class="overlay" style="display: none;">
+	    <div class="card">
+		<h2>Parsing Database...</h2>
+		<div class="progress-container">
+		    <div id="progress-fill" class="progress-bar" style="width: 75%;"></div>
+		</div>
+		<div id="progress-text" style="color: #00ff00; font-size: 14px; margin-top: 10px;">Compiling Match Boundaries</div>
+	    </div>
+	</div>
+	
+	<script src="main.js"></script>
+    </body>
 </html>

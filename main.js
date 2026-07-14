@@ -1,6 +1,6 @@
 const canvas = document.getElementById('canvas');
 const gl = canvas.getContext('webgl');
-const logBox = document.getElementById('log-box');
+const logContent = document.getElementById('log-content');
 const uploadOverlay = document.getElementById('upload-overlay');
 const loadingOverlay = document.getElementById('loading-overlay');
 const resetBtn = document.getElementById('reset-btn');
@@ -17,6 +17,8 @@ let currentTickIndex = 0;
 let lastTickTime = 0;
 let isPaused = false;
 let playbackSpeed = 1.0;    // Realtime speed modifier
+let chats = []; 
+let lastDisplayedTickIndex = -1;
 
 // Compiled SQLite Statement (for loop performance optimization)
 let agentStmt = null;
@@ -33,13 +35,27 @@ function triggerReset() {
         agentStmt.free();
         agentStmt = null;
     }
+    
+    // Clear chat system
+    chats = [];
+    lastDisplayedTickIndex = -1;
+    document.getElementById('chat-content').innerHTML = '<div>System: Chat initialized...</div>';
+    
     appendToConsoleLog("[System] Reset complete. Select a new sqlite database.");
+}
+
+function toggleMinimize(contentId) {
+    const panel = document.getElementById(contentId).parentElement;
+    panel.classList.toggle('minimized');
+    
+    const icon = panel.querySelector('.toggle-icon');
+    icon.innerText = panel.classList.contains('minimized') ? '+' : '-';
 }
 
 function appendToConsoleLog(message) {
     activeLogs.push(message);
     if (activeLogs.length > 5) activeLogs.shift();
-    logBox.innerText = activeLogs.join('\n');
+    logContent.innerText = activeLogs.join('\n');
 }
 
 function getString(charPtr) {
@@ -348,9 +364,9 @@ function processDatabaseAndCompileMatches() {
 
     // Map boundary tick IDs to ordered indices
     const boundaryIndices = Array.from(boundaryTicks)
-        .map(tId => tickIdToIndex.get(tId))
-        .filter(idx => idx !== undefined)
-        .sort((a, b) => a - b);
+          .map(tId => tickIdToIndex.get(tId))
+          .filter(idx => idx !== undefined)
+          .sort((a, b) => a - b);
 
     // Group close boundary events occurring within 15 seconds (ticks) of each other
     const mergedBoundaries = [];
@@ -416,6 +432,26 @@ function processDatabaseAndCompileMatches() {
         WHERE a.tick_id = ? AND s.is_human = 1
     `);
 
+    // 2.5 Cache Chat Logs mapped to Tick Indices
+    chats = [];
+    const chatsRes = replayDb.exec(`
+        SELECT e.tick_id, c.username, c.message, c.team 
+        FROM chats c
+        JOIN events e ON c.event_id = e.id
+        ORDER BY e.tick_id ASC
+    `);
+    if (chatsRes.length > 0 && chatsRes[0].values) {
+        chats = chatsRes[0].values.map(v => {
+            const tickIdx = tickIdToIndex.get(v[0]);
+            return {
+                tickIdx: tickIdx !== undefined ? tickIdx : -1,
+                username: v[1],
+                message: v[2],
+                team: v[3]
+            };
+        }).filter(c => c.tickIdx !== -1);
+    }
+    
     // 3. Resolve Map Bounds
     const boundsRes = replayDb.exec(`
         SELECT MIN(a.pos_x), MAX(a.pos_x), MIN(a.pos_y), MAX(a.pos_y)
@@ -441,6 +477,39 @@ function processDatabaseAndCompileMatches() {
     }
     
     wasmInstance.exports.set_map_bounds(minX, maxX, minY, maxY);
+}
+
+function updateChatDisplay() {
+    const chatContent = document.getElementById('chat-content');
+    if (!chatContent) return;
+
+    // Rebuild log context if scrubber moves backwards or jumps drastically
+    if (currentTickIndex < lastDisplayedTickIndex || Math.abs(currentTickIndex - lastDisplayedTickIndex) > 15) {
+        chatContent.innerHTML = '';
+        const history = chats.filter(c => c.tickIdx <= currentTickIndex).slice(-20); // Keep last 20 messages
+        history.forEach(appendChatToUI);
+    } else {
+        // Smooth progressive play forward
+        const nextChats = chats.filter(c => c.tickIdx > lastDisplayedTickIndex && c.tickIdx <= currentTickIndex);
+        nextChats.forEach(appendChatToUI);
+    }
+    lastDisplayedTickIndex = currentTickIndex;
+}
+
+function appendChatToUI(chat) {
+    const chatContent = document.getElementById('chat-content');
+    const msgDiv = document.createElement('div');
+    msgDiv.style.marginBottom = '5px';
+    msgDiv.style.wordBreak = 'break-word';
+
+    // Team color identification (Default to Green, 0 to Team Blue, 1 to Team Red)
+    let color = '#00ff00'; 
+    if (chat.team === '0') color = '#51adff'; 
+    else if (chat.team === '1') color = '#ff5151';
+
+    msgDiv.innerHTML = `<span style="color: ${color}; font-weight: bold;">[${chat.username}]</span>: <span style="color: #e0e0e0;">${chat.message}</span>`;
+    chatContent.appendChild(msgDiv);
+    chatContent.scrollTop = chatContent.scrollHeight; // Auto-scroll
 }
 
 Promise.all([
@@ -541,6 +610,7 @@ Promise.all([
                         if (currentTickIndex < ticks.length - 1) {
                             currentTickIndex++;
                             updateSliderPosition();
+			    updateChatDisplay();
                         } else {
                             isPaused = true;
                             const playBtn = document.getElementById('tl-play-btn');
@@ -550,6 +620,8 @@ Promise.all([
                     }
                 }
 
+		updateChatDisplay();
+		
                 const currentTickId = ticks[currentTickIndex].id;
 
                 // Bind parameters safely & evaluate agent frames
