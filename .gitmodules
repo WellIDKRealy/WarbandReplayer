@@ -3,4 +3,4 @@
 	url = git@github.com:WellIDKRealy/cglm.git
 [submodule "ubench"]
 	path = ubench
-	url = https://github.com/WellIDKRealy/ubench.h.git
+	url = git@github.com:WellIDKRealy/ubench.h.git
