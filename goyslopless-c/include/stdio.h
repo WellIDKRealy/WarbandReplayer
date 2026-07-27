@@ -3,6 +3,9 @@
 
 #include <stddef.h>
 
+/* SQLite falls back on this for SQLITE_MAX_PATHLEN if not set explicitly. */
+#define FILENAME_MAX 4096
+
 struct FILE {
   int handle;
 };

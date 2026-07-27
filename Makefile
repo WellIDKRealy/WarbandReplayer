@@ -1,33 +1,34 @@
-# The compiler
 CC = clang
 
-# Compiler flags for bare-metal WebAssembly
-# --target=wasm32 tells clang we want wasm output
-# -nostdlib strips out all the standard library garbage you don't need
-# -O3 optimizes for speed and size
 CFLAGS = --target=wasm32 -fno-builtin -nostdlib -static -Os -msimd128 -D__EMSCRIPTEN__ -I./cglm/include -I./goyslopless-c/include/ -std=gnu99 
-# Linker flags passed through Clang to wasm-ld
-# --no-entry: We don't have a standard main() entry point for an OS
-# --export-all: Makes all your C functions available to JavaScript
-# --allow-undefined: Crucial for WebGL. Allows you to call JS/WebGL functions from C even if they aren't defined at compile time.
+# --allow-undefined: Nessecary for WebGL
 LDFLAGS = -fuse-ld=/usr/bin/wasm-ld -Wl,--no-entry -Wl,--import-undefined
 
-# The target output
-TARGETS = main.wasm benchmark.wasm
+TARGETS = main.wasm benchmark.wasm sqlite3.wasm
 LIBS-SRC = goyslopless-c/lib/*.c
 
-# Default rule
+MAIN-EXPORTS = set_screen_dimensions set_map_bounds get_vs_main_ptr get_fs_main_ptr get_vs_grid_ptr get_fs_grid_ptr init_engine init_gl_programs get_agent_buffer_ptr update_frame_data render_frame apply_zoom
+BENCHMARK-EXPORTS = main
+SQLITE3-EXPORTS = sqlite3_open sqlite3_exec sqlite3_close sqlite3_free malloc free
+
+MAIN-FLAGS = $(CFLAGS) $(LDFLAGS) $(LIBS-SRC) $(shell echo $(MAIN-EXPORTS) | xargs -n 1 printf '-Wl,--export=%s ')
+BENCHMARK-FLAGS = $(CFLAGS) $(LDFLAGS) $(LIBS-SRC) $(shell echo $(BENCHMARK-EXPORTS) | xargs -n 1 printf '-Wl,--export=%s ')
+SQLITE3-FLAGS = -DSQLITE_OS_OTHER=1 -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION $(CFLAGS) $(LDFLAGS) $(LIBS-SRC) $(shell echo $(SQLITE3-EXPORTS) | xargs -n 1 printf '-Wl,--export=%s ')
+
+#-Wl,--export-all
+
 all: $(TARGETS)
 
-
 main.wasm: $(LIBS-SRC) main.c
-	$(CC) $(CFLAGS) $(LDFLAGS) -o main.wasm main.c -Wl,--export-all $(LIBS-SRC)
+	$(CC) $(MAIN-FLAGS) -o main.wasm main.c 
 
 benchmark.wasm: $(LIBS-SRC) benchmark.c
-	$(CC) $(CFLAGS) -I./ubench $(LDFLAGS) -o benchmark.wasm benchmark.c -Wl,--export=main $(LIBS-SRC)
+	$(CC) $(BENCHMARK-FLAGS) -I./ubench -o benchmark.wasm benchmark.c 
 	wasm-opt -Os --asyncify benchmark.wasm -o benchmark.wasm
 
-# Clean rule
+sqlite3.wasm: $(LIBS-SRC) sqlite3/sqlite3.c sqlite3/sqlite3_vfs_mem.c
+	$(CC) $(SQLITE3-FLAGS) -I./sqlite3 -o sqlite3.wasm sqlite3/sqlite3.c sqlite3/sqlite3_vfs_mem.c
+
 clean:
 	rm -f $(TARGETS)
 

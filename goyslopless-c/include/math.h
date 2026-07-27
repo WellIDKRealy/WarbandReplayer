@@ -1,7 +1,13 @@
 #ifndef _MATH_H_
 #define _MATH_H_
 
-float fabs(float x);
+/* Compiler builtins so we don't need libc's own definitions of these -
+ * every freestanding-capable compiler (clang/gcc) implements them. */
+#define INFINITY (__builtin_inff())
+#define NAN      (__builtin_nanf(""))
+#define HUGE_VAL  (__builtin_huge_val())
+
+double fabs(double x);
 float fabsf(float x);
 int abs(int x);
 

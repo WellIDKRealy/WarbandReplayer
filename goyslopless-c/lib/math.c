@@ -10,15 +10,31 @@ typedef union {
 #define MANTISSA_MASK 0x007FFFFF
 #define EXPONENT_MASK 0x7F800000
 
-float fabs(float x) {
+typedef union {
+    double d;
+    unsigned long long i;
+} double_bits;
+
+#define DOUBLE_SIGN_BIT_MASK 0x8000000000000000ULL
+
+/* NOTE: this used to be `float fabs(float x)`, which silently truncated
+ * every double passed to it (fabs(double) is what C actually specifies,
+ * and it's what SQLite's amalgamation calls throughout its floating-point
+ * comparison code) through float precision on every call. Kept as a
+ * genuine double implementation now; fabsf below has its own float-only
+ * bit-trick rather than delegating to this one. */
+double fabs(double x) {
+  double_bits u;
+  u.d = x;
+  u.i &= ~DOUBLE_SIGN_BIT_MASK;
+  return u.d;
+}
+
+float fabsf(float x) {
   float_bits u;
   u.f = x;
   u.i &= ~SIGN_BIT_MASK; // Clear the sign bit
   return u.f;
-}
-
-float fabsf(float x) {
-  return fabs(x);
 }
 
 int abs(int x) {
@@ -86,11 +102,14 @@ float modff(float value, float* iptr) {
 
 float sqrtf(float x) {
     if (x < 0.0f) return (0.0f / 0.0f);
+#if defined(__wasm__)
     // This semantic pattern is safely recognized by Clang/WASM as a native instruction
     float res;
     __asm__ ("f32.sqrt %0, %1" : "=r"(res) : "r"(x)); // Optional fallback if using inline assembly
+    (void)res;
+#endif
     // If inline asm is not preferred, keep a fast 4-iteration Newton-Raphson or rely on -O3 auto-lowering
-    return __builtin_sqrtf(x); 
+    return __builtin_sqrtf(x);
 }
 
 double sqrt(double x) {
