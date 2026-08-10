@@ -1,46 +1,17 @@
 #include "stdlib.h"
 #include "string.h"
 
-#define ARENA_SIZE (256 * 1024) // 256KB static footprint for benchmark allocations
-static unsigned char arena[ARENA_SIZE];
-static size_t arena_idx = 0;
-
-void *malloc(size_t size) {
-    // 8-byte memory boundary alignment
-    size = (size + 7) & ~7;
-    if (arena_idx + sizeof(size_t) + size > ARENA_SIZE) return NULL;
-    
-    // Store size inline behind the pointer to handle realloc requests later
-    size_t *header = (size_t *)&arena[arena_idx];
-    *header = size;
-    
-    void *ptr = (void *)(header + 1);
-    arena_idx += sizeof(size_t) + size;
-    return ptr;
-}
-
-void free(void *ptr) {
-    (void)ptr; // No-op: Benchmarks live for the application duration
-}
-
-void *realloc(void *ptr, size_t size) {
-    if (!ptr) return malloc(size);
-    
-    size_t *header = (size_t *)ptr - 1;
-    size_t old_size = *header;
-    
-    if (size <= old_size) return ptr; 
-    
-    void *new_ptr = malloc(size);
-    if (new_ptr) {
-        memcpy(new_ptr, ptr, old_size);
-    }
-    return new_ptr;
-}
+/* malloc/free/realloc/calloc now live in heap.c (a real boundary-tag
+ * free-list heap) - this file kept the old 256KB-bump/leak-everything
+ * allocator, which was unusable for any real SQLite workload. */
 
 void exit(int status) {
     (void)status;
     while(1); // Trap WebAssembly thread execution
+}
+
+void abort(void) {
+    while(1); // Trap WebAssembly thread execution - same convention as exit()
 }
 
 double atof(const char *str) {

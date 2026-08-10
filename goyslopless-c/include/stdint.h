@@ -16,6 +16,32 @@ typedef unsigned long      uintptr_t;
 typedef long long          intmax_t;
 typedef unsigned long long uintmax_t;
 
+/* "least"/"fast" variants (C99 7.18.1.2/7.18.1.3) - on wasm32 these just
+ * alias the same-width exact types. Needed transitively by clang's own
+ * bundled <stdatomic.h>, which declares atomic_int_least16_t & co. */
+typedef int8_t    int_least8_t;
+typedef uint8_t    uint_least8_t;
+typedef int16_t   int_least16_t;
+typedef uint16_t   uint_least16_t;
+typedef int32_t   int_least32_t;
+typedef uint32_t   uint_least32_t;
+typedef int64_t   int_least64_t;
+typedef uint64_t   uint_least64_t;
+
+typedef int32_t   int_fast8_t;
+typedef uint32_t   uint_fast8_t;
+typedef int32_t   int_fast16_t;
+typedef uint32_t   uint_fast16_t;
+typedef int32_t   int_fast32_t;
+typedef uint32_t   uint_fast32_t;
+typedef int64_t   int_fast64_t;
+typedef uint64_t   uint_fast64_t;
+
+#ifndef _WCHAR_T_DEFINED
+#define _WCHAR_T_DEFINED
+typedef int wchar_t;
+#endif
+
 /* Integer constant macros (C99 7.18.4). Needed for literals like
  * UINT64_C(0x8000000000000000) used e.g. by SQLite's fixed-point tables,
  * which otherwise get parsed as a call to an undeclared function and

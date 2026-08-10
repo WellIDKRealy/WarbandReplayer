@@ -1,0 +1,5 @@
+# Real player replay logs (names/chat messages are real user data) - never
+# commit these. The synthetic fixture (fake data, small) is fine to track.
+testdata/replayLog_real_15battles.sqlite
+testdata/*.7z
+testdata/*.xz

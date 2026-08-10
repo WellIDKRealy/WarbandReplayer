@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html><body><pre id="out">running...</pre>
+<script>
+let log = "";
+function line(s) { log += s + "\n"; document.getElementById('out').textContent = log; console.log(s); }
+
+function makeWorker() { return new Worker('../replay-worker.js?v=' + Date.now()); }
+function waitFor(worker, predicate) {
+  return new Promise((resolve, reject) => {
+    const handler = (e) => {
+      if (e.data.type === 'error') { worker.removeEventListener('message', handler); reject(new Error(JSON.stringify(e.data))); return; }
+      if (predicate(e.data)) { worker.removeEventListener('message', handler); resolve(e.data); }
+    };
+    worker.addEventListener('message', handler);
+  });
+}
+
+(async () => {
+  try {
+    line("crossOriginIsolated=" + crossOriginIsolated);
+    const memory = new WebAssembly.Memory({ initial: 16384, maximum: 16384, shared: true }); // 1GB
+    const module = await WebAssembly.compile(await (await fetch('../replay_worker.wasm', { cache: 'no-store' })).arrayBuffer());
+
+    line("fetching real replay file...");
+    const fetchT0 = performance.now();
+    const fileResp = await fetch('replayLog_real_15battles.sqlite');
+    const fileBlob = await fileResp.blob();
+    const file = new File([fileBlob], 'replayLog_real_15battles.sqlite');
+    line(`fetched ${(file.size/1024/1024).toFixed(1)}MB in ${(performance.now()-fetchT0).toFixed(0)}ms`);
+
+    const loader = makeWorker();
+    send: {
+      loader.postMessage({ type: 'init', role: 'loader', memory, module, threadId: 0 });
+    }
+    await waitFor(loader, d => d.type === 'ready');
+    line("loader ready");
+
+    let lastPct = -1;
+    loader.addEventListener('message', (e) => {
+      if (e.data.type === 'progress') {
+        const pct = Math.round((e.data.loaded / e.data.total) * 100);
+        if (pct !== lastPct && pct % 10 === 0) { line(`  load progress: ${pct}% (${(e.data.loaded/1024/1024).toFixed(0)}MB)`); lastPct = pct; }
+      }
+    });
+
+    const t0 = performance.now();
+    const loadResultPromise = waitFor(loader, d => d.type === 'loaded');
+    loader.postMessage({ type: 'load', file });
+    const loadResult = await loadResultPromise;
+    const loadMs = performance.now() - t0;
+
+    line(`\n=== LOAD COMPLETE in ${(loadMs/1000).toFixed(2)}s ===`);
+    line("matchCount: " + loadResult.matchCount);
+    line("matches: " + JSON.stringify(loadResult.matches, null, 1));
+    line("total time span: " + (loadResult.totalEnd - loadResult.totalStart).toFixed(0) + "s");
+
+    // --- parallel bounds: 1 vs N readers, on the REAL data ---
+    async function timeBounds(readerCount, mem) {
+      const readers = [];
+      let remaining = readerCount;
+      const t0 = performance.now();
+      await new Promise((resolve, reject) => {
+        for (let i = 0; i < readerCount; i++) {
+          const w = makeWorker();
+          w.onmessage = (e) => {
+            if (e.data.type === 'ready') w.postMessage({ type: 'computeBounds', readerIdx: i, readerCount });
+            else if (e.data.type === 'boundsReady') { w.terminate(); remaining--; if (remaining === 0) resolve(); }
+            else if (e.data.type === 'error') reject(new Error(e.data.message));
+          };
+          w.postMessage({ type: 'init', role: 'reader', memory: mem, module, threadId: i + 1 });
+          readers.push(w);
+        }
+      });
+      return performance.now() - t0;
+    }
+
+    line("\n=== PARALLEL BOUNDS COMPUTATION (real 2.3M-row agent_states) ===");
+    const oneReaderMs = await timeBounds(1, memory);
+    line("1 reader:  " + oneReaderMs.toFixed(1) + "ms");
+    const hw = Math.min(navigator.hardwareConcurrency || 4, 8);
+    const nReaderMs = await timeBounds(hw, memory);
+    line(hw + " readers: " + nReaderMs.toFixed(1) + "ms");
+    line("speedup: " + (oneReaderMs / nReaderMs).toFixed(2) + "x");
+
+    const combinedPromise = waitFor(loader, d => d.type === 'boundsCombined');
+    loader.postMessage({ type: 'combineBounds', readerCount: hw });
+    const combined = await combinedPromise;
+    line("combined bounds: " + JSON.stringify(combined));
+
+    // --- playback smoothness: request 100 sequential frames across the whole timeline, time each ---
+    line("\n=== PLAYBACK: 100 sequential frame requests across full timeline ===");
+    const frameTimes = [];
+    const span = loadResult.totalEnd - loadResult.totalStart;
+    for (let i = 0; i < 100; i++) {
+      const t = loadResult.totalStart + (span * i) / 100;
+      const ft0 = performance.now();
+      const fp = waitFor(loader, d => d.type === 'frame');
+      loader.postMessage({ type: 'frame', time: t, seek: false });
+      const f = await fp;
+      frameTimes.push(performance.now() - ft0);
+      if (i === 0) line("first frame: count=" + f.count + " activeMatch=" + f.activeMatchIndex);
+    }
+    frameTimes.sort((a, b) => a - b);
+    const avg = frameTimes.reduce((a, b) => a + b, 0) / frameTimes.length;
+    const p50 = frameTimes[Math.floor(frameTimes.length * 0.5)];
+    const p95 = frameTimes[Math.floor(frameTimes.length * 0.95)];
+    const max = frameTimes[frameTimes.length - 1];
+    line(`frame request latency: avg=${avg.toFixed(2)}ms p50=${p50.toFixed(2)}ms p95=${p95.toFixed(2)}ms max=${max.toFixed(2)}ms`);
+
+    loader.terminate();
+
+    const checks = [
+      ["match count near 15 (Discord claim)", loadResult.matchCount >= 10 && loadResult.matchCount <= 20],
+      ["load completed without error", true],
+      ["bounds are sane", combined.maxX - combined.minX < 5000 && combined.maxY - combined.minY < 5000],
+      ["avg frame latency well under 16.6ms (60fps budget)", avg < 16.6],
+      ["p95 frame latency reasonable", p95 < 50],
+    ];
+    let allPass = true;
+    for (const [name, ok] of checks) { line((ok?"PASS":"FAIL") + ": " + name); if (!ok) allPass = false; }
+    line(allPass ? "\nRESULT: PASS" : "\nRESULT: FAIL");
+  } catch (e) {
+    line("EXCEPTION: " + e.message + "\n" + (e.stack || ""));
+  }
+})();
+</script>
+</body></html>

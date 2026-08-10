@@ -1,9 +1,9 @@
 <!DOCTYPE html>
 <html>
     <head>
+	<script src="coi-shim.js"></script>
 	<title>Warband Replay Match Viewer</title>
 	<link rel="stylesheet" href="main.css">
-	<script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.8.0/sql-wasm.js"></script>
     </head>
     <body>
 	<canvas id="canvas"></canvas>
@@ -43,9 +43,9 @@
 	    <div class="card">
 		<h2>Parsing Database...</h2>
 		<div class="progress-container">
-		    <div id="progress-fill" class="progress-bar" style="width: 75%;"></div>
+		    <div id="progress-fill" class="progress-bar" style="width: 0%;"></div>
 		</div>
-		<div id="progress-text" style="color: #00ff00; font-size: 14px; margin-top: 10px;">Compiling Match Boundaries</div>
+		<div id="progress-text" style="color: #00ff00; font-size: 14px; margin-top: 10px;">Starting worker pool...</div>
 	    </div>
 	</div>
 	

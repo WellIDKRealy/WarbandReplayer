@@ -2,7 +2,8 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8">
-    <title>WASM Graphics Engine Math Benchmark</title>
+    <title>WASM Replay Engine Performance Dashboard</title>
+    <script src="coi-shim.js"></script>
     <style>
       body {
           font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -24,6 +25,8 @@
           margin-bottom: 24px;
       }
       h1 { margin: 0; font-size: 24px; color: #f8fafc; }
+      h2 { font-size: 16px; color: #cbd5e1; margin: 32px 0 12px 0; }
+      p.sub { color: #94a3b8; margin: 4px 0 0 0; }
       .btn {
           background-color: #3b82f6;
           color: white;
@@ -36,6 +39,7 @@
           transition: background-color 0.2s;
       }
       .btn:hover { background-color: #2563eb; }
+      .btn:disabled { background-color: #334155; cursor: not-allowed; }
       table {
           width: 100%;
           border-collapse: collapse;
@@ -68,7 +72,7 @@
       .status-running { background-color: #eab30822; color: #eab308; }
       .status-ok { background-color: #22c55e22; color: #22c55e; }
       .status-failed { background-color: #ef444422; color: #ef4444; }
-      
+
       .console-panel {
           background-color: #020617;
           border: 1px solid #1e293b;
@@ -81,6 +85,15 @@
           color: #38bdf8;
           white-space: pre-wrap;
       }
+      .card {
+          background-color: #1e293b;
+          border-radius: 8px;
+          padding: 16px 20px;
+          margin-bottom: 16px;
+      }
+      .row { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+      .metric { font-family: monospace; font-size: 13px; color: #38bdf8; }
+      input[type=file] { color: #94a3b8; }
     </style>
   </head>
   <body>
@@ -88,8 +101,8 @@
 	<div class="container">
       <header>
         <div>
-          <h1>Custom Math Library Performance Dashboard</h1>
-          <p style="color: #94a3b8; margin: 4px 0 0 0;">Target Environment: Wasm32 Standalone Engine Runtime</p>
+          <h1>Replay Engine Performance Dashboard</h1>
+          <p class="sub">Target Environment: Wasm32 Standalone Engine Runtime</p>
         </div>
         <button class="btn" id="runBtn" onclick="runBenchmarks()">Execute Benchmark Suite</button>
       </header>
@@ -112,14 +125,28 @@
 
       <h3 style="color: #94a3b8; font-size: 14px; text-transform: uppercase;">Raw Terminal Stream Output</h3>
       <div class="console-panel" id="consoleOut">Ready. System standing by...</div>
+
+      <h2>System Benchmark: Parallel Load (real Workers, real replay_worker.wasm)</h2>
+      <p class="sub">Drives the actual multithreaded replay engine end-to-end - not a UBENCH micro-benchmark - to
+      answer the one question those can't: did adding worker threads actually help? Uses the bundled synthetic
+      fixture by default, or supply a real <code>replayLog_*.sqlite</code> for realistic-scale numbers.</p>
+      <div class="card">
+        <div class="row">
+          <input type="file" id="systemBenchFile" accept=".sqlite">
+          <button class="btn" id="systemBenchBtn" onclick="runSystemBenchmark()">Run Parallel-Load Benchmark</button>
+        </div>
+        <div class="row" style="margin-top: 12px;">
+          <div class="metric" id="systemBenchResult">No run yet.</div>
+        </div>
+      </div>
 	</div>
 
 	<script>
       let wasmMemory;
       let rawOutputBuffer = "";
-	  let lineBuffer = ""; // holds partial line(s) across handleCPrint calls
+	  let lineBuffer = "";
+      window.__benchmarkResults = { ubench: [], system: null };
 
-      // Read null-terminated string segments directly out of WASM linear memory
       function readStringFromWasm(ptr) {
           const memoryView = new Uint8Array(wasmMemory.buffer);
           let end = ptr;
@@ -127,16 +154,14 @@
           return new TextDecoder().decode(memoryView.subarray(ptr, end));
       }
 
-      // Capture prints from C and parse them line by line
 	  function handleCPrint(ptr) {
 		  const text = readStringFromWasm(ptr);
 		  rawOutputBuffer += text;
-		  
+
 		  const consoleEl = document.getElementById("consoleOut");
 		  consoleEl.textContent = rawOutputBuffer;
 		  consoleEl.scrollTop = consoleEl.scrollHeight;
 
-		  // Parse only whole lines
 		  lineBuffer += text;
 		  let nl;
 		  while ((nl = lineBuffer.indexOf("\n")) !== -1) {
@@ -147,69 +172,52 @@
 	  }
 
 	  function parseBenchmarkOutput(text) {
-          const lines = text.split('\n');
           const tbody = document.querySelector("#resultsTable tbody");
 
 		  const reRun = /^\[\s*RUN\s*\]\s*(.+?)\s*$/;
-		  // OK line example:
-		  // [       OK ] Graphics_cglm.VectorNormalize (mean 0.000(null), confidence interval +- 0.000000%)
 		  const reOk = /^\[\s*OK\s*\]\s*(.+?)\s*\(mean\s+([^,]+),\s*confidence interval\s*\+\-\s*([0-9.]+)%\)\s*$/;
-
-		  // FAILED line example:
-		  // [  FAILED  ] Graphics_cglm.EulerRotation (mean 0.000(null), confidence interval +- 0.000000%)
 		  const reFailed = /^\[\s*FAILED\s*\]\s*(.+?)\s*(?:\(|$)/;
 
-		  for (const line of lines) {
-			  let m;
-
-			  console.log(line)
-			  
-			  if ((m = line.match(reRun))) {
-				  console.log("NIGGER1")
-				  const testName = m[1].trim();
-
-				  if (tbody.querySelector("td[colspan]")) tbody.innerHTML = "";
-
-				  const row = document.createElement("tr");
-				  row.id = "row_" + testName.replace(".", "_");
-				  row.innerHTML = `
+		  let m;
+		  if ((m = text.match(reRun))) {
+			  const testName = m[1].trim();
+			  if (tbody.querySelector("td[colspan]")) tbody.innerHTML = "";
+			  const row = document.createElement("tr");
+			  row.id = "row_" + testName.replace(".", "_");
+			  row.innerHTML = `
         <td style="font-weight: 500;">${testName}</td>
         <td><span class="status-badge status-running">RUNNING</span></td>
         <td style="color: #64748b;">Computing...</td>
         <td style="color: #64748b;">Calculating...</td>
       `;
-				  tbody.appendChild(row);
-				  continue;
+			  tbody.appendChild(row);
+			  return;
+		  }
+
+		  if ((m = text.match(reOk))) {
+			  const testName = m[1].trim();
+			  const meanVal = m[2].trim();
+			  const confidenceVal = m[3].trim();
+
+			  const row = document.getElementById("row_" + testName.replace(".", "_"));
+			  if (row) {
+				  row.cells[1].innerHTML = `<span class="status-badge status-ok">SUCCESS</span>`;
+				  row.cells[2].innerHTML = `<strong style="color: #38bdf8;">${meanVal}</strong>`;
+				  row.cells[3].textContent = `± ${confidenceVal}`;
 			  }
+			  window.__benchmarkResults.ubench.push({ name: testName, mean: meanVal, confidencePct: confidenceVal, status: "ok" });
+			  return;
+		  }
 
-			  if ((m = line.match(reOk))) {
-				  console.log("NIGGER2")
-				  const testName = m[1].trim();
-				  const meanVal = m[2].trim();          // "0.000(null)"
-				  const confidenceVal = m[3].trim();   // "0.000000"
-
-				  const row = document.getElementById("row_" + testName.replace(".", "_"));
-				  if (row) {
-					  row.cells[1].innerHTML = `<span class="status-badge status-ok">SUCCESS</span>`;
-					  row.cells[2].innerHTML = `<strong style="color: #38bdf8;">${meanVal}</strong>`;
-					  row.cells[3].textContent = `± ${confidenceVal}`;
-				  }
-				  continue;
+		  if ((m = text.match(reFailed))) {
+			  const testName = m[1].trim();
+			  const row = document.getElementById("row_" + testName.replace(".", "_"));
+			  if (row) {
+				  row.cells[1].innerHTML = `<span class="status-badge status-failed">FAILED</span>`;
+				  row.cells[2].textContent = "N/A";
+				  row.cells[3].textContent = "Variance Error";
 			  }
-
-			  if ((m = line.match(reFailed))) {
-				  console.log("NIGGER3")
-				  const testName = m[1].trim();
-
-				  const row = document.getElementById("row_" + testName.replace(".", "_"));
-				  if (row) {
-					  row.cells[1].innerHTML = `<span class="status-badge status-failed">FAILED</span>`;
-					  row.cells[2].textContent = "N/A";
-					  row.cells[3].textContent = "Variance Error";
-				  }
-			  }
-			  
-			  console.log("NIGGER4")
+			  window.__benchmarkResults.ubench.push({ name: testName, status: "failed" });
 		  }
 	  }
 
@@ -217,37 +225,48 @@
           document.getElementById("consoleOut").textContent = "Initializing environment components...\n";
           document.querySelector("#resultsTable tbody").innerHTML = `<tr><td colspan="4" style="text-align: center; color: #eab308;">Running benchmarks. Please wait...</td></tr>`;
           rawOutputBuffer = "";
-          
+          window.__benchmarkResults.ubench = [];
+
           document.getElementById("runBtn").disabled = true;
 
 		  let wasmInstance;
-
-		  const DATA_ADDR = 16;     // must point to valid memory for the asyncify data struct
-		  const DATA_STACK_END = 1024; // choose an end address within your wasm memory
+		  const DATA_ADDR = 16;
+		  const DATA_STACK_END = 1024;
 		  let view;
+		  let sleeping = false;
 
-		  let sleeping = false; 
-		  
           const importObject = {
 			  env: {
 				  js_print_string: handleCPrint,
+				  clock_gettime: (clkId, tpPtr) => {
+					  const dv = new DataView(wasmInstance.exports.memory.buffer);
+					  const ms = performance.now();
+					  dv.setInt32(tpPtr, Math.floor(ms / 1000), true);
+					  dv.setInt32(tpPtr + 4, Math.floor((ms % 1000) * 1e6), true);
+					  return 0;
+				  },
 				  emscripten_performance_now: () => performance.now(),
 				  yield_thread: () => {
+					  // Real cooperative yielding needs `wasm-opt --asyncify` to have
+					  // run on benchmark.wasm (see Makefile) - binaryen isn't always
+					  // available (e.g. not packaged for choco at the time of writing).
+					  // Without it, asyncify_start_unwind/etc simply don't exist on the
+					  // module; degrade to a no-op rather than crash - the suite still
+					  // runs correctly, just without yielding back to the browser
+					  // between benchmarks (fine for this suite's size; would matter
+					  // for a much longer-running one).
+					  if (typeof wasmInstance.exports.asyncify_start_unwind !== "function") return;
 					  if (!sleeping) {
-						  // First time: start unwinding
-						  view[DATA_ADDR >> 2] = (DATA_ADDR + 8);                 // stack start location
-						  view[(DATA_ADDR + 4) >> 2] = DATA_STACK_END;          // stack end location (free region)
+						  view[DATA_ADDR >> 2] = (DATA_ADDR + 8);
+						  view[(DATA_ADDR + 4) >> 2] = DATA_STACK_END;
 						  wasmInstance.exports.asyncify_start_unwind(DATA_ADDR);
 						  sleeping = true;
 
 						  setTimeout(() => {
-							  // Resume: start rewinding, then re-enter the function that should run again
 							  wasmInstance.exports.asyncify_start_rewind(DATA_ADDR);
 							  wasmInstance.exports.main();
-							  // IMPORTANT: do NOT call asyncify_stop_rewind() here
 						  }, 0);
 					  } else {
-						  // Second time (resume path): finish rewinding
 						  wasmInstance.exports.asyncify_stop_rewind();
 						  sleeping = false;
 					  }
@@ -256,24 +275,123 @@
           };
 
           try {
-			  // Load your generated standalone WebAssembly binary
 			  const response = await fetch('benchmark.wasm');
 			  const bytes = await response.arrayBuffer();
 			  const { instance } = await WebAssembly.instantiate(bytes, importObject);
-			  
-			  wasmInstance = instance; 
-			  wasmMemory = instance.exports.memory;
 
+			  wasmInstance = instance;
+			  wasmMemory = instance.exports.memory;
 			  view = new Int32Array(wasmInstance.exports.memory.buffer);
-			  
-			  // Execute the entrypoint main definition
+
 			  instance.exports.main(0, 0);
+
+			  console.log(JSON.stringify({ ubenchResults: window.__benchmarkResults.ubench }));
           } catch (err) {
 			  document.getElementById("consoleOut").textContent += `\nRuntime Instantiation Error: ${err.message}`;
           } finally {
 			  document.getElementById("runBtn").disabled = false;
           }
 	  }
+
+      // ---- System benchmark: real Workers, real replay_worker.wasm ----
+      // Answers "did multi-core actually help" with an actual measurement,
+      // not an assertion: times the parallel bounds-computation phase (the
+      // genuinely parallelizable read-only work in this architecture - see
+      // replay_worker.c's comment on why index-building itself can't be
+      // parallelized under SQLite's single-writer model) with 1 worker vs
+      // the full hardwareConcurrency-sized pool.
+      const WASM_MEMORY_PAGES = 16384; // must match Makefile's replay_worker.wasm memory flags
+
+      function readCstrShared(memory, ptr) {
+        const mem = new Uint8Array(memory.buffer);
+        let end = ptr; while (mem[end] !== 0) end++;
+        return new TextDecoder().decode(Uint8Array.from(mem.subarray(ptr, end)));
+      }
+
+      function loadAndTimeBounds(memory, module, file, readerCount) {
+        return new Promise((resolve, reject) => {
+          const loader = new Worker('replay-worker.js');
+          loader.onerror = reject;
+          loader.onmessage = (e) => {
+            const d = e.data;
+            if (d.type === 'error') { reject(new Error(d.message)); return; }
+            if (d.type === 'ready') {
+              loader.postMessage({ type: 'load', file });
+            } else if (d.type === 'loaded') {
+              const readers = [];
+              let remaining = readerCount;
+              const t0 = performance.now();
+              for (let i = 0; i < readerCount; i++) {
+                const w = new Worker('replay-worker.js');
+                w.onerror = reject;
+                w.onmessage = (ev) => {
+                  if (ev.data.type === 'ready') {
+                    w.postMessage({ type: 'computeBounds', readerIdx: i, readerCount });
+                  } else if (ev.data.type === 'boundsReady') {
+                    w.terminate();
+                    remaining--;
+                    if (remaining === 0) {
+                      const boundsMs = performance.now() - t0;
+                      loader.terminate();
+                      resolve({ boundsMs, matchCount: d.matchCount, loadedBytes: file.size });
+                    }
+                  } else if (ev.data.type === 'error') {
+                    reject(new Error(ev.data.message));
+                  }
+                };
+                w.postMessage({ type: 'init', role: 'reader', memory, module, threadId: i + 1 });
+                readers.push(w);
+              }
+            }
+          };
+          loader.postMessage({ type: 'init', role: 'loader', memory, module, threadId: 0 });
+        });
+      }
+
+      async function runSystemBenchmark() {
+        const resultEl = document.getElementById('systemBenchResult');
+        const btn = document.getElementById('systemBenchBtn');
+        btn.disabled = true;
+        resultEl.textContent = 'Compiling replay_worker.wasm...';
+
+        try {
+          if (!window.crossOriginIsolated) {
+            resultEl.textContent = 'crossOriginIsolated is false - shared memory unavailable. Serve via serve.py or wait for coi-shim.js to finish its one-time reload.';
+            btn.disabled = false;
+            return;
+          }
+
+          const fileInput = document.getElementById('systemBenchFile');
+          const file = fileInput.files[0] || await fetch('testdata/synthetic_fixture.sqlite').then(r => r.blob()).then(b => new File([b], 'synthetic_fixture.sqlite'));
+
+          const module = await WebAssembly.compile(await (await fetch('replay_worker.wasm')).arrayBuffer());
+          const hwConcurrency = Math.min(navigator.hardwareConcurrency || 4, 8);
+
+          resultEl.textContent = `Running with 1 reader thread (file: ${file.name}, ${(file.size/1024/1024).toFixed(1)}MB)...`;
+          const mem1 = new WebAssembly.Memory({ initial: WASM_MEMORY_PAGES, maximum: WASM_MEMORY_PAGES, shared: true });
+          const r1 = await loadAndTimeBounds(mem1, module, file, 1);
+
+          resultEl.textContent = `Running with ${hwConcurrency} reader threads...`;
+          const memN = new WebAssembly.Memory({ initial: WASM_MEMORY_PAGES, maximum: WASM_MEMORY_PAGES, shared: true });
+          const rN = await loadAndTimeBounds(memN, module, file, hwConcurrency);
+
+          const speedup = r1.boundsMs / Math.max(rN.boundsMs, 0.001);
+          const summary = {
+            file: file.name, sizeMB: +(file.size / 1024 / 1024).toFixed(2), matchCount: r1.matchCount,
+            oneReaderMs: +r1.boundsMs.toFixed(2), nReadersMs: +rN.boundsMs.toFixed(2), readerCount: hwConcurrency,
+            speedup: +speedup.toFixed(2)
+          };
+          window.__benchmarkResults.system = summary;
+          resultEl.innerHTML = `file=${summary.file} (${summary.sizeMB}MB, ${summary.matchCount} matches) &nbsp; ` +
+            `1 reader: <strong>${summary.oneReaderMs}ms</strong> &nbsp; ${summary.readerCount} readers: <strong>${summary.nReadersMs}ms</strong> ` +
+            `&nbsp; speedup: <strong style="color:#22c55e">${summary.speedup}x</strong>`;
+          console.log(JSON.stringify({ systemBenchmark: summary }));
+        } catch (err) {
+          resultEl.textContent = 'Error: ' + err.message;
+        } finally {
+          btn.disabled = false;
+        }
+      }
 	</script>
   </body>
 </html>
