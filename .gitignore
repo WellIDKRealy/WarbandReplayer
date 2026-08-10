@@ -1,5 +1,11 @@
-# Real player replay logs (names/chat messages are real user data) - never
-# commit these. The synthetic fixture (fake data, small) is fine to track.
-testdata/replayLog_real_15battles.sqlite
+# Real player replay logs (names/chat messages are real, other people's user
+# data) used to be excluded here by default. testdata/replays_batch/ and
+# testdata/gt_batch/ are now tracked deliberately - the test suite
+# (run_test_suite.py) needs them present to be runnable on a fresh clone
+# without also having a Warband install + replays.7z on hand. Anyone
+# re-generating this from their own replays.7z should consider whether they
+# want those other players' names/chat committed to a public repo before
+# doing the same.
 testdata/*.7z
 testdata/*.xz
+testdata/test_suite_results.json

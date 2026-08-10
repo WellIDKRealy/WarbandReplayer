@@ -502,6 +502,22 @@ static float fetch_positions(sqlite3_int64 tick_id, float *out_x, float *out_y, 
 static float g_pos_a_x[MAX_AGENT_SLOTS], g_pos_a_y[MAX_AGENT_SLOTS];
 static float g_pos_b_x[MAX_AGENT_SLOTS], g_pos_b_y[MAX_AGENT_SLOTS];
 static unsigned char g_pos_a_present[MAX_AGENT_SLOTS], g_pos_b_present[MAX_AGENT_SLOTS];
+/* Full roster snapshot at tickA - same reasoning as corpse_count_at_a above,
+ * for the same root cause: the tickB lookahead resync below can overwrite
+ * is_human/team/active for any agent_id that gets a NEW spawn event exactly
+ * at tickB (e.g. a human's slot reused for a bot in the next match, right at
+ * a match-boundary tick). The display loop must classify each agent using
+ * its tickA state - what's actually being shown - not tickB's. Found the
+ * same way as the corpse bug: ground_truth.py + verify_against_truth.html
+ * caught a real file where agent_id 718 was a valid human unit at tickA but
+ * got excluded because it respawned as a bot at tickB, right at a
+ * match-boundary faction_switch. spawn_event_id is snapshotted separately
+ * (not folded into this struct) because it's used differently: compared
+ * against g_roster's CURRENT (post-tickB) value on purpose, to detect
+ * whether a respawn happened in the A-B interpolation window at all. */
+static unsigned char g_snap_a_active[MAX_AGENT_SLOTS];
+static unsigned char g_snap_a_is_human[MAX_AGENT_SLOTS];
+static signed char g_snap_a_team[MAX_AGENT_SLOTS];
 static sqlite3_int64 g_snap_a_spawn[MAX_AGENT_SLOTS];
 
 static void build_frame_at_time(double t) {
@@ -519,8 +535,31 @@ static void build_frame_at_time(double t) {
     }
 
     resync_roster_to(tickA_id);
+    /* Corpses are cumulative GLOBAL state (unlike positions, which get their
+     * own separate a/b snapshots below) - the lookahead resync to tickB just
+     * below exists purely to fetch tickB's positions for interpolation, but
+     * it also advances the roster/corpse state through tickB's kill events.
+     * Snapshotting the count here, before that lookahead runs, is what keeps
+     * this frame's displayed corpses scoped to tickA (what's actually being
+     * shown) instead of leaking in tickB's (one tick in the future). Found
+     * via ground_truth.py + verify_against_truth.html: corpse counts were
+     * consistently over by however many kills landed in exactly tickB. Living
+     * units don't need this same guard - they're already gated on
+     * g_pos_a_present, which a tickB-only spawn naturally fails. The
+     * underlying g_corpses[]/g_corpse_count keep growing past this snapshot
+     * (correct - next frame's incremental resync picks up right where this
+     * left off), only what gets EMITTED this frame is capped. */
+    int corpse_count_at_a = g_corpse_count;
+
     memset(g_snap_a_spawn, 0xFF, sizeof(g_snap_a_spawn)); /* -1 = "no snapshot" */
-    for (int i = 0; i < MAX_AGENT_SLOTS; i++) if (g_roster[i].active) g_snap_a_spawn[i] = g_roster[i].spawn_event_id;
+    memset(g_snap_a_active, 0, sizeof(g_snap_a_active));
+    for (int i = 0; i < MAX_AGENT_SLOTS; i++) {
+        if (!g_roster[i].active) continue;
+        g_snap_a_spawn[i] = g_roster[i].spawn_event_id;
+        g_snap_a_active[i] = 1;
+        g_snap_a_is_human[i] = g_roster[i].is_human;
+        g_snap_a_team[i] = g_roster[i].team;
+    }
 
     memset(g_pos_a_present, 0, sizeof(g_pos_a_present));
     memset(g_pos_b_present, 0, sizeof(g_pos_b_present));
@@ -536,14 +575,14 @@ static void build_frame_at_time(double t) {
      * buffer order with no depth test, so whatever's pushed first ends up
      * underneath. Living units come after so they're always on top of any
      * corpse standing on the same spot. */
-    for (int i = 0; i < g_corpse_count; i++) {
+    for (int i = 0; i < corpse_count_at_a; i++) {
         g_frame_buffer[out * 3 + 0] = g_corpses[i].x;
         g_frame_buffer[out * 3 + 1] = g_corpses[i].y;
         g_frame_buffer[out * 3 + 2] = (g_corpses[i].team == 0) ? 2.0f : (g_corpses[i].team == 1) ? 3.0f : 4.0f;
         out++;
     }
     for (int agent_id = 0; agent_id < MAX_AGENT_SLOTS; agent_id++) {
-        if (!g_roster[agent_id].active || !g_roster[agent_id].is_human) continue;
+        if (!g_snap_a_active[agent_id] || !g_snap_a_is_human[agent_id]) continue;
         if (!g_pos_a_present[agent_id]) continue;
 
         float x = g_pos_a_x[agent_id], y = g_pos_a_y[agent_id];
@@ -553,7 +592,7 @@ static void build_frame_at_time(double t) {
         }
         g_frame_buffer[out * 3 + 0] = x;
         g_frame_buffer[out * 3 + 1] = y;
-        g_frame_buffer[out * 3 + 2] = (float)g_roster[agent_id].team; /* -1, 0, or 1 */
+        g_frame_buffer[out * 3 + 2] = (float)g_snap_a_team[agent_id]; /* -1, 0, or 1 - tickA's team, not tickB's */
         out++;
     }
     g_frame_count = out;

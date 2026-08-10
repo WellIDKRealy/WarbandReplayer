@@ -23,7 +23,7 @@ function waitFor(worker, predicate) {
 
     line("fetching real replay file...");
     const fetchT0 = performance.now();
-    const fileResp = await fetch('replayLog_real_15battles.sqlite');
+    const fileResp = await fetch('replays_batch/replayLog_2026-07-22_23-18-29.sqlite');
     const fileBlob = await fileResp.blob();
     const file = new File([fileBlob], 'replayLog_real_15battles.sqlite');
     line(`fetched ${(file.size/1024/1024).toFixed(1)}MB in ${(performance.now()-fetchT0).toFixed(0)}ms`);

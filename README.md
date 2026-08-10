@@ -98,3 +98,38 @@ python3 serve.py
 then open `http://localhost:8000/benchmark.html` and run the suite. Covers allocator throughput,
 indexed-vs-naive query cost, incremental-cursor-vs-full-reseek cost, and 1-worker-vs-N-worker
 parallel load wall clock.
+
+## Testing
+
+Correctness testing for the replay engine works by **ground-truth comparison, not rendering**: an
+independent Python reimplementation (`testdata/ground_truth.py`) re-derives match segmentation,
+living-agent positions, corpse accumulation, and chat delivery directly from a `.sqlite` file's SQL
+- never touching `replay_worker.wasm` - producing an authoritative expected output. A browser-side
+harness (`testdata/verify_against_truth.html`) then drives the *actual* engine through the same
+`postMessage` protocol `main.js` uses, and diffs its output against that ground truth sample by
+sample (agent positions/teams, corpse counts, chat counts, match boundaries). This is what caught a
+real bug during development (corpse counts leaking one tick ahead of the displayed frame) that
+count-only smoke testing had missed.
+
+`testdata/run_test_suite.py` automates this across every replay in a batch and every real browser
+engine available for automation on the machine - Chromium (Chrome/Edge/Brave), Firefox (Gecko), and
+WebKit (Safari's engine; real Safari is macOS/iOS-only and can't be driven headlessly, but the same
+engine catches most engine-level bugs) - via [Playwright](https://playwright.dev/).
+
+```bash
+playwright install chromium firefox webkit
+
+# one-time: generate ground truth for a batch of replays
+python3 testdata/ground_truth.py path/to/replay.sqlite 6 testdata/gt_batch/replay.json
+# (or loop it over testdata/replays_batch/*.sqlite -> testdata/gt_batch/*.json)
+
+python3 serve.py 8126                       # must be running - COOP/COEP + concurrent requests
+python3 testdata/run_test_suite.py          # all discovered replays x all 3 engines
+python3 testdata/run_test_suite.py --only match_substring
+python3 testdata/run_test_suite.py --browsers chromium,firefox
+```
+
+Replay files themselves are never committed (they're real player data - usernames, chat) and
+`testdata/replays_batch/` and `testdata/gt_batch/` are gitignored; populate them locally from
+whatever `.sqlite` recordings you have (e.g. `Modules/Napoleonic Wars/lua/replays.7z` in a Warband
+install) before running the suite.
