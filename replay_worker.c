@@ -82,9 +82,11 @@ typedef struct MatchInfo {
     double start_time, end_time;
     int scene_no;
     char faction_text[96];
+    sqlite3_int64 rowid_lo, rowid_hi; /* this battle's own slice of agent_states, see replay_ensure_battle_ready */
 } MatchInfo;
 static MatchInfo g_matches[MAX_MATCHES];
 static int g_match_count = 0;
+static unsigned char g_battle_ready[MAX_MATCHES]; /* has this battle's agent_states rowid slice been resolved? */
 
 int replay_get_match_count(void) { return g_match_count; }
 double replay_get_match_start_time(int idx) { return (idx >= 0 && idx < g_match_count) ? g_matches[idx].start_time : 0.0; }
@@ -96,6 +98,12 @@ const char *replay_get_match_faction_ptr(int idx) {
 }
 double replay_get_total_start_time(void) { return g_tick_count > 0 ? g_ticks[0].time : 0.0; }
 double replay_get_total_end_time(void) { return g_tick_count > 0 ? g_ticks[g_tick_count - 1].time : 0.0; }
+/* raw tick_id bounds, for JS to hand to replay_prefetch_battle() - as double,
+ * not sqlite3_int64: well within float64's exact-integer range for this
+ * data (a few hundred thousand ticks at most), and avoids the wasm i64
+ * JS/BigInt marshalling this codebase doesn't use anywhere else. */
+double replay_get_match_start_tick_id(int idx) { return (idx >= 0 && idx < g_match_count) ? (double)g_matches[idx].start_tick_id : 0.0; }
+double replay_get_match_end_tick_id(int idx) { return (idx >= 0 && idx < g_match_count) ? (double)g_matches[idx].end_tick_id : 0.0; }
 
 /* ---- roster / incremental cursor ----------------------------------------- */
 typedef struct RosterEntry {
@@ -114,7 +122,7 @@ static unsigned char g_corpse_present[MAX_AGENT_SLOTS];
 
 /* prepared once in replay_finish_load, reused for the life of the session */
 static sqlite3_stmt *g_stmt_roster_delta = 0; /* spawn+kill events in (tick_lo, tick_hi] */
-static sqlite3_stmt *g_stmt_agent_states = 0; /* positions at a single tick */
+static sqlite3_stmt *g_stmt_id_lookup = 0; /* tick_id of first agent_states row with id >= ?1 */
 
 static signed char parse_team(const unsigned char *teamText) {
     if (!teamText) return -1;
@@ -128,6 +136,226 @@ static int find_match_for_tick(sqlite3_int64 tick_id) {
         if (tick_id >= g_matches[i].start_tick_id && tick_id <= g_matches[i].end_tick_id) return i;
     }
     return -1;
+}
+
+static int run_sql(const char *sql); /* defined below, near replay_finish_load */
+
+static void append_i64(char *buf, int *pos, sqlite3_int64 v) {
+    char tmp[24]; int n = 0;
+    if (v < 0) { buf[(*pos)++] = '-'; v = -v; }
+    if (v == 0) tmp[n++] = '0';
+    while (v > 0) { tmp[n++] = '0' + (int)(v % 10); v /= 10; }
+    while (n > 0) buf[(*pos)++] = tmp[--n];
+}
+
+/* agent_states has no upfront/global secondary index (see replay_finish_load)
+ * - a CREATE INDEX, even a partial one filtered `WHERE tick_id BETWEEN lo AND
+ * hi`, still requires a full base-table scan to evaluate the WHERE clause for
+ * every row (tick_id has no index to seek through), so N per-battle "partial
+ * by tick" indexes would cost N full scans, not one - worse than a single
+ * upfront index, not better (measured: this was the first approach tried
+ * here and it regressed real-file latency badly).
+ *
+ * Instead, each battle is pre-split into its own disjoint [rowid_lo,
+ * rowid_hi] slice of agent_states via binary search over the table's own
+ * built-in rowid B-tree (agent_states.id is INTEGER PRIMARY KEY AUTOINCREMENT,
+ * i.e. IS the rowid, and rows are appended in tick order by the recorder, so
+ * rowid is monotonic with tick_id - a precondition this bisection relies on).
+ * Each probe is a `WHERE id >= ?` seek: O(log n) B-tree descent, never a
+ * scan - ~2*log2(2.3M) =~ 44 point seeks total for one battle. Battle 10's
+ * rows are never visited while resolving battle 5's range.
+ *
+ * Unlike tick_id, rowid IS always seekable (it's the table's own clustering
+ * key), so `CREATE INDEX ... WHERE id BETWEEN lo AND hi` compiles to a
+ * *bounded* scan of just that battle's rowid range, not a full-table one -
+ * this is what actually makes the per-battle index cheap to build. The
+ * matching query then binds the SAME literal [lo, hi] (not a parameter -
+ * SQLite can only prove a partial index applies when the query's WHERE term
+ * is exactly the index's WHERE term) so it can use that index for O(log n)
+ * tick_id lookups within the battle, rather than a linear scan of the whole
+ * rowid range per frame.
+ *
+ * Self-healing: fetch_positions() calls this itself before every query, so
+ * correctness never depends on JS remembering to prefetch - prefetching
+ * (replay_prefetch_battle() below, driven by replay-worker.js requesting
+ * nearby battles ahead of the cursor, YouTube-buffering-style) only affects
+ * *latency*, never correctness.
+ *
+ * The bisection/SQL-building helpers below take an explicit (sqlite3 *,
+ * sqlite3_stmt *) rather than reaching for g_db/g_stmt_id_lookup, so the
+ * SAME algorithm runs correctly from two different threads' two different
+ * connections: replay_ensure_battle_ready() below (the single playback
+ * thread's connection, g_db) and replay_prefetch_battle() further down (a
+ * dedicated prefetch thread's OWN connection, opened fresh - never g_db,
+ * which belongs exclusively to the playback thread and is not thread-safe
+ * to share even under SQLITE_THREADSAFE=1, same reason readers each open
+ * their own connection for bounds computation above).
+ */
+static int agent_states_rowid_span_on(sqlite3 *db, sqlite3_int64 *out_min, sqlite3_int64 *out_max) {
+    sqlite3_stmt *stmt = 0;
+    int ok = 0;
+    if (sqlite3_prepare_v2(db, "SELECT MIN(id), MAX(id) FROM agent_states", -1, &stmt, 0) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW && sqlite3_column_type(stmt, 0) != SQLITE_NULL) {
+            *out_min = sqlite3_column_int64(stmt, 0);
+            *out_max = sqlite3_column_int64(stmt, 1);
+            ok = 1;
+        }
+        sqlite3_finalize(stmt);
+    }
+    return ok;
+}
+
+/* tick_id of the first agent_states row with id >= probe (rowid seek, O(log n)) */
+static sqlite3_int64 tick_id_at_or_after_rowid_on(sqlite3_stmt *idlookup, sqlite3_int64 probe) {
+    sqlite3_reset(idlookup);
+    sqlite3_bind_int64(idlookup, 1, probe);
+    if (sqlite3_step(idlookup) == SQLITE_ROW) return sqlite3_column_int64(idlookup, 0);
+    return -1; /* probe is past the last row */
+}
+
+/* smallest rowid whose tick_id >= target_tick (rmax+1 if none) */
+static sqlite3_int64 lower_bound_rowid_on(sqlite3_stmt *idlookup, sqlite3_int64 rmin, sqlite3_int64 rmax, sqlite3_int64 target_tick) {
+    sqlite3_int64 lo = rmin, hi = rmax + 1;
+    while (lo < hi) {
+        sqlite3_int64 mid = lo + (hi - lo) / 2;
+        sqlite3_int64 t = tick_id_at_or_after_rowid_on(idlookup, mid);
+        if (t != -1 && t >= target_tick) hi = mid; else lo = mid + 1;
+    }
+    return lo;
+}
+
+/* smallest rowid whose tick_id > target_tick (rmax+1 if none) */
+static sqlite3_int64 upper_bound_rowid_on(sqlite3_stmt *idlookup, sqlite3_int64 rmin, sqlite3_int64 rmax, sqlite3_int64 target_tick) {
+    sqlite3_int64 lo = rmin, hi = rmax + 1;
+    while (lo < hi) {
+        sqlite3_int64 mid = lo + (hi - lo) / 2;
+        sqlite3_int64 t = tick_id_at_or_after_rowid_on(idlookup, mid);
+        if (t != -1 && t > target_tick) hi = mid; else lo = mid + 1;
+    }
+    return lo;
+}
+
+/* both callers need the exact same CREATE INDEX text (literal [lo,hi], not
+ * bound params - see the block comment above) so the SELECT built with the
+ * same literals is provably eligible to use it, whichever thread built it. */
+static void build_battle_index_sql(char *sql, int matchIdx, sqlite3_int64 rowid_lo, sqlite3_int64 rowid_hi) {
+    int p = 0;
+    const char *idx_prefix = "CREATE INDEX IF NOT EXISTS idx_as_b";
+    for (const char *c = idx_prefix; *c; c++) sql[p++] = *c;
+    append_i64(sql, &p, matchIdx);
+    const char *idx_mid = " ON agent_states(tick_id) WHERE id BETWEEN ";
+    for (const char *c = idx_mid; *c; c++) sql[p++] = *c;
+    append_i64(sql, &p, rowid_lo);
+    const char *and_ = " AND ";
+    for (const char *c = and_; *c; c++) sql[p++] = *c;
+    append_i64(sql, &p, rowid_hi);
+    sql[p] = 0;
+}
+
+static sqlite3_int64 g_as_rowid_min = -1, g_as_rowid_max = -1;
+static sqlite3_stmt *g_stmt_agent_states_battle[MAX_MATCHES]; /* one per battle, prepared lazily against its own partial index */
+/* has this battle's [rowid_lo, rowid_hi] been resolved yet - by g_db itself
+ * (self-healing fallback) or by the read-only prefetch worker writing
+ * directly into g_matches[] (see replay_prefetch_battle) - separate from
+ * g_battle_ready, which additionally requires the index to exist and the
+ * per-battle statement to be prepared, both g_db-only operations. */
+static unsigned char g_bounds_known[MAX_MATCHES];
+
+int replay_ensure_battle_ready(int matchIdx) {
+    if (matchIdx < 0 || matchIdx >= g_match_count) return 0;
+    if (g_battle_ready[matchIdx]) return 0;
+
+    MatchInfo *m = &g_matches[matchIdx];
+    if (!g_bounds_known[matchIdx]) {
+        /* self-healing fallback: nobody prefetched this battle, resolve its
+         * rowid slice ourselves (same bisection the prefetch worker would
+         * have done, just on g_db - the only path when prefetch never ran). */
+        if (g_as_rowid_min < 0) agent_states_rowid_span_on(g_db, &g_as_rowid_min, &g_as_rowid_max);
+        m->rowid_lo = lower_bound_rowid_on(g_stmt_id_lookup, g_as_rowid_min, g_as_rowid_max, m->start_tick_id);
+        sqlite3_int64 hi = upper_bound_rowid_on(g_stmt_id_lookup, g_as_rowid_min, g_as_rowid_max, m->end_tick_id) - 1;
+        m->rowid_hi = (hi >= m->rowid_lo) ? hi : m->rowid_lo - 1; /* empty slice guard */
+        g_bounds_known[matchIdx] = 1;
+    }
+
+    char sql[224];
+    build_battle_index_sql(sql, matchIdx, m->rowid_lo, m->rowid_hi);
+    if (run_sql(sql) != SQLITE_OK) return -1; /* CREATE INDEX IF NOT EXISTS - cheap no-op if replay_prefetch_battle() already built this one */
+
+    char qsql[224];
+    int p = 0;
+    const char *q_prefix = "SELECT agent_id, pos_x, pos_y FROM agent_states WHERE id BETWEEN ";
+    for (const char *c = q_prefix; *c; c++) qsql[p++] = *c;
+    append_i64(qsql, &p, m->rowid_lo);
+    const char *and_ = " AND ";
+    for (const char *c = and_; *c; c++) qsql[p++] = *c;
+    append_i64(qsql, &p, m->rowid_hi);
+    const char *q_tail = " AND tick_id = ?1";
+    for (const char *c = q_tail; *c; c++) qsql[p++] = *c;
+    qsql[p] = 0;
+    if (sqlite3_prepare_v2(g_db, qsql, -1, &g_stmt_agent_states_battle[matchIdx], 0) != SQLITE_OK) return -1;
+
+    g_battle_ready[matchIdx] = 1;
+    return 0;
+}
+
+/* Runs on a dedicated, persistent prefetch worker's OWN READONLY connection
+ * (see wasm_layout.h's WASM_PREFETCH_THREAD_ID) - entirely local state (own
+ * db handle, own statements) for the READ side of the work.
+ *
+ * Deliberately READ-ONLY, never a second writer: SQLite's rollback-journal
+ * locking downgrades a write transaction back to SHARED (not fully
+ * unlocked) once it commits - standard, documented behavior, not a bug -
+ * so g_db (the single long-lived playback connection, which does its own
+ * occasional CREATE INDEX) ends up holding SHARED *permanently* once it's
+ * done its first write. A second connection trying to open its own write
+ * transaction later sees shared_count > 1 forever and gets SQLITE_BUSY on
+ * every attempt - measured directly via wasm_vfs_get_lock_trace() during
+ * development: a prefetch connection opened SQLITE_OPEN_READWRITE could
+ * bisect fine but its CREATE INDEX reliably failed (rc=5) the moment g_db
+ * had written anything at all. There is only ever one writer for the
+ * lifetime of this module (matches the ORIGINAL single-writer invariant:
+ * g_db is "the one connection ever open in SQLITE_OPEN_READWRITE mode").
+ *
+ * So this function does only the part that's genuinely safe to parallelize
+ * - the rowid bisection - and writes the result directly into g_matches[]
+ * (a plain, non-TLS static: physically the SAME bytes across every worker
+ * instance sharing this Memory, so the write is immediately visible to
+ * g_db's own instance too, no message round-trip needed for the data
+ * itself) plus g_bounds_known[matchIdx]. replay_ensure_battle_ready(),
+ * still exclusively on g_db, then only has to do the actual (bounded, cheap)
+ * CREATE INDEX + prepare - the one write every battle still needs, but now
+ * without also paying for its own bisection when prefetch already did it.
+ * A benign race with g_db's own self-healing bisection for the same battle
+ * (if the cursor reaches it while this is still running) just means both
+ * compute the same deterministic bounds redundantly - never a correctness
+ * issue, only wasted work. */
+int replay_prefetch_battle(int matchIdx, double start_tick_id_d, double end_tick_id_d) {
+    if (matchIdx < 0 || matchIdx >= g_match_count) return -1;
+    if (g_bounds_known[matchIdx]) return 0;
+    sqlite3_int64 start_tick_id = (sqlite3_int64)start_tick_id_d;
+    sqlite3_int64 end_tick_id = (sqlite3_int64)end_tick_id_d;
+
+    sqlite3 *db = 0;
+    if (sqlite3_open_v2("main.db", &db, SQLITE_OPEN_READONLY, 0) != SQLITE_OK) return -1;
+
+    sqlite3_int64 rmin, rmax;
+    if (!agent_states_rowid_span_on(db, &rmin, &rmax)) { sqlite3_close(db); return -2; }
+
+    sqlite3_stmt *idlookup = 0;
+    if (sqlite3_prepare_v2(db, "SELECT tick_id FROM agent_states WHERE id >= ?1 ORDER BY id ASC LIMIT 1", -1, &idlookup, 0) != SQLITE_OK) {
+        sqlite3_close(db); return -3;
+    }
+
+    sqlite3_int64 rowid_lo = lower_bound_rowid_on(idlookup, rmin, rmax, start_tick_id);
+    sqlite3_int64 hi = upper_bound_rowid_on(idlookup, rmin, rmax, end_tick_id) - 1;
+    sqlite3_finalize(idlookup);
+    sqlite3_close(db);
+
+    MatchInfo *m = &g_matches[matchIdx];
+    m->rowid_lo = rowid_lo;
+    m->rowid_hi = (hi >= rowid_lo) ? hi : rowid_lo - 1;
+    g_bounds_known[matchIdx] = 1;
+    return 0;
 }
 
 /* apply every spawn/kill event with tick_id in (from_tick, to_tick] to the
@@ -215,13 +443,17 @@ static int find_tick_index_for_time(double t) {
 }
 
 static float fetch_positions(sqlite3_int64 tick_id, float *out_x, float *out_y, unsigned char *out_present) {
-    sqlite3_reset(g_stmt_agent_states);
-    sqlite3_bind_int64(g_stmt_agent_states, 1, tick_id);
-    while (sqlite3_step(g_stmt_agent_states) == SQLITE_ROW) {
-        sqlite3_int64 agent_id = sqlite3_column_int64(g_stmt_agent_states, 0);
+    int matchIdx = find_match_for_tick(tick_id);
+    if (matchIdx < 0) return 0.0f; /* tick outside any known match: nothing to fetch, nothing touched */
+    replay_ensure_battle_ready(matchIdx); /* self-healing: resolves this battle's rowid slice + index on first access if not already prefetched */
+    sqlite3_stmt *stmt = g_stmt_agent_states_battle[matchIdx];
+    sqlite3_reset(stmt);
+    sqlite3_bind_int64(stmt, 1, tick_id);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        sqlite3_int64 agent_id = sqlite3_column_int64(stmt, 0);
         if (agent_id < 0 || agent_id >= MAX_AGENT_SLOTS) continue;
-        out_x[agent_id] = (float)sqlite3_column_double(g_stmt_agent_states, 1);
-        out_y[agent_id] = (float)sqlite3_column_double(g_stmt_agent_states, 2);
+        out_x[agent_id] = (float)sqlite3_column_double(stmt, 1);
+        out_y[agent_id] = (float)sqlite3_column_double(stmt, 2);
         out_present[agent_id] = 1;
     }
     return 0.0f;
@@ -501,13 +733,22 @@ int replay_finish_load(void) {
 
     if (run_sql("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;") != SQLITE_OK) return -2;
 
+    /* agent_states gets NO secondary index, ever - it's ~99% of the row
+     * count (2.3M of ~2.35M total rows in a real 15-battle file) and the
+     * only table worth scoping per-battle at all; per-battle isolation for
+     * it comes from rowid-range bisection instead, see
+     * replay_ensure_battle_ready(). Every other table here is small enough
+     * (hundreds to low thousands of rows total, across ALL battles) that a
+     * plain full index is negligible. idx_spawns_agent_event (agent_id,
+     * event_id) from an earlier pass is gone entirely: no query here ever
+     * used it, and agent_id is a reused engine slot (0-1024) - an index
+     * sorted by it would have interleaved every battle's rows into the same
+     * B-tree pages, defeating per-battle isolation for no benefit. */
     if (run_sql(
         "CREATE INDEX idx_ticks_time ON ticks(time);"
         "CREATE INDEX idx_events_tick_id ON events(tick_id);"
         "CREATE INDEX idx_events_type_tick ON events(event_type, tick_id);"
-        "CREATE INDEX idx_agent_states_tick ON agent_states(tick_id);"
         "CREATE INDEX idx_spawns_event_id ON spawns(event_id);"
-        "CREATE INDEX idx_spawns_agent_event ON spawns(agent_id, event_id);"
         "CREATE INDEX idx_kills_event_id ON kills(event_id);"
         "CREATE INDEX idx_chats_event_id ON chats(event_id);"
         "CREATE INDEX idx_map_switches_event ON map_switches(event_id);"
@@ -537,9 +778,9 @@ int replay_finish_load(void) {
     }
 
     if (sqlite3_prepare_v2(g_db,
-        "SELECT agent_id, pos_x, pos_y FROM agent_states WHERE tick_id = ?1",
-        -1, &g_stmt_agent_states, 0) != SQLITE_OK) {
-        set_error("failed to prepare agent_states statement"); return -8;
+        "SELECT tick_id FROM agent_states WHERE id >= ?1 ORDER BY id ASC LIMIT 1",
+        -1, &g_stmt_id_lookup, 0) != SQLITE_OK) {
+        set_error("failed to prepare id lookup statement"); return -9;
     }
 
     return g_match_count;
@@ -631,6 +872,38 @@ float replay_get_map_min_x(void) { return g_map_min_x; }
 float replay_get_map_max_x(void) { return g_map_max_x; }
 float replay_get_map_min_y(void) { return g_map_min_y; }
 float replay_get_map_max_y(void) { return g_map_max_y; }
+
+/* layout ground-truth for JS bootstrap - lets replay-worker.js's TLS/stack
+ * pool base constants be verified against the real linker-computed
+ * addresses instead of hand-estimated ones. */
+double wasm_debug_heap_base(void) { return (double)(size_t)&__heap_base; }
+double wasm_debug_region_a_base(void) { return (double)(size_t)wasm_region_a_base(); }
+double wasm_debug_region_c_base(void) { return (double)(size_t)wasm_region_c_base(); }
+double wasm_debug_layout_end(void) { return (double)(size_t)wasm_layout_end(); }
+/* load-bearing, not just diagnostic - replay-worker.js's bootstrap() calls
+ * these to place each thread's stack/TLS, see the comment in wasm_layout.h. */
+double wasm_debug_stack_pool_base(void) { return (double)(size_t)wasm_stack_pool_base(); }
+double wasm_debug_tls_pool_base(void) { return (double)(size_t)wasm_tls_pool_base(); }
+
+/* temporary diagnostic: does g_db (the playback connection) see an index
+ * another connection built, without going through replay_ensure_battle_ready
+ * at all - isolates "cross-connection visibility" from "bisection/prepare
+ * cost" as the explanation for prefetch not being as cheap as expected. */
+int replay_debug_index_visible(int matchIdx) {
+    char sql[64];
+    int p = 0;
+    const char *prefix = "SELECT count(*) FROM sqlite_master WHERE name='idx_as_b";
+    for (const char *c = prefix; *c; c++) sql[p++] = *c;
+    append_i64(sql, &p, matchIdx);
+    sql[p++] = '\''; sql[p] = 0;
+    sqlite3_stmt *stmt = 0;
+    int result = -1;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, 0) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) result = sqlite3_column_int(stmt, 0);
+        sqlite3_finalize(stmt);
+    }
+    return result;
+}
 
 /* ---- thread entry point --------------------------------------------------
  * role: 0 = loader (does the write phase: load/index/tick-scan/match-scan,

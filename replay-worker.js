@@ -1,4 +1,4 @@
-// One script, three roles (parameterized by the init message), all sharing
+// One script, four roles (parameterized by the init message), all sharing
 // the same WebAssembly.Memory:
 //   - 'loader': streams the file in, opens+indexes the DB, scans matches,
 //     then continues running as the 'playback' role for the rest of the
@@ -8,6 +8,10 @@
 //     connection - concurrently stepping someone else's prepared
 //     statement isn't safe even under SQLITE_THREADSAFE=1). Reports back
 //     and terminates once done.
+//   - 'prefetch': one persistent worker, own READWRITE connection, own
+//     (larger) heap slab. Builds not-yet-visited battles' indexes ahead of
+//     the playback cursor - see runPrefetchBattle() below and main.js's
+//     prefetch-near-cursor orchestration.
 //
 // This file is the entire replay engine's JS footprint for Worker-side
 // logic: no SQL, no tick/match/roster bookkeeping happens here - it all
@@ -19,9 +23,18 @@ let sharedMemory = null;
 let role = null;
 let threadId = -1;
 
-const TLS_POOL_BASE = 400 * 1024 * 1024; // clear of the heap-slab/RegionA/RegionC layout (wasm_layout.h)
+// Slot sizes only - must match WASM_STACK_SLOT_SIZE/WASM_TLS_SLOT_SIZE in
+// wasm_layout.h (small and stable, unlike the pool *base* addresses, which
+// shift whenever a heap region's size changes). The bases themselves are
+// read back from the module after instantiation (wasm_debug_stack_pool_base/
+// wasm_debug_tls_pool_base) instead of being hardcoded here - a previous
+// version hand-computed them as fixed constants (300MB/400MB) and that
+// estimate silently drifted out of sync with the real layout (verified: it
+// ended up landing inside the reader thread heap slabs), which only didn't
+// crash because readers' actual allocations stayed small enough to not
+// reach the colliding bytes. Reading the real values removes that whole
+// class of bug.
 const TLS_SLOT_SIZE = 65536;
-const STACK_POOL_BASE = 300 * 1024 * 1024;
 const STACK_SLOT_SIZE = 4 * 1024 * 1024;
 
 async function bootstrap(memory, module, id) {
@@ -50,8 +63,10 @@ async function bootstrap(memory, module, id) {
   instance = await WebAssembly.instantiate(module, importObject);
   const ex = instance.exports;
 
-  ex.__stack_pointer.value = STACK_POOL_BASE + id * STACK_SLOT_SIZE + STACK_SLOT_SIZE; // stack grows down from the top
-  if (ex.__wasm_init_tls) ex.__wasm_init_tls(TLS_POOL_BASE + id * TLS_SLOT_SIZE);
+  const stackPoolBase = ex.wasm_debug_stack_pool_base();
+  const tlsPoolBase = ex.wasm_debug_tls_pool_base();
+  ex.__stack_pointer.value = stackPoolBase + id * STACK_SLOT_SIZE + STACK_SLOT_SIZE; // stack grows down from the top
+  if (ex.__wasm_init_tls) ex.__wasm_init_tls(tlsPoolBase + id * TLS_SLOT_SIZE);
 
   return ex;
 }
@@ -136,6 +151,11 @@ async function runLoader(ex, data) {
       endTime: ex.replay_get_match_end_time(i),
       sceneNo: ex.replay_get_match_scene_no(i),
       faction: readCstr(ex.replay_get_match_faction_ptr(i)),
+      // raw tick_id bounds, for the prefetch worker (see main.js's
+      // schedulePrefetch) - not used for display, only passed through to
+      // replay_prefetch_battle().
+      startTickId: ex.replay_get_match_start_tick_id(i),
+      endTickId: ex.replay_get_match_end_tick_id(i),
     });
   }
 
@@ -162,6 +182,22 @@ function runCombineBounds(ex, data) {
     minY: ex.replay_get_map_min_y(),
     maxY: ex.replay_get_map_max_y(),
   });
+}
+
+// temporary diagnostic - see replay_worker.c's replay_debug_index_visible
+// and sqlite3_vfs_mem.c's WASM_VFS_LOCK_TRACE facility.
+function runDebugIndexVisible(ex, data) {
+  postMessage({ type: "debugIndexVisible", matchIdx: data.matchIdx, result: ex.replay_debug_index_visible(data.matchIdx) });
+}
+function runResetVfsTraces(ex) {
+  ex.wasm_vfs_reset_traces();
+  postMessage({ type: "vfsTracesReset" });
+}
+function runGetVfsTraces(ex) {
+  postMessage({ type: "vfsTraces", lockTrace: readCstr(ex.wasm_vfs_get_lock_trace()), ioTrace: readCstr(ex.wasm_vfs_get_io_trace()) });
+}
+function runGetLockCounters(ex) {
+  postMessage({ type: "lockCounters", sharedCount: ex.wasm_vfs_debug_shared_count(), exclusiveKind: ex.wasm_vfs_debug_exclusive_kind() });
 }
 
 function runFrame(ex, data) {
@@ -199,13 +235,41 @@ function runFrame(ex, data) {
   );
 }
 
+// 'prefetch': a dedicated, persistent worker with its own READWRITE SQLite
+// connection (opened fresh inside replay_prefetch_battle - never touches the
+// playback worker's g_db) and its own larger heap slab (thread id 9, see
+// WASM_PREFETCH_THREAD_ID/WASM_PREFETCH_HEAP_SIZE in wasm_layout.h), used to
+// build a not-yet-visited battle's index ahead of the playback cursor so the
+// playback worker's own self-healing call is a cheap no-op by the time the
+// user actually gets there. main.js drives it one request at a time, always
+// re-targeting the battle nearest the current cursor.
+function runPrefetchBattle(ex, data) {
+  ex.replay_prefetch_battle(data.matchIdx, data.startTickId, data.endTickId);
+  postMessage({ type: "prefetched", matchIdx: data.matchIdx });
+}
+
+// Runs on the PLAYBACK worker (g_db, the sole writer - see replay_prefetch_battle's
+// comment in replay_worker.c for why there's only ever one). This is the
+// other half of prefetching: replay_prefetch_battle() above only computes a
+// battle's rowid bounds off-thread; someone still has to actually build its
+// index, and that can only happen on g_db. main.js calls this ahead of the
+// cursor, during a gap between frame requests, so the cost lands before the
+// user scrubs there instead of exactly when they arrive - the CREATE INDEX
+// itself is unavoidable (single-writer), only its *timing* is the thing
+// being optimized here.
+function runPrimeBattle(ex, data) {
+  ex.replay_ensure_battle_ready(data.matchIdx);
+  postMessage({ type: "battlePrimed", matchIdx: data.matchIdx });
+}
+
 onmessage = async (e) => {
   const data = e.data;
   try {
     if (data.type === "init") {
       role = data.role;
       const ex = await bootstrap(data.memory, data.module, data.threadId);
-      ex.thread_main(data.threadId, role === "reader" ? 1 : 0);
+      const roleNum = role === "reader" ? 1 : role === "prefetch" ? 2 : 0;
+      ex.thread_main(data.threadId, roleNum);
       postMessage({ type: "ready" });
       return;
     }
@@ -220,6 +284,24 @@ onmessage = async (e) => {
         break;
       case "combineBounds":
         runCombineBounds(ex, data);
+        break;
+      case "prefetchBattle":
+        runPrefetchBattle(ex, data);
+        break;
+      case "primeBattle":
+        runPrimeBattle(ex, data);
+        break;
+      case "debugIndexVisible":
+        runDebugIndexVisible(ex, data);
+        break;
+      case "resetVfsTraces":
+        runResetVfsTraces(ex);
+        break;
+      case "getVfsTraces":
+        runGetVfsTraces(ex);
+        break;
+      case "getLockCounters":
+        runGetLockCounters(ex);
         break;
       case "frame":
         runFrame(ex, data);

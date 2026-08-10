@@ -28,9 +28,15 @@
  */
 #if defined(WASM_THREADS)
 
-#define WASM_LOADER_HEAP_SIZE  (256u * 1024u * 1024u) /* thread 0: CREATE INDEX over 2M+ rows */
-#define WASM_WORKER_HEAP_SIZE  (24u  * 1024u * 1024u) /* threads 1..N: simple bounded queries */
-#define WASM_MAX_WORKER_THREADS 8u                     /* up to 8 readers/playback (thread ids 1..8) */
+#define WASM_LOADER_HEAP_SIZE   (256u * 1024u * 1024u) /* thread 0: CREATE INDEX over 2M+ rows */
+#define WASM_WORKER_HEAP_SIZE   (24u  * 1024u * 1024u) /* threads 1..N: simple bounded queries */
+#define WASM_MAX_WORKER_THREADS 8u                     /* up to 8 readers (thread ids 1..8) */
+#define WASM_PREFETCH_HEAP_SIZE (96u  * 1024u * 1024u) /* thread 9: prefetch - runs the same
+                                                          * CREATE INDEX path as the loader, just
+                                                          * scoped to one battle's rows instead of
+                                                          * the whole table, so it needs more than a
+                                                          * reader's 24MB but not the loader's 256MB */
+#define WASM_PREFETCH_THREAD_ID 9
 
 #define WASM_REGION_A_SIZE    (320u * 1024u * 1024u)  /* shared DB blob (+ index overhead) */
 #define WASM_REGION_C_SIZE    (8u   * 1024u * 1024u)  /* shared per-match results */
@@ -39,20 +45,44 @@ extern unsigned char __heap_base;
 
 static inline unsigned char *wasm_thread_heap_base(int thread_id) {
     if (thread_id <= 0) return &__heap_base;
-    return &__heap_base + (size_t)WASM_LOADER_HEAP_SIZE + (size_t)(thread_id - 1) * (size_t)WASM_WORKER_HEAP_SIZE;
+    if (thread_id <= (int)WASM_MAX_WORKER_THREADS)
+        return &__heap_base + (size_t)WASM_LOADER_HEAP_SIZE + (size_t)(thread_id - 1) * (size_t)WASM_WORKER_HEAP_SIZE;
+    /* prefetch thread: its own slab, right after the last reader slab */
+    return &__heap_base + (size_t)WASM_LOADER_HEAP_SIZE + (size_t)WASM_MAX_WORKER_THREADS * (size_t)WASM_WORKER_HEAP_SIZE;
 }
 static inline size_t wasm_thread_heap_size(int thread_id) {
-    return thread_id <= 0 ? (size_t)WASM_LOADER_HEAP_SIZE : (size_t)WASM_WORKER_HEAP_SIZE;
+    if (thread_id <= 0) return (size_t)WASM_LOADER_HEAP_SIZE;
+    if (thread_id <= (int)WASM_MAX_WORKER_THREADS) return (size_t)WASM_WORKER_HEAP_SIZE;
+    return (size_t)WASM_PREFETCH_HEAP_SIZE;
 }
 
 static inline unsigned char *wasm_region_a_base(void) {
-    return &__heap_base + (size_t)WASM_LOADER_HEAP_SIZE + (size_t)WASM_MAX_WORKER_THREADS * (size_t)WASM_WORKER_HEAP_SIZE;
+    return &__heap_base + (size_t)WASM_LOADER_HEAP_SIZE + (size_t)WASM_MAX_WORKER_THREADS * (size_t)WASM_WORKER_HEAP_SIZE
+           + (size_t)WASM_PREFETCH_HEAP_SIZE;
 }
 static inline unsigned char *wasm_region_c_base(void) {
     return wasm_region_a_base() + (size_t)WASM_REGION_A_SIZE;
 }
 static inline unsigned char *wasm_layout_end(void) {
     return wasm_region_c_base() + (size_t)WASM_REGION_C_SIZE;
+}
+
+/* JS-side per-thread stack/TLS pools (see replay-worker.js's bootstrap())
+ * live here, past wasm_layout_end() - NOT as hand-picked JS constants. They
+ * used to be hardcoded at 300MB/400MB "clear of" this layout by eyeball;
+ * that estimate was wrong (this layout's own regions already reached
+ * ~449-777MB with 8 reader slabs, before the prefetch slab even existed) and
+ * the two silently overlapped for however long readers happened to not
+ * allocate far enough into their slab to prove it. JS now reads these back
+ * via wasm_debug_stack_pool_base()/wasm_debug_tls_pool_base() instead of
+ * duplicating the arithmetic, so this can never drift out of sync again. */
+#define WASM_MAX_THREAD_ID     (WASM_PREFETCH_THREAD_ID) /* highest thread_id ever used (loader=0, readers=1..8, prefetch=9) */
+#define WASM_STACK_SLOT_SIZE   (4u  * 1024u * 1024u)
+#define WASM_TLS_SLOT_SIZE     (64u * 1024u)
+
+static inline unsigned char *wasm_stack_pool_base(void) { return wasm_layout_end(); }
+static inline unsigned char *wasm_tls_pool_base(void) {
+    return wasm_stack_pool_base() + (size_t)(WASM_MAX_THREAD_ID + 1) * (size_t)WASM_STACK_SLOT_SIZE;
 }
 
 #endif /* WASM_THREADS */

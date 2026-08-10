@@ -54,6 +54,9 @@ typedef struct MemSharedLock {
 static MemSharedLock g_region_a_lock;
 static _Atomic sqlite3_int64 g_region_a_size = 0;
 
+int wasm_vfs_debug_shared_count(void) { return atomic_load(&g_region_a_lock.shared_count); }
+int wasm_vfs_debug_exclusive_kind(void) { return atomic_load(&g_region_a_lock.exclusive_kind); }
+
 #ifdef WASM_VFS_LOCK_TRACE
 static char g_lock_trace[2048];
 static int g_lock_trace_len = 0;
@@ -94,6 +97,11 @@ static void trace_io(const char *op, sqlite3_int64 ofst, int amt, sqlite3_int64 
 }
 const char *wasm_vfs_get_io_trace(void) { return g_io_trace; }
 
+void wasm_vfs_reset_traces(void) {
+    g_lock_trace_len = 0; g_lock_trace[0] = 0;
+    g_io_trace_len = 0; g_io_trace[0] = 0;
+}
+
 static unsigned char *g_debug_last_write_dataptr = 0;
 unsigned long wasm_vfs_debug_last_write_dataptr(void) { return (unsigned long)(uintptr_t)g_debug_last_write_dataptr; }
 #else
@@ -115,10 +123,32 @@ typedef struct MemFile {
 #endif
 } MemFile;
 
+#if defined(WASM_THREADS)
+static int memUnlockShared(MemFile *p, int lockType); /* defined below, needed by memClose */
+#endif
+
 static int memClose(sqlite3_file *pFile) {
     MemFile *p = (MemFile *)pFile;
 #if defined(WASM_THREADS)
-    if (p->is_shared) return SQLITE_OK; /* Region A is never freed - it's not this handle's to own */
+    if (p->is_shared) {
+        /* On a real OS, closing a file descriptor implicitly releases every
+         * lock it held - SQLite's own xClose callers don't always call
+         * xUnlock(NONE) first, relying on that OS behavior for free. Our
+         * VFS has no OS to do it for us: without this, a connection that
+         * closes while still holding >= SHARED (e.g. a reader that never
+         * explicitly dropped its lock) leaks its contribution to
+         * g_region_a_lock.shared_count forever, and every future writer's
+         * SHARED->EXCLUSIVE upgrade then permanently sees shared_count > 1
+         * and gets SQLITE_BUSY even when nothing is actually still using
+         * Region A. (Found via wasm_vfs_get_lock_trace(): a prefetch
+         * connection's CREATE INDEX repeatedly failed its EXCLUSIVE upgrade
+         * with rc=5 after 8 short-lived reader connections had come and
+         * gone from the earlier parallel-bounds-computation pass.) Region A
+         * itself is never freed here - only this handle's claim on the lock
+         * state is released, mirroring what a real OS's close() would do. */
+        memUnlockShared(p, SQLITE_LOCK_NONE);
+        return SQLITE_OK;
+    }
 #endif
     free(p->data);
     p->data = NULL;

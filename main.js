@@ -26,6 +26,32 @@ let playbackWorker = null; // the loader worker, which continues serving live qu
 let pendingFrameRequest = false;
 let latestFrame = null; // { buffer, count, activeMatchIndex, relativeTime }
 
+// Near-cursor prefetch (YouTube-buffering-style): a dedicated persistent
+// worker builds not-yet-visited battles' indexes ahead of the playback
+// cursor, so playbackWorker's own self-healing replay_ensure_battle_ready
+// call is a cheap no-op by the time the user actually gets there instead of
+// paying the one-time index-build cost live. See replay-worker.js's
+// 'prefetch' role and replay_worker.c's replay_prefetch_battle(). Purely a
+// latency optimization - fetch_positions() is self-healing regardless, so
+// nothing here is required for correctness, only for hiding the cold-open
+// cost before the cursor arrives.
+const PREFETCH_THREAD_ID = 9; // must match WASM_PREFETCH_THREAD_ID in wasm_layout.h
+let prefetchWorker = null;
+let prefetchInFlight = false;
+let prefetchedBattles = new Set(); // bounds computed (read-only, off playbackWorker)
+
+// Priming is the other half: replay_prefetch_battle() only computes a
+// battle's rowid bounds - actually building its index is a WRITE, and
+// SQLite's rollback-journal locking only ever lets ONE connection hold that
+// role (see the comment on replay_prefetch_battle in replay_worker.c), so it
+// has to happen on playbackWorker itself. Sent only once a battle's bounds
+// are already known (so playbackWorker's own call skips straight to the
+// index build) and only when playbackWorker has no frame request in flight -
+// still a visible one-time cost when it runs, but 1-2 battles ahead of the
+// cursor instead of exactly when the user arrives.
+let primingInFlight = false;
+let primedBattles = new Set();
+
 const glObjects = { programs: [], shaders: [], buffers: [], uniforms: [] };
 
 function triggerReset() {
@@ -36,6 +62,11 @@ function triggerReset() {
     currentSimulationState = "AWAITING_FILE";
 
     if (playbackWorker) { playbackWorker.terminate(); playbackWorker = null; }
+    if (prefetchWorker) { prefetchWorker.terminate(); prefetchWorker = null; }
+    prefetchedBattles = new Set();
+    prefetchInFlight = false;
+    primedBattles = new Set();
+    primingInFlight = false;
     sharedMemory = null;
     matches = [];
     latestFrame = null;
@@ -327,6 +358,91 @@ function appendChatToUI(chat) {
     chatContent.scrollTop = chatContent.scrollHeight;
 }
 
+// ---- Near-cursor prefetch orchestration ----
+
+function matchIndexForTime(t) {
+    for (let i = 0; i < matches.length; i++) {
+        if (t >= matches[i].startTime && t <= matches[i].endTime) return i;
+    }
+    return -1;
+}
+
+// Priority order fans out from the cursor, forward-biased (playback usually
+// moves forward): current+1, current-1, current+2, current-2, ... The
+// currently-active battle itself is deliberately skipped - playbackWorker's
+// own self-healing call already covers it on the very next frame request,
+// same as a video player's initial buffer when you first press play.
+function pickPrefetchTarget() {
+    if (matches.length === 0) return -1;
+    const current = latestFrame ? latestFrame.activeMatchIndex : matchIndexForTime(replayTime);
+    const base = current >= 0 ? current : 0;
+    for (let d = 1; d < matches.length; d++) {
+        const fwd = base + d;
+        if (fwd < matches.length && !prefetchedBattles.has(fwd)) return fwd;
+        const back = base - d;
+        if (back >= 0 && !prefetchedBattles.has(back)) return back;
+    }
+    return -1;
+}
+
+function schedulePrefetch() {
+    if (!prefetchWorker || prefetchInFlight) return;
+    const idx = pickPrefetchTarget();
+    if (idx < 0) return; // every battle already prefetched (or none loaded yet) - idle
+    prefetchInFlight = true;
+    prefetchWorker.postMessage({
+        type: 'prefetchBattle',
+        matchIdx: idx,
+        startTickId: matches[idx].startTickId,
+        endTickId: matches[idx].endTickId,
+    });
+}
+
+function startPrefetchWorker() {
+    prefetchWorker = new Worker('replay-worker.js');
+    prefetchWorker.onmessage = (e) => {
+        const d = e.data;
+        if (d.type === 'ready') {
+            schedulePrefetch();
+        } else if (d.type === 'prefetched') {
+            prefetchedBattles.add(d.matchIdx);
+            prefetchInFlight = false;
+            schedulePrefetch(); // always re-target the current cursor, not a stale one
+            schedulePriming();  // this battle's bounds are ready - eligible to prime now
+        } else if (d.type === 'error') {
+            appendToConsoleLog('[Prefetch Worker Error] ' + d.message);
+            // best-effort only (see comment above prefetchWorker decl) - drop
+            // this attempt and move on rather than getting stuck retrying.
+            prefetchInFlight = false;
+            schedulePrefetch();
+        }
+    };
+    prefetchWorker.postMessage({ type: 'init', role: 'prefetch', memory: sharedMemory, module: replayModule, threadId: PREFETCH_THREAD_ID });
+}
+
+// Same fan-out priority as pickPrefetchTarget, but only among battles whose
+// bounds are already known (prefetched) and not yet primed.
+function pickPrimeTarget() {
+    if (matches.length === 0) return -1;
+    const current = latestFrame ? latestFrame.activeMatchIndex : matchIndexForTime(replayTime);
+    const base = current >= 0 ? current : 0;
+    for (let d = 1; d < matches.length; d++) {
+        const fwd = base + d;
+        if (fwd < matches.length && prefetchedBattles.has(fwd) && !primedBattles.has(fwd)) return fwd;
+        const back = base - d;
+        if (back >= 0 && prefetchedBattles.has(back) && !primedBattles.has(back)) return back;
+    }
+    return -1;
+}
+
+function schedulePriming() {
+    if (!playbackWorker || primingInFlight || pendingFrameRequest) return; // only when playbackWorker is truly idle
+    const idx = pickPrimeTarget();
+    if (idx < 0) return;
+    primingInFlight = true;
+    playbackWorker.postMessage({ type: 'primeBattle', matchIdx: idx });
+}
+
 // ---- Worker orchestration ----
 
 function startReplayLoad(file) {
@@ -378,6 +494,7 @@ function onLoaderMessage(e) {
             totalEndTime = d.totalEnd;
             document.getElementById('progress-text').innerText = 'Computing map bounds (parallel)...';
             startBoundsComputation();
+            startPrefetchWorker(); // independent of bounds computation - can start working immediately
             break;
         }
         case 'boundsCombined': {
@@ -390,6 +507,14 @@ function onLoaderMessage(e) {
             latestFrame = { buffer: d.buffer, count: d.count, activeMatchIndex: d.activeMatchIndex, relativeTime: d.relativeTime };
             if (d.chatMessages && d.chatMessages.length) d.chatMessages.forEach(appendChatToUI);
             updateSliderPosition();
+            schedulePrefetch(); // re-target in case the cursor moved (playback, seek, or scrub)
+            schedulePriming();  // playbackWorker is idle right now - a good moment to prime, if anything's eligible
+            break;
+        }
+        case 'battlePrimed': {
+            primedBattles.add(d.matchIdx);
+            primingInFlight = false;
+            schedulePriming();
             break;
         }
         case 'error': {

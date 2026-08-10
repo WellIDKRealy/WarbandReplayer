@@ -33,7 +33,13 @@ WORKER-EXPORTS = thread_main \
                  replay_get_new_chat_count replay_get_chat_username_ptr replay_get_chat_message_ptr \
                  replay_get_chat_team replay_advance_chat_cursor \
                  replay_reader_compute_bounds replay_combine_bounds \
-                 replay_get_map_min_x replay_get_map_max_x replay_get_map_min_y replay_get_map_max_y
+                 replay_get_map_min_x replay_get_map_max_x replay_get_map_min_y replay_get_map_max_y \
+                 replay_ensure_battle_ready replay_prefetch_battle replay_debug_index_visible \
+                 replay_get_match_start_tick_id replay_get_match_end_tick_id \
+                 wasm_debug_heap_base wasm_debug_region_a_base wasm_debug_region_c_base wasm_debug_layout_end \
+                 wasm_debug_stack_pool_base wasm_debug_tls_pool_base \
+                 wasm_vfs_get_lock_trace wasm_vfs_get_io_trace wasm_vfs_reset_traces \
+                 wasm_vfs_debug_shared_count wasm_vfs_debug_exclusive_kind
 # 1GB: 256MB loader heap + 8*24MB reader/playback heaps (192MB) + 320MB
 # Region A (DB blob + index overhead) + 8MB Region C, rounded up with
 # headroom (see goyslopless-c/include/wasm_layout.h) - the loader's heap
@@ -52,7 +58,7 @@ MAIN-FLAGS = $(CFLAGS) $(LDFLAGS) $(LIBS-SRC) $(shell echo $(MAIN-EXPORTS) | xar
 BENCHMARK-FLAGS = -DSQLITE_OS_OTHER=1 -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION \
                   $(CFLAGS) $(LDFLAGS) -I./sqlite3 $(LIBS-SRC) \
                   $(shell echo $(BENCHMARK-EXPORTS) | xargs -n 1 printf '-Wl,--export=%s ')
-WORKER-FLAGS = -DWASM_THREADS -DSQLITE_OS_OTHER=1 -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION \
+WORKER-FLAGS = -DWASM_THREADS -DWASM_VFS_LOCK_TRACE -DSQLITE_OS_OTHER=1 -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION \
                $(CFLAGS) $(LDFLAGS) $(WORKER-MEMORY-FLAGS) $(WORKER-BOOTSTRAP-EXPORTS) $(LIBS-SRC) \
                $(shell echo $(WORKER-EXPORTS) | xargs -n 1 printf '-Wl,--export=%s ')
 
