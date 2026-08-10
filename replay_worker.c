@@ -21,8 +21,7 @@ extern const sqlite3_mutex_methods *wasm_mutex_methods_get(void);
 extern void js_log_string(const char *msg);
 
 /* ---- constants -------------------------------------------------------- */
-#define MAX_AGENT_SLOTS    1025  /* lua/main.lua: for agent = 0, 1024 do */
-#define MAX_RENDER_AGENTS  1000  /* matches main.c's MAX_AGENTS/agent_buffer layout */
+#define MAX_AGENT_SLOTS    1025  /* lua/main.lua: for agent = 0, 1024 do - a real engine limit on simultaneous living units */
 #define MAX_MATCHES        16    /* up to 15 real battles per file, +1 headroom */
 #define LOAD_CHUNK_SIZE    (1024 * 1024)
 #define MAX_CHAT_ENTRIES   4096
@@ -116,9 +115,35 @@ static RosterEntry g_roster[MAX_AGENT_SLOTS];
 static sqlite3_int64 g_roster_synced_tick_id = -1;
 static int g_active_match_index = -1;
 
+/* Every kill within the current battle gets its own permanent corpse entry -
+ * NOT indexed by agent_id (a reused engine slot: the same slot dies and
+ * respawns many times over a battle, so a fixed g_corpses[agent_id] array
+ * could only ever remember the *most recent* death per slot, silently
+ * overwriting earlier ones). This is a growable list instead: every kill
+ * appends, capacity doubles on demand, no ceiling on how many corpses one
+ * battle can accumulate. Reset (not just at match boundaries but any time
+ * resync_roster_to() does a full resync, e.g. a backward seek) and rebuilt
+ * by replaying that match's kill events from its own start - see
+ * resync_roster_to() and apply_roster_delta(). */
 typedef struct CorpseEntry { float x, y; signed char team; } CorpseEntry;
-static CorpseEntry g_corpses[MAX_AGENT_SLOTS];
-static unsigned char g_corpse_present[MAX_AGENT_SLOTS];
+static CorpseEntry *g_corpses = 0;
+static int g_corpse_count = 0;
+static int g_corpse_capacity = 0;
+
+static void corpse_list_reset(void) { g_corpse_count = 0; }
+static void corpse_list_add(float x, float y, signed char team) {
+    if (g_corpse_count >= g_corpse_capacity) {
+        int new_cap = g_corpse_capacity ? g_corpse_capacity * 2 : 256;
+        CorpseEntry *nc = (CorpseEntry *)realloc(g_corpses, sizeof(CorpseEntry) * (size_t)new_cap);
+        if (!nc) return; /* OOM: drop this corpse rather than crash, everything else keeps working */
+        g_corpses = nc;
+        g_corpse_capacity = new_cap;
+    }
+    g_corpses[g_corpse_count].x = x;
+    g_corpses[g_corpse_count].y = y;
+    g_corpses[g_corpse_count].team = team;
+    g_corpse_count++;
+}
 
 /* prepared once in replay_finish_load, reused for the life of the session */
 static sqlite3_stmt *g_stmt_roster_delta = 0; /* spawn+kill events in (tick_lo, tick_hi] */
@@ -384,10 +409,7 @@ static void apply_roster_delta(sqlite3_int64 from_tick, sqlite3_int64 to_tick) {
             double dead_x = sqlite3_column_double(g_stmt_roster_delta, 7);
             double dead_y = sqlite3_column_double(g_stmt_roster_delta, 8);
             if (dead_id >= 0 && dead_id < MAX_AGENT_SLOTS) {
-                g_corpses[dead_id].x = (float)dead_x;
-                g_corpses[dead_id].y = (float)dead_y;
-                g_corpses[dead_id].team = g_roster[dead_id].team;
-                g_corpse_present[dead_id] = 1;
+                corpse_list_add((float)dead_x, (float)dead_y, g_roster[dead_id].team);
             }
         }
     }
@@ -404,7 +426,7 @@ static void resync_roster_to(sqlite3_int64 target_tick_id) {
 
     if (target_match != g_active_match_index || target_tick_id < g_roster_synced_tick_id) {
         memset(g_roster, 0, sizeof(g_roster));
-        memset(g_corpse_present, 0, sizeof(g_corpse_present));
+        corpse_list_reset(); /* rebuilt below by replaying this match's kills from its own start */
         g_active_match_index = target_match;
         /* -2, not -1: the boundary tick where THIS match's own spawn events
          * fire is recorded as the PREVIOUS match's tail tick (start_idx of
@@ -420,10 +442,28 @@ static void resync_roster_to(sqlite3_int64 target_tick_id) {
     g_roster_synced_tick_id = target_tick_id;
 }
 
-/* ---- frame buffer (JS/wasm shared layout: [x,y,team, x,y,team, ...]) ---- */
-static float g_frame_buffer[MAX_RENDER_AGENTS * 3];
+/* ---- frame buffer (JS/wasm shared layout: [x,y,team, x,y,team, ...]) ----
+ * Growable, not fixed-size: living units are capped at MAX_AGENT_SLOTS by
+ * the game engine itself (a real limit, not one imposed here), but corpses
+ * accumulate for the whole battle (see corpse_list_add above) and have no
+ * such ceiling - a long, bloody battle can end up with far more corpses
+ * than living slots. JS re-reads replay_get_frame_buffer_ptr() every frame
+ * regardless, so a pointer that moves after a realloc is always safe. */
+static float *g_frame_buffer = 0;
+static int g_frame_buffer_capacity = 0;
 static int g_frame_count = 0;
 static double g_relative_time = 0.0;
+static sqlite3_int64 g_current_tick_id = -1; /* tickA of the most recent build_frame_at_time() call - chat gates on this */
+
+static void ensure_frame_buffer_capacity(int n) {
+    if (n <= g_frame_buffer_capacity) return;
+    int new_cap = g_frame_buffer_capacity ? g_frame_buffer_capacity * 2 : 2048;
+    while (new_cap < n) new_cap *= 2;
+    float *nb = (float *)realloc(g_frame_buffer, sizeof(float) * 3 * (size_t)new_cap);
+    if (!nb) return; /* OOM: keep the old buffer/capacity, build_frame_at_time's out-count will just clamp to it */
+    g_frame_buffer = nb;
+    g_frame_buffer_capacity = new_cap;
+}
 
 float *replay_get_frame_buffer_ptr(void) { return g_frame_buffer; }
 int replay_get_frame_count(void) { return g_frame_count; }
@@ -489,8 +529,20 @@ static void build_frame_at_time(double t) {
     resync_roster_to(tickB_id); /* cheap: incremental from tickA, already synced */
     fetch_positions(tickB_id, g_pos_b_x, g_pos_b_y, g_pos_b_present);
 
+    ensure_frame_buffer_capacity(g_corpse_count + MAX_AGENT_SLOTS); /* corpses (unbounded) + every living slot, worst case */
+
     int out = 0;
-    for (int agent_id = 0; agent_id < MAX_AGENT_SLOTS && out < MAX_RENDER_AGENTS; agent_id++) {
+    /* corpses first so they're drawn first - main.c's renderer paints in
+     * buffer order with no depth test, so whatever's pushed first ends up
+     * underneath. Living units come after so they're always on top of any
+     * corpse standing on the same spot. */
+    for (int i = 0; i < g_corpse_count; i++) {
+        g_frame_buffer[out * 3 + 0] = g_corpses[i].x;
+        g_frame_buffer[out * 3 + 1] = g_corpses[i].y;
+        g_frame_buffer[out * 3 + 2] = (g_corpses[i].team == 0) ? 2.0f : (g_corpses[i].team == 1) ? 3.0f : 4.0f;
+        out++;
+    }
+    for (int agent_id = 0; agent_id < MAX_AGENT_SLOTS; agent_id++) {
         if (!g_roster[agent_id].active || !g_roster[agent_id].is_human) continue;
         if (!g_pos_a_present[agent_id]) continue;
 
@@ -504,14 +556,8 @@ static void build_frame_at_time(double t) {
         g_frame_buffer[out * 3 + 2] = (float)g_roster[agent_id].team; /* -1, 0, or 1 */
         out++;
     }
-    for (int agent_id = 0; agent_id < MAX_AGENT_SLOTS && out < MAX_RENDER_AGENTS; agent_id++) {
-        if (!g_corpse_present[agent_id]) continue;
-        g_frame_buffer[out * 3 + 0] = g_corpses[agent_id].x;
-        g_frame_buffer[out * 3 + 1] = g_corpses[agent_id].y;
-        g_frame_buffer[out * 3 + 2] = (g_corpses[agent_id].team == 0) ? 2.0f : (g_corpses[agent_id].team == 1) ? 3.0f : 4.0f;
-        out++;
-    }
     g_frame_count = out;
+    g_current_tick_id = tickA_id; /* chat delivery (replay_get_new_chat_count) gates on this */
 
     g_relative_time = 0.0;
     if (g_active_match_index >= 0) g_relative_time = t - g_matches[g_active_match_index].start_time;
@@ -564,12 +610,20 @@ static void load_chats_for_match(int match_idx) {
     sqlite3_finalize(stmt);
 }
 
-/* returns the number of chat entries newly available since the last call
- * (a monotonic cursor - JS never re-scans, just drains what's new),
+/* returns the number of chat entries newly DUE since the last call - "due"
+ * meaning their tick_id has actually been reached by playback
+ * (g_current_tick_id, set every build_frame_at_time() call), not just
+ * "loaded for this match". Without this gate, the whole match's chat log -
+ * loaded all at once by load_chats_for_match() below - would all report as
+ * "new" the instant the match becomes active, dumping every message into
+ * the chat panel in one burst instead of as each was actually said. A
+ * monotonic cursor either way (JS never re-scans, just drains what's due),
  * re-scoping the cache when the active match has changed. */
 int replay_get_new_chat_count(void) {
     if (g_active_match_index != g_chat_scoped_match) load_chats_for_match(g_active_match_index);
-    int n = g_chat_count - g_chat_read_cursor;
+    int due = g_chat_read_cursor;
+    while (due < g_chat_count && g_chats[due].tick_id <= g_current_tick_id) due++;
+    int n = due - g_chat_read_cursor;
     return n > 0 ? n : 0;
 }
 static int chat_ref(int i) { return g_chat_read_cursor + i; } /* index relative to the unread window */

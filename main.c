@@ -1,4 +1,5 @@
 #include <math.h>
+#include <stdlib.h>
 #include <cglm/cglm.h>
 
 // WebGL Constants
@@ -37,7 +38,6 @@ extern void gl_draw_arrays(int mode, int first, int count);
 extern void gl_viewport(int x, int y, int w, int h);
 extern void js_log_string(const char* msg);
 
-#define MAX_AGENTS 1000
 #define BALL_RADIUS 0.75f
 #define CIRCLE_SEGS 18
 
@@ -66,11 +66,27 @@ int keys[4] = {0, 0, 0, 0};
 float map_min_x = -100.0f, map_max_x = 100.0f;
 float map_min_y = -100.0f, map_max_y = 100.0f;
 
-// Shared Wasm Memory: Array layout [x, y, team, x, y, team...]
-float agent_buffer[MAX_AGENTS * 3];
+// Shared Wasm Memory: Array layout [x, y, team, x, y, team...]. Growable,
+// not a fixed cap - a battle's living units are naturally bounded (the
+// game engine only has ~1025 agent slots), but corpses accumulate for the
+// whole battle with no ceiling, so this needs to be able to grow past
+// whatever an initial guess would be.
+float *agent_buffer = 0;
+int agent_buffer_capacity = 0;
 int active_agent_count = 0;
 
-float* get_agent_buffer_ptr() { return agent_buffer; }
+// Called from JS before writing this frame's data in: grows the buffer if
+// needed and returns the (possibly new) pointer. JS always re-fetches the
+// pointer via this call rather than caching it, since a realloc can move it.
+float* ensure_agent_capacity(int n) {
+    if (n > agent_buffer_capacity) {
+        int new_cap = agent_buffer_capacity ? agent_buffer_capacity * 2 : 2048;
+        while (new_cap < n) new_cap *= 2;
+        float *nb = (float*)realloc(agent_buffer, sizeof(float) * 3 * (size_t)new_cap);
+        if (nb) { agent_buffer = nb; agent_buffer_capacity = new_cap; }
+    }
+    return agent_buffer;
+}
 void update_frame_data(int count) { active_agent_count = count; }
 
 void set_map_bounds(float min_x, float max_x, float min_y, float max_y) {

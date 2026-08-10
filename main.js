@@ -17,6 +17,7 @@ let totalEndTime = 0.0;
 let isPaused = false;
 let playbackSpeed = 1.0;
 let matches = []; // small (<=16) summary array from the loader worker's 'loaded' message
+let timelineLoadBars = []; // per-match DOM element for the buffered/loaded indicator, see updateLoadIndicators()
 
 // Worker orchestration
 const WASM_MEMORY_PAGES = 16384; // 1GB - must match Makefile's --initial-memory/--max-memory for replay_worker.wasm
@@ -69,6 +70,7 @@ function triggerReset() {
     primingInFlight = false;
     sharedMemory = null;
     matches = [];
+    timelineLoadBars = [];
     latestFrame = null;
 
     document.getElementById('chat-content').innerHTML = '<div>System: Chat initialized...</div>';
@@ -252,6 +254,7 @@ function createTimelineUI() {
     trackWrapper.style.overflow = 'hidden';
 
     const totalSpan = Math.max(1e-6, totalEndTime - totalStartTime);
+    timelineLoadBars = [];
     matches.forEach((m, idx) => {
         const startPct = ((m.startTime - totalStartTime) / totalSpan) * 100;
         const widthPct = ((m.endTime - m.startTime) / totalSpan) * 100;
@@ -270,8 +273,25 @@ function createTimelineUI() {
             seekTo(m.startTime);
         };
 
+        // YouTube-style buffered indicator: a thin bar along the bottom of
+        // this battle's block, brightness reflecting how "loaded" it is -
+        // see updateLoadIndicators(). Purely visual, driven by the same
+        // prefetchedBattles/primedBattles state the prefetch orchestration
+        // (schedulePrefetch/schedulePriming) already tracks.
+        const loadBar = document.createElement('div');
+        loadBar.style.position = 'absolute';
+        loadBar.style.bottom = '0';
+        loadBar.style.left = '0';
+        loadBar.style.width = '100%';
+        loadBar.style.height = '3px';
+        loadBar.style.background = 'transparent';
+        loadBar.style.pointerEvents = 'none';
+        block.appendChild(loadBar);
+        timelineLoadBars[idx] = loadBar;
+
         trackWrapper.appendChild(block);
     });
+    updateLoadIndicators();
 
     const slider = document.createElement('input');
     slider.id = 'tl-slider';
@@ -407,6 +427,7 @@ function startPrefetchWorker() {
         } else if (d.type === 'prefetched') {
             prefetchedBattles.add(d.matchIdx);
             prefetchInFlight = false;
+            updateLoadIndicators();
             schedulePrefetch(); // always re-target the current cursor, not a stale one
             schedulePriming();  // this battle's bounds are ready - eligible to prime now
         } else if (d.type === 'error') {
@@ -441,6 +462,26 @@ function schedulePriming() {
     if (idx < 0) return;
     primingInFlight = true;
     playbackWorker.postMessage({ type: 'primeBattle', matchIdx: idx });
+}
+
+// YouTube-buffered-bar-style loading indicator, drawn along the bottom of
+// each battle's timeline block: dim/transparent = not loaded at all, faint
+// = bounds prefetched but index not built yet, bright = fully primed (an
+// access to this battle would be instant). Called whenever prefetchedBattles/
+// primedBattles change, and once from createTimelineUI() to paint the
+// initial state.
+function updateLoadIndicators() {
+    for (let i = 0; i < timelineLoadBars.length; i++) {
+        const bar = timelineLoadBars[i];
+        if (!bar) continue;
+        if (primedBattles.has(i)) {
+            bar.style.background = 'rgba(255, 255, 255, 0.9)';
+        } else if (prefetchedBattles.has(i)) {
+            bar.style.background = 'rgba(255, 255, 255, 0.35)';
+        } else {
+            bar.style.background = 'transparent';
+        }
+    }
 }
 
 // ---- Worker orchestration ----
@@ -507,6 +548,17 @@ function onLoaderMessage(e) {
             latestFrame = { buffer: d.buffer, count: d.count, activeMatchIndex: d.activeMatchIndex, relativeTime: d.relativeTime };
             if (d.chatMessages && d.chatMessages.length) d.chatMessages.forEach(appendChatToUI);
             updateSliderPosition();
+            // A battle can become ready without ever going through the
+            // prefetch/prime pipeline - e.g. the very first battle on load,
+            // or the user jumping straight to one (playbackWorker's own
+            // self-healing call covers it live). If we just got a real frame
+            // for a battle, it's ready by definition; make sure the loading
+            // indicator reflects that regardless of how it got there.
+            if (d.activeMatchIndex >= 0 && !primedBattles.has(d.activeMatchIndex)) {
+                primedBattles.add(d.activeMatchIndex);
+                prefetchedBattles.add(d.activeMatchIndex);
+                updateLoadIndicators();
+            }
             schedulePrefetch(); // re-target in case the cursor moved (playback, seek, or scrub)
             schedulePriming();  // playbackWorker is idle right now - a good moment to prime, if anything's eligible
             break;
@@ -514,6 +566,7 @@ function onLoaderMessage(e) {
         case 'battlePrimed': {
             primedBattles.add(d.matchIdx);
             primingInFlight = false;
+            updateLoadIndicators();
             schedulePriming();
             break;
         }
@@ -688,9 +741,12 @@ Promise.all([
                 }
 
                 if (latestFrame) {
-                    const agentBufferPtr = exports.get_agent_buffer_ptr();
-                    const floatView = new Float32Array(wasmInstance.exports.memory.buffer, agentBufferPtr, 1000 * 3);
-                    const n = Math.min(latestFrame.count, 1000);
+                    // No cap here - ensure_agent_capacity grows main.wasm's
+                    // buffer to fit however many units+corpses this frame
+                    // actually has (a long battle's corpse count is unbounded).
+                    const n = latestFrame.count;
+                    const agentBufferPtr = exports.ensure_agent_capacity(n);
+                    const floatView = new Float32Array(wasmInstance.exports.memory.buffer, agentBufferPtr, n * 3);
                     floatView.set(latestFrame.buffer.subarray(0, n * 3));
                     exports.update_frame_data(n);
                 }

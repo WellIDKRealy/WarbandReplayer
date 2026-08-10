@@ -180,6 +180,45 @@ function waitFor(worker, predicate) {
     const rCold = await timedFrame(coldTarget.startTime + 5);
     line(`jump to NOT-prefetched battle #${coldIdx} (control):            ${rCold.ms.toFixed(1)}ms count=${rCold.count} match=${rCold.activeMatchIndex}`);
 
+    // --- corpses (accumulate for the whole battle, never shrink except on a
+    // new battle/backward seek, and are drawn before living units so they
+    // render underneath) + chat (delivered progressively as tick_id is
+    // crossed, not dumped all at once) - both against a real long battle. ---
+    line("\n=== CORPSES + CHAT PACING (battle #1, a long one) ===");
+    const longBattle = loadResult.matches[1];
+    const steps = 8;
+    let cumulativeChats = 0;
+    const chatArrivals = [];
+    const corpseTrend = [];
+    let orderViolation = false;
+    for (let i = 0; i <= steps; i++) {
+        // stay 5s clear of both edges - exact start/end boundary ticks can
+        // be sparse/empty transition frames (seen earlier in this file's
+        // testing), which isn't what this is trying to measure.
+        const lo = longBattle.startTime + 5, hi = longBattle.endTime - 5;
+        const t = lo + (hi - lo) * (i / steps);
+        const fp = waitFor(loader, d => d.type === 'frame');
+        loader.postMessage({ type: 'frame', time: t, seek: i === 0 });
+        const f = await fp;
+        const newChats = (f.chatMessages || []).length;
+        cumulativeChats += newChats;
+        chatArrivals.push(newChats);
+
+        let corpseCount = 0, seenLiving = false;
+        for (let k = 0; k < f.count; k++) {
+            const team = f.buffer[k * 3 + 2];
+            const isCorpse = team === 2 || team === 3 || team === 4;
+            if (isCorpse) { corpseCount++; if (seenLiving) orderViolation = true; }
+            else seenLiving = true;
+        }
+        corpseTrend.push(corpseCount);
+        line(`  step ${i}: t=+${(t - longBattle.startTime).toFixed(0)}s newChats=${newChats} corpses=${corpseCount} living=${f.count - corpseCount} match=${f.activeMatchIndex}`);
+    }
+    line(`chat arrival distribution across ${steps + 1} steps: [${chatArrivals.join(',')}] (total ${cumulativeChats})`);
+    line(`corpse count by step: [${corpseTrend.join(',')}]`);
+    const corpsesNonDecreasing = corpseTrend.every((v, i) => i === 0 || v >= corpseTrend[i - 1]);
+    const chatNotAllAtOnce = cumulativeChats === 0 || chatArrivals[0] < cumulativeChats;
+
     // --- playback smoothness: request 100 sequential frames across the whole timeline, time each ---
     line("\n=== PLAYBACK: 100 sequential frame requests across full timeline ===");
     const frameTimes = [];
@@ -220,6 +259,9 @@ function waitFor(worker, predicate) {
       ["slow frames bounded by battle count (no redundant rebuild)", coldFrames <= loadResult.matchCount],
       ["prefetched battle is fast on first live access", rPrefetched.ms < 16.6],
       ["prefetch is the reason: un-prefetched control battle is still slow", rCold.ms > 16.6],
+      ["corpses drawn before living units in the frame buffer (renders underneath)", !orderViolation],
+      ["corpse count never decreases across forward playback within a battle", corpsesNonDecreasing],
+      ["chat delivered progressively, not dumped all at once on battle entry", chatNotAllAtOnce],
     ];
     let allPass = true;
     for (const [name, ok] of checks) { line((ok?"PASS":"FAIL") + ": " + name); if (!ok) allPass = false; }

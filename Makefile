@@ -10,7 +10,7 @@ LDFLAGS = -fuse-ld=lld -Wl,--no-entry -Wl,--import-undefined
 TARGETS = main.wasm benchmark.wasm replay_worker.wasm
 LIBS-SRC = goyslopless-c/lib/*.c
 
-MAIN-EXPORTS = set_screen_dimensions set_map_bounds get_vs_main_ptr get_fs_main_ptr get_vs_grid_ptr get_fs_grid_ptr init_engine init_gl_programs get_agent_buffer_ptr update_frame_data render_frame apply_zoom pan_camera set_key_state
+MAIN-EXPORTS = set_screen_dimensions set_map_bounds get_vs_main_ptr get_fs_main_ptr get_vs_grid_ptr get_fs_grid_ptr init_engine init_gl_programs ensure_agent_capacity update_frame_data render_frame apply_zoom pan_camera set_key_state
 BENCHMARK-EXPORTS = main
 
 # replay_worker.wasm: the multithreaded (-DWASM_THREADS -DSQLITE_THREADSAFE=1)
