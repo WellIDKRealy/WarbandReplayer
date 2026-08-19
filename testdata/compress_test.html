@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html><body><pre id="out">running...</pre>
+<script>
+let log = "";
+function line(s) { log += s + "\n"; document.getElementById('out').textContent = log; console.log(s); }
+
+function hexDump(bytes, n) {
+  return [...bytes.subarray(0, n)].map(b => b.toString(16).padStart(2, '0')).join(' ');
+}
+
+(async () => {
+  try {
+    const module = await WebAssembly.compile(await (await fetch('../compress.wasm', { cache: 'no-store' })).arrayBuffer());
+    line("imports needed: " + JSON.stringify(WebAssembly.Module.imports(module)));
+
+    // compress.wasm is NOT built with --import-memory (unlike replay_worker.wasm,
+    // it's a standalone non-threaded module with no need to share memory
+    // across Workers) - it defines and EXPORTS its own memory rather than
+    // importing one, so there is nothing to pass in env.memory here. All
+    // byte access below must go through instance.exports.memory, not a
+    // separately-constructed WebAssembly.Memory.
+    const instance = await WebAssembly.instantiate(module, {});
+    const ex = instance.exports;
+    line("instantiated OK, exports: " + Object.keys(ex).join(','));
+
+    function readCstr(ptr) {
+      const mem = new Uint8Array(ex.memory.buffer);
+      let end = ptr;
+      while (mem[end] !== 0) end++;
+      return new TextDecoder().decode(mem.subarray(ptr, end));
+    }
+
+    // build a synthetic but non-trivial input: repeated text (compressible) +
+    // some pseudo-random tail (weakly compressible - it's an LCG, not real
+    // entropy, but that's fine for exercising the encoder), enough to cross
+    // more than one internal chunk (CHUNK_SIZE = 1MiB in compress_worker.c).
+    const text = "The quick brown fox jumps over the lazy dog. ".repeat(80000); // ~3.7MB, highly compressible
+    let rnd = 12345;
+    function nextRnd() { rnd = (rnd * 1103515245 + 12345) & 0x7fffffff; return rnd; }
+    const randomTail = new Uint8Array(200000);
+    for (let i = 0; i < randomTail.length; i++) randomTail[i] = nextRnd() & 0xff;
+    const textBytes = new TextEncoder().encode(text);
+    const input = new Uint8Array(textBytes.length + randomTail.length);
+    input.set(textBytes, 0);
+    input.set(randomTail, textBytes.length);
+    line(`synthetic input: ${input.length} bytes`);
+    window.__compressInput = input;
+
+    ex.compress_begin();
+    const chunkPtr = ex.compress_get_input_chunk_ptr();
+    const CHUNK = 1024 * 1024;
+    let fed = 0;
+    while (fed < input.length) {
+      const n = Math.min(CHUNK, input.length - fed);
+      // re-read ex.memory.buffer fresh every iteration: memory.grow() during
+      // compress_feed_chunk (goyslopless-c's elastic heap) detaches the old
+      // ArrayBuffer, so a Uint8Array captured once before the loop would go
+      // stale partway through for a large enough input.
+      new Uint8Array(ex.memory.buffer).set(input.subarray(fed, fed + n), chunkPtr);
+      const rc = ex.compress_feed_chunk(n);
+      if (rc !== 0) throw new Error("compress_feed_chunk failed: " + readCstr(ex.compress_get_last_error()));
+      fed += n;
+    }
+    line(`fed ${fed} bytes in ${Math.ceil(input.length / CHUNK)} chunks`);
+
+    const t0 = performance.now();
+    const rc = ex.compress_finish(24);
+    const ms = performance.now() - t0;
+    if (rc !== 0) throw new Error("compress_finish failed: " + readCstr(ex.compress_get_last_error()));
+
+    const outPtr = ex.compress_get_output_ptr();
+    const outLen = ex.compress_get_output_len();
+    line(`compressed in ${ms.toFixed(1)}ms: ${input.length} -> ${outLen} bytes (ratio ${(input.length / outLen).toFixed(2)}x)`);
+    line(`debug: outPtr=${outPtr} writeCalls=${ex.compress_debug_write_call_count()} writeBytesTotal=${ex.compress_debug_write_bytes_total()} ex.memory.buffer.byteLength=${ex.memory.buffer.byteLength}`);
+
+    const outView = new Uint8Array(ex.memory.buffer, outPtr, outLen);
+    const output = new Uint8Array(outLen);
+    output.set(outView); // copy out before any further compress_finish call could move/resize the buffer
+    window.__compressOutput = output;
+
+    line("output first 16 bytes: " + hexDump(output, 16));
+    const XZ_MAGIC = [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00];
+    const magicOk = XZ_MAGIC.every((b, i) => output[i] === b);
+
+    const checks = [
+      ["compress_finish returned success", rc === 0],
+      ["output starts with real xz stream magic (FD 37 7A 58 5A 00)", magicOk],
+      ["output is smaller than input (mixed compressible+random data)", outLen < input.length],
+      ["output is non-trivially smaller (>2x, dominated by the repetitive text)", input.length / outLen > 2],
+    ];
+    let allPass = true;
+    line("");
+    for (const [name, ok] of checks) { line((ok ? "PASS" : "FAIL") + ": " + name); if (!ok) allPass = false; }
+    line(allPass ? "\nRESULT: PASS" : "\nRESULT: FAIL");
+
+    // base64-dump both buffers into the page text itself (not a
+    // javascript_tool return value, which has a much lower size ceiling and
+    // previously caused a manual-retyping mistake) so an external check can
+    // extract them byte-exact via get_page_text + marker search, no manual
+    // copy/paste of a multi-KB string involved.
+    function toBase64(bytes) {
+      let binary = '';
+      const chunk = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+      return btoa(binary);
+    }
+    // (input is regenerated deterministically on the Python side for the
+    // round-trip byte-compare instead of also dumping ~3.8MB of base64 here)
+    line("\nBASE64_OUTPUT_START:" + toBase64(output) + ":BASE64_OUTPUT_END");
+  } catch (e) {
+    line("EXCEPTION: " + e.message + "\n" + (e.stack || ""));
+  }
+})();
+</script>
+</body></html>

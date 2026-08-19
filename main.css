@@ -58,24 +58,153 @@ canvas {
     box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
 }
 
-/* Chat goes Bottom-Left (Classic Multiplayer Position) */
+/* Every panel below is draggable (main.js's makeDraggable(), attached to
+   .panel-header). System Logs/VFS Trace/SQL Terminal are also individually
+   toggleable from the hamburger menu's Panels checkboxes - main.js's
+   setPanelVisible() repositions a panel to a staggered top-right spot every
+   time it's checked back on, overriding whatever's here, so the coordinates
+   below only matter for the brief window before a panel has ever been
+   toggled (and for SQL Terminal specifically, which shows by CSS default in
+   debug mode rather than via a checkbox change). Chat is the one panel
+   that's always visible and never goes through setPanelVisible - see its
+   own bottom-anchoring comment below. */
 #chat-box {
     bottom: 110px; /* Sits perfectly above the timeline controller */
     left: 20px;
     width: 360px;
 }
 
-/* System Logs go Top-Left */
+/* Chat is bottom-anchored (see main.js's reanchorChatBottom) - as messages
+   accumulate the panel should visibly grow taller, not just internally
+   scroll within a small fixed box, so this needs real headroom past the
+   generic 150px every other .panel-content uses. Still caps out somewhere
+   (unbounded growth would eventually run into the hamburger/timeline) and
+   scrolls internally past that. The minimized (collapsed-to-0) case is set
+   inline by main.js's toggleMinimize() instead of a `.minimized
+   #chat-content` override here - see the comment there for why. */
+#chat-content {
+    max-height: 400px;
+}
+
 #log-box {
-    top: 20px;
+    top: 80px;
     left: 20px;
     width: 280px;
 }
 
+#debug-panel {
+    top: 220px;
+    right: 20px;
+    width: 320px;
+}
+
+#debug-panel button {
+    background: transparent;
+    border: 1px solid rgba(0, 255, 0, 0.4);
+    color: #00ff00;
+    font-family: inherit;
+    font-size: 10px;
+    padding: 3px 6px;
+    margin: 2px 2px 2px 0;
+    cursor: pointer;
+}
+
+#debug-panel button:hover {
+    background: rgba(0, 255, 0, 0.15);
+}
+
+#debug-panel input {
+    background: #111;
+    border: 1px solid rgba(0, 255, 0, 0.3);
+    color: #00ff00;
+    font-family: inherit;
+    font-size: 10px;
+}
+
+#debug-output {
+    white-space: pre-wrap;
+    word-break: break-all;
+    margin: 6px 0 0 0;
+    color: #0c0;
+}
+
+#sql-terminal-panel {
+    top: 20px;
+    right: 20px;
+    width: 440px;
+}
+
+#sql-terminal-panel textarea {
+    width: 100%;
+    box-sizing: border-box;
+    background: #111;
+    color: #0f0;
+    border: 1px solid rgba(0, 255, 0, 0.3);
+    font-family: inherit;
+    font-size: 11px;
+    resize: vertical;
+}
+
+#sql-terminal-panel button, #sql-terminal-panel select {
+    background: transparent;
+    border: 1px solid rgba(0, 255, 0, 0.4);
+    color: #00ff00;
+    font-family: inherit;
+    font-size: 10px;
+    padding: 3px 6px;
+    margin: 4px 4px 0 0;
+    cursor: pointer;
+}
+
+#sql-terminal-panel button:hover {
+    background: rgba(0, 255, 0, 0.15);
+}
+
+#sql-terminal-status {
+    margin-top: 4px;
+    color: #888;
+    font-size: 10px;
+}
+
+#sql-terminal-results {
+    overflow: auto;
+    max-height: 240px;
+    margin-top: 6px;
+}
+
+#sql-terminal-results table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 10px;
+}
+
+#sql-terminal-results th, #sql-terminal-results td {
+    border: 1px solid rgba(0, 255, 0, 0.2);
+    padding: 2px 5px;
+    text-align: left;
+    white-space: nowrap;
+}
+
+#sql-terminal-results th {
+    background: rgba(0, 255, 0, 0.08);
+    position: sticky;
+    top: 0;
+}
+
+#sql-terminal-results tr:hover td {
+    background: rgba(0, 255, 0, 0.08);
+    cursor: pointer;
+}
+
+/* Draggable by mousedown-and-move (main.js's makeDraggable()); a plain click
+   with no real movement still toggles minimize, same as before. cursor:move
+   is the visual affordance that these headers pick up/drag rather than just
+   click. user-select:none also matters more now - without it, a fast drag
+   would select the header's text underneath the cursor. */
 .panel-header {
     padding: 8px 12px;
     background: rgba(20, 20, 20, 0.9);
-    cursor: pointer;
+    cursor: move;
     font-weight: bold;
     display: flex;
     justify-content: space-between;
@@ -104,17 +233,97 @@ canvas {
     border-bottom: none;
 }
 
-#reset-btn {
-    position: absolute; top: 20px; right: 20px;
-    background: #111; border: 1px solid #444; color: #fff;
-    padding: 8px 16px; cursor: pointer; border-radius: 4px;
-    font-family: inherit; z-index: 12; display: none; font-size: 12px;
+/* Top-Left. Replaces what used to be two separately floating corner buttons
+   (#reset-btn/#export-btn, top-right) - those collided with the debug panels
+   (also top-right by default) whenever both were visible at once. One
+   compact icon instead, opening a small dropdown for those two actions plus
+   the Panels visibility checkboxes below; hidden as a whole via main.js
+   exactly when #reset-btn used to be (only meaningful once a replay/battle
+   is loaded and running). */
+#hamburger-container {
+    position: absolute; top: 20px; left: 20px;
+    z-index: 12;
 }
 
-#reset-btn:hover {
+#hamburger-btn {
+    background: #111; border: 1px solid #444; color: #fff;
+    width: 40px; height: 40px; line-height: 40px; padding: 0;
+    cursor: pointer; border-radius: 4px;
+    font-family: inherit; font-size: 18px;
+}
+
+#hamburger-btn:hover {
     background: #222;
     border-color: #00ff00;
     color: #00ff00;
+}
+
+#main-menu {
+    display: none;
+    flex-direction: column;
+    position: absolute; top: 48px; left: 0;
+    background: #111; border: 1px solid #444; border-radius: 4px;
+    padding: 6px;
+    box-shadow: 0 4px 15px rgba(0, 0, 0, 0.5);
+    min-width: 240px;
+}
+
+#main-menu.open {
+    display: flex;
+}
+
+#main-menu button {
+    background: transparent; border: none; color: #fff;
+    padding: 10px 12px; cursor: pointer;
+    font-family: inherit; font-size: 12px; text-align: left;
+    border-radius: 3px;
+}
+
+#main-menu button:hover {
+    background: rgba(0, 255, 0, 0.12);
+    color: #00ff00;
+}
+
+.menu-divider {
+    height: 1px;
+    background: #333;
+    margin: 6px 4px;
+}
+
+.menu-checkbox-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    color: #ccc;
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    border-radius: 3px;
+}
+
+.menu-checkbox-item:hover {
+    background: rgba(0, 255, 0, 0.08);
+    color: #00ff00;
+}
+
+.menu-checkbox-item input {
+    cursor: pointer;
+}
+
+#export-btn {
+    color: #ffcc00;
+}
+
+#export-btn:hover {
+    background: rgba(255, 204, 0, 0.12);
+    color: #ffcc00;
+}
+
+#export-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+    background: transparent;
 }
 
 /* Minimalist Overlays */

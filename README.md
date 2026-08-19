@@ -25,6 +25,24 @@ project) this repo grew out of; the replay viewer (`main.html`) is the actual ap
   import shim, and DOM updates for the timeline/chat panels driven by small summaries the workers
   send over - no SQL or per-tick bookkeeping happens here.
 
+### Memory footprint
+
+`replay_worker.wasm`'s shared `WebAssembly.Memory` reserves 96MiB up front (`--initial-memory`,
+`WASM_MEMORY_INITIAL_PAGES` in `main.js`) and can grow to 2GiB (`--max-memory`) as needed. That
+96MiB isn't a hand-picked "safe-sounding" number - it's `goyslopless-c/include/wasm_layout.h`'s
+per-thread slab sizes (8MiB loader + 8×2MiB readers + 4MiB prefetch + 4KiB bounds-result region)
+plus fixed per-thread stack/TLS pools, and every one of those slab sizes is a *starting point*, not
+a cap: `goyslopless-c/lib/heap.c`'s `heap_extend_threaded()` transparently grows any thread past its
+nominal slab via `memory.grow`, landing a new disjoint region wherever the shared memory's current
+size happens to be. A real `CREATE INDEX` over a 2M+-row table from an 8MiB starting heap is exactly
+what proved that growth path safe in the first place (stress-tested with `heap_debug_region_count()`/
+`heap_debug_extend_failures()`, see `wasm_layout.h`'s own comments) - so the up-front reservation
+only has to cover the common case, not the worst case. `navigator.deviceMemory` (where supported;
+Chromium-only, coarse) additionally clamps how many reader Workers spin up and the LZMA dictionary
+size used for battle exports on constrained devices (`main.js`'s `computeReaderCount()`/
+`computeDictSizeMiB()`) - that's about real fixed per-Worker/per-compression overhead, independent
+of the wasm-side memory floor above.
+
 ## Prerequisites
 
 - **LLVM toolchain**: `clang` and `wasm-ld` (part of LLVM - on Windows, `choco install llvm` gets
@@ -38,7 +56,7 @@ project) this repo grew out of; the replay viewer (`main.html`) is the actual ap
 make
 ```
 
-Produces `main.wasm`, `benchmark.wasm`, and `replay_worker.wasm`. `make clean` removes them.
+Produces `main.wasm`, `benchmark.wasm`, `replay_worker.wasm`, and `compress.wasm`. `make clean` removes them.
 
 ## Running
 
@@ -84,6 +102,20 @@ transparent. See the comment block at the top of `coi-shim.js` for how it works.
 - `goyslopless-c/` - the from-scratch freestanding libc this project builds against instead of a
   full libc, including the heap allocator (`lib/heap.c`) and the `__multi3` 128-bit-multiply
   compiler-rt shim (`lib/compiler_rt.c`) clang needs for SQLite's overflow-safe arithmetic.
+- `replay_export.c` / `compress_worker.c` (`compress.wasm`) - the battle export pipeline: per-battle
+  `replay.db`/`battle.db`/`manifest.json`, packed into a minimal ustar tar, then xz/LZMA2-compressed
+  (and decompressed, for loading one back in) by a public-domain LZMA SDK subset vendored under
+  `lzma-sdk/` (see `lzma-sdk/NOTICE.md`). `compress-worker.js` is the thin Worker wrapper;
+  `compress.wasm` is deliberately a separate, non-threaded module from `replay_worker.wasm`, built
+  with its own elastic (non-shared) memory. "Load Battle Export (.tar.xz)" in `main.html` decompresses
+  and tar-extracts client-side, then hands `replay.db`'s bytes to `replay_finish_load_battle_file()`
+  (`replay_worker.c`) - the same OPFS-backed load path a full source file uses, just skipping
+  `scan_matches()` in favor of the single row `replay_export.c` wrote into `replay_meta` at export time.
+- `sql_terminal.c` - the `?debug=1` SQL terminal: arbitrary read/write SQL against whatever's
+  currently loaded, row results streamed back in bounded batches, plus in-session
+  `SAVEPOINT`/`ROLLBACK TO` checkpoints (never persisted - gone once the tab closes). Query results
+  aliased exactly `x`/`y` can be pushed onto the map as highlighted rings via `main.c`'s
+  `highlight_buffer` (mirrors `agent_buffer`'s pattern, third draw pass in `render_frame`).
 - `cglm/`, `ubench/` - git submodules (3D math, benchmarking).
 - `benchmark.c` / `benchmark.html` - the benchmark suite (see below).
 - `lua/main.lua` - the Warband-side recorder script that produces the `.sqlite` replay logs this
@@ -112,24 +144,48 @@ real bug during development (corpse counts leaking one tick ahead of the display
 count-only smoke testing had missed.
 
 `testdata/run_test_suite.py` automates this across every replay in a batch and every real browser
-engine available for automation on the machine - Chromium (Chrome/Edge/Brave), Firefox (Gecko), and
-WebKit (Safari's engine; real Safari is macOS/iOS-only and can't be driven headlessly, but the same
-engine catches most engine-level bugs) - via [Playwright](https://playwright.dev/).
+engine available for automation on the machine - Chrome, Firefox, and (Linux only) WebKit via
+[Selenium](https://www.selenium.dev/). Real Safari is macOS/iOS-only and can't be driven headlessly;
+WebKitGTK is the closest available proxy for that engine and only runs on Linux (`apt install
+webkit2gtk-driver`) - on Windows/macOS, run with `--browsers chrome,firefox` or use WSL for WebKit
+coverage. Each case gets its own fresh browser process, runs concurrently (thread pool per browser,
+all browsers at once), and gets one automatic retry if the browser process itself crashes or a
+page-internal fetch flakes under concurrent load - not for a real assertion mismatch.
 
 ```bash
-playwright install chromium firefox webkit
+pip install selenium   # Selenium Manager auto-downloads chromedriver/geckodriver - nothing else to install for chrome/firefox
+pip install psutil      # optional - enables --max-suite-memory-mb below
 
 # one-time: generate ground truth for a batch of replays
 python3 testdata/ground_truth.py path/to/replay.sqlite 6 testdata/gt_batch/replay.json
 # (or loop it over testdata/replays_batch/*.sqlite -> testdata/gt_batch/*.json)
 
-python3 serve.py 8126                       # must be running - COOP/COEP + concurrent requests
-python3 testdata/run_test_suite.py          # all discovered replays x all 3 engines
+python3 serve.py 8126                                    # must be running - COOP/COEP + concurrent requests
+python3 testdata/run_test_suite.py --browsers chrome,firefox   # all discovered replays x both engines
 python3 testdata/run_test_suite.py --only match_substring
-python3 testdata/run_test_suite.py --browsers chromium,firefox
+python3 testdata/run_test_suite.py --browsers chrome,firefox,webkit   # Linux only
+python3 testdata/run_test_suite.py --max-suite-memory-mb 4096  # cap the SUITE's own memory use (its
+                                                                 # spawned browsers only, never other
+                                                                 # programs on the machine) - new
+                                                                 # launches wait for a running case to
+                                                                 # finish rather than pile on
 ```
 
 Replay files themselves are never committed (they're real player data - usernames, chat) and
 `testdata/replays_batch/` and `testdata/gt_batch/` are gitignored; populate them locally from
 whatever `.sqlite` recordings you have (e.g. `Modules/Napoleonic Wars/lua/replays.7z` in a Warband
 install) before running the suite.
+
+### Pre-commit: catching a stale `.wasm`
+
+`main.wasm`/`replay_worker.wasm` are committed binaries (GitHub Pages serves the repo directly, no
+build step), which means nothing stops a commit from shipping C source changes without the matching
+rebuilt binary - this happened once already, silently reintroducing an already-fixed bug.
+`scripts/git-hooks/pre-commit` catches it: if a commit touches wasm-affecting source, it force-rebuilds
+`main.wasm`/`replay_worker.wasm` and blocks the commit if what's staged doesn't match. `.git/hooks/`
+isn't tracked by git, so install it explicitly once per clone:
+
+```bash
+cp scripts/git-hooks/pre-commit .git/hooks/pre-commit
+chmod +x .git/hooks/pre-commit
+```

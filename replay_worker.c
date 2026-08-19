@@ -12,6 +12,9 @@
 #include "sqlite3.h"
 #include "wasm_thread.h"
 #include "wasm_layout.h"
+#include "sql/canonical_roster_corpse_sql.h"
+#include "replay_internal.h"
+#include "sha256.h"
 #include <stdatomic.h>
 #include <string.h>
 #include <stdlib.h>
@@ -39,9 +42,40 @@ static unsigned char g_load_chunk[LOAD_CHUNK_SIZE];
 static sqlite3_vfs *g_vfs = 0;
 static sqlite3_file *g_load_file = 0;
 static sqlite3_int64 g_load_write_offset = 0;
-static sqlite3 *g_db = 0;
+sqlite3 *g_db = 0; /* not static - shared with replay_export.c, see replay_internal.h */
+
+/* ---- source file identity (Phase 4: manifest.json's source_replay block) --
+ * sha256 is accumulated incrementally as replay_feed_chunk streams the file
+ * in (a 20GB file can't be hashed as one buffer, and crypto.subtle.digest
+ * has no streaming/update API - see sha256.h) and finalized once at the end
+ * of replay_finish_load(). Filename/generated-at-time are the two pieces of
+ * export metadata only JS genuinely has (the File object's name, and real
+ * wall-clock time - this module's only clock_gettime() import is
+ * performance.now()-based, not Unix epoch, see replay-worker.js), so JS
+ * writes them in through the same "buffer JS fills, C reads" pattern
+ * replay_get_load_chunk_ptr() already uses for file bytes - not a
+ * departure from "logic lives in C", just the two raw inputs only JS has. */
+#define SOURCE_FILENAME_BUF_SIZE 256
+static sha256_ctx g_source_hash_ctx;
+static char g_source_hash_hex[65];
+static char g_source_filename[SOURCE_FILENAME_BUF_SIZE];
+static double g_export_time_unix = 0;
+
+unsigned char *replay_get_filename_buf_ptr(void) { return (unsigned char *)g_source_filename; }
+int replay_set_filename_len(int len) {
+    if (len < 0) len = 0;
+    if (len > SOURCE_FILENAME_BUF_SIZE - 1) len = SOURCE_FILENAME_BUF_SIZE - 1;
+    g_source_filename[len] = 0;
+    return 0;
+}
+void replay_set_export_time_unix(double t) { g_export_time_unix = t; }
+double replay_get_export_time_unix(void) { return g_export_time_unix; }
+const char *replay_get_source_sha256_hex(void) { return g_source_hash_hex; }
+const char *replay_get_source_filename(void) { return g_source_filename; }
+double replay_get_source_size_bytes(void) { return (double)g_load_write_offset; }
 
 int replay_begin_load(void) {
+    sha256_init(&g_source_hash_ctx);
     g_vfs = sqlite3_vfs_find(0);
     if (!g_vfs) { set_error("no default vfs registered"); return -1; }
     g_load_file = (sqlite3_file *)sqlite3_malloc(g_vfs->szOsFile);
@@ -50,6 +84,18 @@ int replay_begin_load(void) {
     int rc = g_vfs->xOpen(g_vfs, "main.db", g_load_file,
         SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_MAIN_DB, &outFlags);
     if (rc != SQLITE_OK) { set_error("vfs xOpen failed for main.db"); return rc; }
+    /* main.db is backed by a persistent OPFS file (see sqlite3_vfs_mem.c) -
+     * unlike the fresh-per-load WebAssembly.Memory (which zeroes
+     * everything, including the in-memory logical-size counter, for free),
+     * bytes physically written to OPFS by a PREVIOUS load in this browser
+     * session stay on disk until explicitly cleared. The logical-size
+     * counter already bounds every read to what THIS load has actually
+     * written, so stale trailing bytes from a bigger previous file are
+     * harmless for correctness - this xTruncate is purely hygiene, so
+     * repeatedly loading different files in one session doesn't leak
+     * unbounded OPFS disk space. */
+    rc = g_load_file->pMethods->xTruncate(g_load_file, 0);
+    if (rc != SQLITE_OK) { set_error("vfs xTruncate(0) failed for main.db"); return rc; }
     g_load_write_offset = 0;
     return 0;
 }
@@ -60,6 +106,7 @@ int replay_feed_chunk(int len) {
     if (!g_load_file) { set_error("replay_feed_chunk called before replay_begin_load"); return -1; }
     int rc = g_load_file->pMethods->xWrite(g_load_file, g_load_chunk, len, g_load_write_offset);
     if (rc != SQLITE_OK) { set_error("vfs xWrite failed (file exceeds Region A capacity?)"); return rc; }
+    sha256_update(&g_source_hash_ctx, g_load_chunk, (size_t)len);
     g_load_write_offset += len;
     return 0;
 }
@@ -76,16 +123,15 @@ static TickEntry *g_ticks = 0;
 static int g_tick_count = 0;
 
 /* ---- match summaries ---------------------------------------------------- */
-typedef struct MatchInfo {
-    sqlite3_int64 start_tick_id, end_tick_id;
-    double start_time, end_time;
-    int scene_no;
-    char faction_text[96];
-    sqlite3_int64 rowid_lo, rowid_hi; /* this battle's own slice of agent_states, see replay_ensure_battle_ready */
-} MatchInfo;
+/* MatchInfo itself now lives in replay_internal.h - shared verbatim with
+ * replay_export.c, which needs a battle's resolved rowid_lo/rowid_hi too. */
 static MatchInfo g_matches[MAX_MATCHES];
 static int g_match_count = 0;
 static unsigned char g_battle_ready[MAX_MATCHES]; /* has this battle's agent_states rowid slice been resolved? */
+
+MatchInfo *replay_internal_get_match(int matchIdx) {
+    return (matchIdx >= 0 && matchIdx < g_match_count) ? &g_matches[matchIdx] : 0;
+}
 
 int replay_get_match_count(void) { return g_match_count; }
 double replay_get_match_start_time(int idx) { return (idx >= 0 && idx < g_match_count) ? g_matches[idx].start_time : 0.0; }
@@ -260,20 +306,40 @@ static sqlite3_int64 upper_bound_rowid_on(sqlite3_stmt *idlookup, sqlite3_int64 
     return lo;
 }
 
+/* Shared "idx_as_b<matchIdx>" name-building - used by CREATE INDEX below,
+ * DROP INDEX (replay_evict_battle), and the debug index-visibility getter
+ * (replay_debug_index_visible) - one place builds this name instead of
+ * three copies of the same "idx_as_b" + integer concatenation. */
+static void append_battle_index_name(char *sql, int *p, int matchIdx) {
+    const char *prefix = "idx_as_b";
+    for (const char *c = prefix; *c; c++) sql[(*p)++] = *c;
+    append_i64(sql, p, matchIdx);
+}
+
 /* both callers need the exact same CREATE INDEX text (literal [lo,hi], not
  * bound params - see the block comment above) so the SELECT built with the
  * same literals is provably eligible to use it, whichever thread built it. */
 static void build_battle_index_sql(char *sql, int matchIdx, sqlite3_int64 rowid_lo, sqlite3_int64 rowid_hi) {
     int p = 0;
-    const char *idx_prefix = "CREATE INDEX IF NOT EXISTS idx_as_b";
+    const char *idx_prefix = "CREATE INDEX IF NOT EXISTS ";
     for (const char *c = idx_prefix; *c; c++) sql[p++] = *c;
-    append_i64(sql, &p, matchIdx);
+    append_battle_index_name(sql, &p, matchIdx);
     const char *idx_mid = " ON agent_states(tick_id) WHERE id BETWEEN ";
     for (const char *c = idx_mid; *c; c++) sql[p++] = *c;
     append_i64(sql, &p, rowid_lo);
     const char *and_ = " AND ";
     for (const char *c = and_; *c; c++) sql[p++] = *c;
     append_i64(sql, &p, rowid_hi);
+    sql[p] = 0;
+}
+
+/* DROP counterpart, used only by eviction (replay_evict_battle below) -
+ * needs just the name, not the [lo,hi] bounds CREATE requires. */
+static void build_battle_drop_index_sql(char *sql, int matchIdx) {
+    int p = 0;
+    const char *prefix = "DROP INDEX IF EXISTS ";
+    for (const char *c = prefix; *c; c++) sql[p++] = *c;
+    append_battle_index_name(sql, &p, matchIdx);
     sql[p] = 0;
 }
 
@@ -286,9 +352,114 @@ static sqlite3_stmt *g_stmt_agent_states_battle[MAX_MATCHES]; /* one per battle,
  * per-battle statement to be prepared, both g_db-only operations. */
 static unsigned char g_bounds_known[MAX_MATCHES];
 
+/* Memory-budgeted prefetch/eviction. 0 = unset = unlimited (matches the
+ * pre-existing unbounded-growth behavior if JS never calls
+ * replay_set_priming_budget_bytes - fail-open, not fail-closed). Compared
+ * against replay_get_playback_heap_bytes() (thread 0's own live-allocation
+ * count, goyslopless-c/lib/heap.c's heap_debug_bytes_inuse() - deliberately
+ * NOT region/committed-address-space size, which only ever grows even after
+ * an eviction frees payload bytes for reuse; see heap.c's comment on
+ * g_heap_bytes_inuse for why that distinction matters here). */
+static int g_priming_budget_bytes = 0;
+static int g_evict_failures = 0; /* mirrors g_heap_extend_failures' role in heap.c - should stay 0 */
+
+void replay_set_priming_budget_bytes(int bytes) { g_priming_budget_bytes = bytes; }
+int replay_get_playback_heap_bytes(void) { return (int)heap_debug_bytes_inuse(); }
+
+/* Which currently-ready battle is farthest in real elapsed time from
+ * fromMatchIdx (excluding fromMatchIdx itself) - the eviction victim when
+ * room needs to be made. Real time distance (MatchInfo.start_time), not
+ * match-index distance: battles vary enough in duration (a skirmish vs a
+ * siege) that a short battle three matches away can be closer in elapsed
+ * time than a long one immediately adjacent. main.js's own prefetch fan-out
+ * (pickPrefetchTarget/pickPrimeTarget) keeps using index-distance for FETCH
+ * ORDER, which is a separately-tuned, unrelated concern - this is only for
+ * deciding what to sacrifice. Returns -1 if nothing else is evictable.
+ *
+ * Also unconditionally excludes g_active_match_index (the battle
+ * build_frame_at_time() is actually displaying right now, updated
+ * synchronously in resync_roster_to() before every fetch_positions() call -
+ * see replay_get_active_match_index()), not just fromMatchIdx. The two
+ * usually agree (replay_ensure_battle_ready's self-heal call always passes
+ * its own matchIdx, which resync_roster_to already set as active moments
+ * earlier), but replay_try_prime_battle's currentMatchIdx comes from JS as a
+ * cursor snapshot taken when the 'primeBattle' message was SENT, not when
+ * it's processed - if the cursor has since moved (a fast scrub, or several
+ * proactive primes queued back to back), that snapshot is stale and could
+ * pick the battle now genuinely on screen as the "farthest away" victim.
+ * Checking the always-current g_active_match_index here closes that race at
+ * its one physical choke point instead of trying to keep every caller's
+ * cursor snapshot fresh - confirmed via ui_behavior_tests.js's "active
+ * battle is always ready under eviction pressure" check, which started
+ * failing reproducibly once proactive priming got frequent enough (see
+ * pickPrimeTarget's comment in main.js) to actually hit this window. */
+static int pick_farthest_primed_battle(int fromMatchIdx) {
+    if (fromMatchIdx < 0 || fromMatchIdx >= g_match_count) return -1;
+    int victim = -1;
+    double victim_dt = -1.0;
+    double from_time = g_matches[fromMatchIdx].start_time;
+    for (int i = 0; i < g_match_count; i++) {
+        if (i == fromMatchIdx || i == g_active_match_index || !g_battle_ready[i]) continue;
+        double dt = g_matches[i].start_time - from_time;
+        if (dt < 0) dt = -dt;
+        if (dt > victim_dt) { victim_dt = dt; victim = i; }
+    }
+    return victim;
+}
+
+/* Tears down one battle's index+statement so its heap allocation becomes
+ * available for a later allocation to reuse (see g_heap_bytes_inuse's
+ * comment in heap.c - this can never shrink the tab's actual memory
+ * footprint, only bound future growth). No-op if the battle isn't ready.
+ * Deliberately leaves g_bounds_known[matchIdx] set - the resolved
+ * rowid_lo/rowid_hi cost two sqlite3_int64s and stay correct forever, no
+ * need to re-bisect on a future re-prime. A failed DROP (e.g. losing a race
+ * against a prefetch connection's brief SHARED lock - see
+ * sqlite3_vfs_mem.c's lock state machine) isn't a correctness bug: whether
+ * or not the drop actually happened, the next access's CREATE INDEX IF NOT
+ * EXISTS + fresh sqlite3_prepare_v2 converge correctly either way, so this
+ * only counts it (g_evict_failures) rather than retrying. */
+int replay_evict_battle(int matchIdx) {
+    if (!g_battle_ready[matchIdx]) return 0;
+    sqlite3_finalize(g_stmt_agent_states_battle[matchIdx]);
+    g_stmt_agent_states_battle[matchIdx] = 0;
+    char sql[64];
+    build_battle_drop_index_sql(sql, matchIdx);
+    if (run_sql(sql) != SQLITE_OK) g_evict_failures++;
+    g_battle_ready[matchIdx] = 0;
+    return 0;
+}
+
+/* Bitmask of which battles are currently ready (index+statement built) -
+ * MAX_MATCHES=16 fits comfortably in an int. The reporting channel for
+ * eviction: NOT a "last evicted index" scalar (an earlier draft of this
+ * feature had one) - build_frame_at_time() calls fetch_positions() twice
+ * per frame (tickA/tickB, see below), so a boundary-straddling frame under
+ * a tight budget could evict twice in one call, clobbering a single-slot
+ * value before JS ever read the first one. A mask read on every relevant
+ * message is idempotent and can't lose events no matter how many evictions
+ * happened in between - JS diffs it against its own primedBattles Set. */
+int replay_get_battle_ready_mask(void) {
+    int mask = 0;
+    for (int i = 0; i < g_match_count; i++) if (g_battle_ready[i]) mask |= (1 << i);
+    return mask;
+}
+
 int replay_ensure_battle_ready(int matchIdx) {
     if (matchIdx < 0 || matchIdx >= g_match_count) return 0;
     if (g_battle_ready[matchIdx]) return 0;
+
+    /* Correctness-critical path (see fetch_positions()'s self-healing call
+     * below) - this must always succeed regardless of memory pressure, but
+     * still tries to stay under budget when it can: if already over budget,
+     * free room by evicting whichever OTHER ready battle is farthest away
+     * first. Purely best-effort - falls through to the unconditional build
+     * below either way. This is "evict things... if needed to play the
+     * battle" from the feature request. */
+    if (g_priming_budget_bytes > 0 && replay_get_playback_heap_bytes() >= g_priming_budget_bytes) {
+        int victim = pick_farthest_primed_battle(matchIdx);
+        if (victim >= 0) replay_evict_battle(victim);
+    }
 
     MatchInfo *m = &g_matches[matchIdx];
     if (!g_bounds_known[matchIdx]) {
@@ -321,6 +492,41 @@ int replay_ensure_battle_ready(int matchIdx) {
 
     g_battle_ready[matchIdx] = 1;
     return 0;
+}
+
+/* Proactive-only counterpart to replay_ensure_battle_ready above, for
+ * prefetch-ahead-of-cursor requests (never for the battle actually needed
+ * right now - that always goes through replay_ensure_battle_ready directly,
+ * which must always succeed). This one may decline: under a tight budget it
+ * only evicts-and-builds when matchIdx would genuinely be a closer-to-
+ * cursor thing to keep warm than whatever it would have to sacrifice -
+ * otherwise it does nothing and reports back "declined" (see
+ * replay-worker.js's runPrimeBattle). Without this check, proactively
+ * priming a battle that's no closer than the eviction victim would just
+ * evict-and-immediately-rebuild forever as the prefetch scheduler keeps
+ * walking outward from the cursor - thrashing instead of making progress.
+ * "It should stop" from the feature request. */
+int replay_try_prime_battle(int matchIdx, int currentMatchIdx) {
+    if (matchIdx < 0 || matchIdx >= g_match_count) return -1;
+    if (g_battle_ready[matchIdx]) return 0;
+
+    if (g_priming_budget_bytes > 0 && replay_get_playback_heap_bytes() >= g_priming_budget_bytes) {
+        int victim = pick_farthest_primed_battle(currentMatchIdx);
+        double target_dt, victim_dt;
+        if (currentMatchIdx >= 0 && currentMatchIdx < g_match_count) {
+            target_dt = g_matches[matchIdx].start_time - g_matches[currentMatchIdx].start_time;
+            if (target_dt < 0) target_dt = -target_dt;
+        } else {
+            target_dt = 0; /* no known cursor - treat matchIdx as maximally close, never worth evicting for */
+        }
+        if (victim < 0) return 1; /* nothing to evict, and building would grow past budget - decline */
+        victim_dt = g_matches[victim].start_time - g_matches[currentMatchIdx].start_time;
+        if (victim_dt < 0) victim_dt = -victim_dt;
+        if (victim_dt <= target_dt) return 1; /* victim is no farther than matchIdx would be - not worth it, decline */
+        replay_evict_battle(victim);
+    }
+
+    return replay_ensure_battle_ready(matchIdx);
 }
 
 /* Runs on a dedicated, persistent prefetch worker's OWN READONLY connection
@@ -813,8 +1019,16 @@ static int scan_matches(void) {
     return 0;
 }
 
-/* returns match count on success, negative error code on failure */
-int replay_finish_load(void) {
+/* Shared by replay_finish_load() (a full multi-battle source upload) and
+ * replay_finish_load_battle_file() (Phase 5: a single already-exported
+ * battle's replay.db loaded directly) - both open the same OPFS-backed
+ * main.db slot g_load_file just finished streaming into, need the same
+ * pragmas/indexes/tick-index/chat-cache/prepared-statements, and only
+ * diverge on how g_matches[]/g_match_count get populated afterward
+ * (scan_matches()'s boundary-event heuristic vs. reading replay.db's own
+ * replay_meta table directly). Returns 0 on success, matching the negative
+ * error-code convention the two callers already use. */
+static int common_finish_load_setup(void) {
     if (g_load_file) {
         g_load_file->pMethods->xClose(g_load_file);
         sqlite3_free(g_load_file);
@@ -824,7 +1038,19 @@ int replay_finish_load(void) {
     int rc = sqlite3_open_v2("main.db", &g_db, SQLITE_OPEN_READWRITE, 0);
     if (rc != SQLITE_OK) { set_error("sqlite3_open_v2 failed"); return -1; }
 
-    if (run_sql("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=MEMORY;") != SQLITE_OK) return -2;
+    /* temp_store=FILE (not MEMORY): the external sorter CREATE INDEX drives
+     * over agent_states (2M+ rows) needs a real spill target once its
+     * bounded in-memory working set is exceeded. temp_store=MEMORY makes
+     * SQLite skip real temp files entirely and keep growing malloc'd
+     * memory instead (confirmed: this is why elastic heap growth alone -
+     * see goyslopless-c/lib/heap.c - was sufficient to get a real
+     * CREATE INDEX working under a deliberately tiny starting heap during
+     * testing) - fine for a normal machine with plenty of RAM, but directly
+     * works against the 128MB-during-derivation target for a large enough
+     * table, since heap growth is real committed RAM, not disk. FILE lets
+     * the sorter spill to actual temp files instead, which sqlite3_vfs_mem.c
+     * now backs with OPFS (is_opfs_temp mode) rather than a RAM buffer. */
+    if (run_sql("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA temp_store=FILE;") != SQLITE_OK) return -2;
 
     /* agent_states gets NO secondary index, ever - it's ~99% of the row
      * count (2.3M of ~2.35M total rows in a real 15-battle file) and the
@@ -850,7 +1076,6 @@ int replay_finish_load(void) {
     ) != SQLITE_OK) return -3;
 
     if (load_tick_index() != 0) return -4;
-    if (scan_matches() != 0) return -5;
 
     g_chat_capacity = MAX_CHAT_ENTRIES;
     g_chats = (ChatEntry *)malloc(sizeof(ChatEntry) * (size_t)g_chat_capacity);
@@ -875,6 +1100,74 @@ int replay_finish_load(void) {
         -1, &g_stmt_id_lookup, 0) != SQLITE_OK) {
         set_error("failed to prepare id lookup statement"); return -9;
     }
+
+    /* finalize the incremental source-file hash now that every chunk has
+     * been fed through replay_feed_chunk() - see the field comment near
+     * g_source_hash_ctx for why this can't happen any earlier. */
+    { unsigned char digest[32]; sha256_final(&g_source_hash_ctx, digest); sha256_to_hex(digest, g_source_hash_hex); }
+
+    /* journal_mode=OFF (set above) disables SQLite's rollback journal
+     * *entirely* - not just the disk-write part of it, the whole
+     * old-page-image bookkeeping that ROLLBACK/ROLLBACK TO SAVEPOINT
+     * depends on. Left at OFF, Phase 5's SQL-terminal checkpoints
+     * (sql_checkpoint_save/revert) would silently no-op: SAVEPOINT/
+     * ROLLBACK TO both return SQLITE_OK with no error, but the data
+     * genuinely never reverts - caught empirically running exactly that
+     * checkpoint-then-revert sequence through the real terminal UI.
+     * MEMORY mode keeps the journal in RAM instead of a file (so no new
+     * disk I/O, unlike DELETE/TRUNCATE) while keeping real rollback
+     * capability - switched here, AFTER the CREATE INDEX pass above, so
+     * Phase 3's memory-bounded index-build behavior (the reason OFF was
+     * used in the first place, see the big comment on the CREATE INDEX
+     * block) is completely unaffected; only the interactive
+     * querying/playback phase that follows needs rollback to work. */
+    if (run_sql("PRAGMA journal_mode=MEMORY;") != SQLITE_OK) return -12;
+
+    return 0;
+}
+
+/* returns match count on success, negative error code on failure */
+int replay_finish_load(void) {
+    int rc = common_finish_load_setup();
+    if (rc != 0) return rc;
+    if (scan_matches() != 0) return -5;
+    return g_match_count;
+}
+
+/* Phase 5: load an already-exported single battle's replay.db directly,
+ * streamed in via the SAME replay_begin_load()/replay_feed_chunk() calls
+ * the full-source path uses (it's still just bytes landing in the OPFS
+ * main.db slot) - only the "how do we know what the battle boundaries are"
+ * step differs: instead of scan_matches()'s boundary-event heuristic (which
+ * needs the FULL multi-battle event history to find map/score/faction
+ * switches), this reads the single row replay_export.c wrote into
+ * replay_meta at export time. g_match_count is always exactly 1 here - an
+ * exported battle file only ever contains the one battle it was exported
+ * for, by construction (see replay_export.c's export_copy_replaydb_rows). */
+int replay_finish_load_battle_file(void) {
+    int rc = common_finish_load_setup();
+    if (rc != 0) return rc;
+
+    sqlite3_stmt *stmt = 0;
+    if (sqlite3_prepare_v2(g_db, "SELECT start_tick_id, end_tick_id FROM replay_meta", -1, &stmt, 0) != SQLITE_OK) {
+        set_error("failed to prepare replay_meta query - is this a valid exported replay.db?"); return -10;
+    }
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        set_error("replay_meta table is empty - not a valid exported replay.db"); return -11;
+    }
+    sqlite3_int64 start_tick_id = sqlite3_column_int64(stmt, 0);
+    sqlite3_int64 end_tick_id = sqlite3_column_int64(stmt, 1);
+    sqlite3_finalize(stmt);
+
+    g_match_count = 1;
+    MatchInfo *m = &g_matches[0];
+    memset(m, 0, sizeof(*m));
+    m->start_tick_id = start_tick_id;
+    m->end_tick_id = end_tick_id;
+    m->start_time = g_ticks[tick_index_for_id(start_tick_id)].time;
+    m->end_time = g_ticks[tick_index_for_id(end_tick_id)].time;
+    resolve_match_meta(m->start_tick_id, &m->scene_no, m->faction_text, sizeof(m->faction_text));
 
     return g_match_count;
 }
@@ -970,7 +1263,6 @@ float replay_get_map_max_y(void) { return g_map_max_y; }
  * pool base constants be verified against the real linker-computed
  * addresses instead of hand-estimated ones. */
 double wasm_debug_heap_base(void) { return (double)(size_t)&__heap_base; }
-double wasm_debug_region_a_base(void) { return (double)(size_t)wasm_region_a_base(); }
 double wasm_debug_region_c_base(void) { return (double)(size_t)wasm_region_c_base(); }
 double wasm_debug_layout_end(void) { return (double)(size_t)wasm_layout_end(); }
 /* load-bearing, not just diagnostic - replay-worker.js's bootstrap() calls
@@ -985,9 +1277,9 @@ double wasm_debug_tls_pool_base(void) { return (double)(size_t)wasm_tls_pool_bas
 int replay_debug_index_visible(int matchIdx) {
     char sql[64];
     int p = 0;
-    const char *prefix = "SELECT count(*) FROM sqlite_master WHERE name='idx_as_b";
+    const char *prefix = "SELECT count(*) FROM sqlite_master WHERE name='";
     for (const char *c = prefix; *c; c++) sql[p++] = *c;
-    append_i64(sql, &p, matchIdx);
+    append_battle_index_name(sql, &p, matchIdx);
     sql[p++] = '\''; sql[p] = 0;
     sqlite3_stmt *stmt = 0;
     int result = -1;

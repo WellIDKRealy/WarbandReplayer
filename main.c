@@ -89,6 +89,27 @@ float* ensure_agent_capacity(int n) {
 }
 void update_frame_data(int count) { active_agent_count = count; }
 
+// Phase 5: SQL-terminal query-result highlighting. Same growable-buffer
+// pattern as agent_buffer above, but (x, y) pairs only - a highlight is a
+// generic point from an arbitrary query result, not a living/dead agent
+// with a team. Data path: the terminal requires the query to alias its
+// coordinate columns exactly "x"/"y" (main.js's sqlTerminalHighlightOnMap)
+// rather than guessing column names, so this side stays simple/predictable.
+float *highlight_buffer = 0;
+int highlight_buffer_capacity = 0;
+int active_highlight_count = 0;
+
+float* ensure_highlight_capacity(int n) {
+    if (n > highlight_buffer_capacity) {
+        int new_cap = highlight_buffer_capacity ? highlight_buffer_capacity * 2 : 256;
+        while (new_cap < n) new_cap *= 2;
+        float *nb = (float*)realloc(highlight_buffer, sizeof(float) * 2 * (size_t)new_cap);
+        if (nb) { highlight_buffer = nb; highlight_buffer_capacity = new_cap; }
+    }
+    return highlight_buffer;
+}
+void update_highlight_data(int count) { active_highlight_count = count; }
+
 void set_map_bounds(float min_x, float max_x, float min_y, float max_y) {
     map_min_x = min_x; map_max_x = max_x;
     map_min_y = min_y; map_max_y = max_y;
@@ -276,5 +297,33 @@ void render_frame(float dt_seconds) {
         }
 
         gl_draw_arrays(GL_TRIANGLE_FAN, 0, CIRCLE_SEGS + 2);
+    }
+
+    // 4. Render SQL-terminal highlight points as bright rings, drawn last so
+    // they layer visually on top of both living agents and corpses - a
+    // marker for arbitrary query results, independent of the team-colored
+    // agent rendering above. Reuses the same circle vbo as a LINE_LOOP
+    // starting at index 1 (skipping the fan-center vertex at index 0), so it
+    // reads as a ring around the point rather than a filled dot.
+    if (active_highlight_count > 0) {
+        gl_bind_buffer(GL_ARRAY_BUFFER, vbo_circle);
+        gl_vertex_attrib_pointer(attr_position_main, 3, GL_FLOAT, 0, 12, 0);
+        gl_uniform3f(loc_uColor, 1.0f, 0.9f, 0.1f);
+
+        for (int i = 0; i < active_highlight_count; i++) {
+            float hx = highlight_buffer[i * 2 + 0];
+            float hy = highlight_buffer[i * 2 + 1];
+
+            mat4 model = GLM_MAT4_IDENTITY_INIT;
+            vec3 translate = {hx, hy, 0.0f};
+            glm_translate(model, translate);
+            glm_scale_uni(model, BALL_RADIUS * 1.6f);
+
+            mat4 mvp;
+            glm_mat4_mul(vp, model, mvp);
+            gl_uniform_matrix4fv(loc_mvp, (float*)mvp);
+
+            gl_draw_arrays(GL_LINE_LOOP, 1, CIRCLE_SEGS + 1);
+        }
     }
 }

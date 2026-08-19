@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html><body><pre id="out">running...</pre>
+<script>
+let log = "";
+function line(s) { log += s + "\n"; document.getElementById('out').textContent = log; console.log(s); }
+function waitFor(worker, predicate) {
+  return new Promise((resolve, reject) => {
+    const handler = (e) => {
+      if (e.data.type === 'error') { worker.removeEventListener('message', handler); reject(new Error(JSON.stringify(e.data))); return; }
+      if (predicate(e.data)) { worker.removeEventListener('message', handler); resolve(e.data); }
+    };
+    worker.addEventListener('message', handler);
+  });
+}
+function toBase64(bytes) {
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+  return btoa(binary);
+}
+
+(async () => {
+  try {
+    // ---- exact same load path the real app uses ----
+    const memory = new WebAssembly.Memory({ initial: 1536, maximum: 32768, shared: true });
+    const module = await WebAssembly.compile(await (await fetch('../replay_worker.wasm', { cache: 'no-store' })).arrayBuffer());
+    const fileBlob = await (await fetch('synthetic_fixture.sqlite')).blob();
+    const file = new File([fileBlob], 'synthetic_fixture.sqlite');
+
+    const loader = new Worker('../replay-worker.js?v=' + Date.now());
+    loader.postMessage({ type: 'init', role: 'loader', memory, module, threadId: 0 });
+    await waitFor(loader, d => d.type === 'ready');
+
+    const loadedPromise = waitFor(loader, d => d.type === 'loaded');
+    loader.postMessage({ type: 'load', file });
+    const loaded = await loadedPromise;
+    line(`loaded: matchCount=${loaded.matchCount}`);
+    if (loaded.matchCount < 1) throw new Error("no matches");
+
+    // ---- exportBattle exactly as main.js's exportActiveBattle() drives it ----
+    const exportedPromise = waitFor(loader, d => d.type === 'exported');
+    loader.postMessage({ type: 'exportBattle', matchIdx: 0 });
+    const exported = await exportedPromise;
+    const tarSize = exported.tar.length; // captured before the transfer below detaches exported.tar's buffer
+    line(`exported: matchIdx=${exported.matchIdx} tar size=${tarSize} bytes`);
+
+    // ---- compress-worker.js exactly as handleExportedTar() drives it ----
+    const compressWorker = new Worker('../compress-worker.js?v=' + Date.now());
+    const compressedPromise = new Promise((resolve, reject) => {
+      compressWorker.onmessage = (e) => {
+        if (e.data.type === 'compressed') resolve(e.data.out);
+        else if (e.data.type === 'error') reject(new Error(e.data.message));
+      };
+    });
+    // tar is a regular (non-shared) ArrayBuffer copied out of replay_worker.wasm's
+    // shared memory by replay-worker.js's runExportBattle - transferable
+    // (this detaches exported.tar's buffer, hence capturing tarSize above first).
+    compressWorker.postMessage({ type: 'compress', data: exported.tar, dictSizeMiB: 24 }, [exported.tar.buffer]);
+    const compressed = await compressedPromise;
+    line(`compressed: ${compressed.length} bytes (ratio ${(tarSize / compressed.length).toFixed(2)}x)`);
+
+    const XZ_MAGIC = [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00];
+    const magicOk = XZ_MAGIC.every((b, i) => compressed[i] === b);
+
+    const checks = [
+      ["export produced a tar (non-zero size)", tarSize > 0],
+      ["compression produced smaller output than the tar", compressed.length < tarSize],
+      ["compressed output starts with real xz magic", magicOk],
+    ];
+    let allPass = true;
+    line("");
+    for (const [name, ok] of checks) { line((ok ? "PASS" : "FAIL") + ": " + name); if (!ok) allPass = false; }
+    line(allPass ? "\nRESULT: PASS" : "\nRESULT: FAIL");
+
+    line("\nBASE64_COMPRESSED_START:" + toBase64(compressed) + ":BASE64_COMPRESSED_END");
+
+    loader.terminate();
+    compressWorker.terminate();
+  } catch (e) {
+    line("EXCEPTION: " + e.message + "\n" + (e.stack || ""));
+  }
+})();
+</script>
+</body></html>

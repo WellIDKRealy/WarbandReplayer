@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html><body><pre id="out">running...</pre>
+<script>
+let log = "";
+function line(s) { log += s + "\n"; document.getElementById('out').textContent = log; console.log(s); }
+
+(async () => {
+  try {
+    const compressed = new Uint8Array(await (await fetch('real_xz_source.bin.xz')).arrayBuffer());
+    const expected = new Uint8Array(await (await fetch('real_xz_source.bin')).arrayBuffer());
+    line(`fetched: real_xz_source.bin.xz=${compressed.length} bytes (made by real xz.exe -9), real_xz_source.bin=${expected.length} bytes`);
+
+    const worker = new Worker('../compress-worker.js?v=' + Date.now());
+    const decompressedPromise = new Promise((resolve, reject) => {
+      worker.onmessage = (e) => {
+        if (e.data.type === 'decompressed') resolve(e.data.out);
+        else if (e.data.type === 'error') reject(new Error(e.data.message));
+      };
+    });
+    worker.postMessage({ type: 'decompress', data: compressed }, [compressed.buffer]);
+    const decompressed = await decompressedPromise;
+    line(`decompressed via compress.wasm: ${decompressed.length} bytes`);
+
+    let identical = decompressed.length === expected.length;
+    if (identical) {
+      for (let i = 0; i < expected.length; i++) {
+        if (decompressed[i] !== expected[i]) { identical = false; line(`first mismatch at byte ${i}`); break; }
+      }
+    }
+
+    const checks = [
+      ["length matches the real xz -9 source", decompressed.length === expected.length],
+      ["bytes are bit-for-bit identical to the real xz -9 source (true format interop, not just self-consistency)", identical],
+    ];
+    let allPass = true;
+    line("");
+    for (const [name, ok] of checks) { line((ok ? "PASS" : "FAIL") + ": " + name); if (!ok) allPass = false; }
+    line(allPass ? "\nRESULT: PASS" : "\nRESULT: FAIL");
+    worker.terminate();
+  } catch (e) {
+    line("EXCEPTION: " + e.message + "\n" + (e.stack || ""));
+  }
+})();
+</script>
+</body></html>

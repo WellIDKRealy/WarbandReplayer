@@ -14,6 +14,7 @@ double atof(const char *str);
 
 #if defined(WASM_THREADS)
 void heap_thread_init(int thread_id);
+size_t heap_debug_bytes_inuse(void); /* current thread's live (allocated, not-yet-freed) heap bytes */
 #endif
 
 // WASM Specific

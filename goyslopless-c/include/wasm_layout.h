@@ -7,39 +7,56 @@
  * Fixed shared-memory layout for the replay_worker.wasm multithreaded
  * build. Everything below __heap_base (linker-provided: first free byte
  * after static data) is carved up once, up front, into non-overlapping
- * regions - no runtime memory.grow calls happen in this build at all
- * (only the single-threaded main.wasm/benchmark.wasm heap grows
- * dynamically; see heap.c), so two threads can never race over growing
- * shared memory.
+ * regions.
  *
  *   [__heap_base .. +LOADER_HEAP)        thread 0's (loader) private heap
  *   [.. +N*WORKER_HEAP)                  threads 1..N's (reader/playback) private heaps
- *   [REGION_A_BASE .. +SIZE)             the loaded/indexed DB blob (frozen after load)
  *   [REGION_C_BASE .. +SIZE)             per-match result summaries written by reader workers
  *
- * The loader's heap is deliberately much bigger than the others: it's the
- * one thread that runs `CREATE INDEX` over the real schema's largest
- * table (agent_states, 2M+ rows in a real 15-battle file) - confirmed
- * empirically to need far more than a "just big enough for simple
- * queries" slab (SQLite's page cache + external sort/B-tree-build
- * scratch space during index creation genuinely needs tens to low
- * hundreds of MB at that row count). Reader/playback threads only ever
- * run simple bounded queries and stay small.
+ * The loaded/indexed DB blob used to live here too (the old "Region A",
+ * 320MiB, a fixed shared RAM buffer holding the ENTIRE uploaded replay file
+ * - the direct blocker for large files, see sqlite3_vfs_mem.c's OPFS-backed
+ * MemFile mode which replaced it). It's gone from this layout entirely now:
+ * the source file lives in OPFS (real backing storage, not linear memory),
+ * fronted by a small _Thread_local page cache in sqlite3_vfs_mem.c that
+ * needs no fixed region here since it's ordinary per-thread heap-adjacent
+ * static storage, not a shared cross-thread mapping.
+ *
+ * Phase 6: these are NOMINAL starting sizes, not hard caps - every one of
+ * them is just the address-space offset where the NEXT region starts, and
+ * heap.c's heap_extend_threaded() already transparently grows any thread
+ * past its nominal slab via additional disjoint regions (proven, not
+ * theoretical: an 8MiB loader slab was deliberately stress-tested against a
+ * real CREATE INDEX over 2.3M rows and passed 48/48 cases - see
+ * MAX_HEAP_REGIONS's own history below). Since going over a nominal size
+ * costs nothing but an extra region (a few dozen bytes of bookkeeping) and
+ * a memory.grow call, these are sized to the SMALL, boring, common case,
+ * not the large one - the 128MB-floor target this whole layout has to fit
+ * inside depends on that: `wasm_layout_end()`'s total is what
+ * --initial-memory has to cover up front (see the Makefile), and every
+ * byte reserved here "just in case" is a byte that floor doesn't have.
+ * Loader keeps the same 8MiB already proven safe by that stress test;
+ * reader/prefetch shrink further since they were never the thing driving
+ * the old, much larger numbers - nothing here changes what any thread can
+ * eventually grow into, only what it starts with.
  */
 #if defined(WASM_THREADS)
 
-#define WASM_LOADER_HEAP_SIZE   (256u * 1024u * 1024u) /* thread 0: CREATE INDEX over 2M+ rows */
-#define WASM_WORKER_HEAP_SIZE   (24u  * 1024u * 1024u) /* threads 1..N: simple bounded queries */
-#define WASM_MAX_WORKER_THREADS 8u                     /* up to 8 readers (thread ids 1..8) */
-#define WASM_PREFETCH_HEAP_SIZE (96u  * 1024u * 1024u) /* thread 9: prefetch - runs the same
-                                                          * CREATE INDEX path as the loader, just
-                                                          * scoped to one battle's rows instead of
-                                                          * the whole table, so it needs more than a
-                                                          * reader's 24MB but not the loader's 256MB */
+#define WASM_LOADER_HEAP_SIZE   (8u   * 1024u * 1024u) /* thread 0: CREATE INDEX over 2M+ rows - grows from here via heap_extend_threaded, proven down to exactly this size under real stress */
+#define WASM_WORKER_HEAP_SIZE   (2u   * 1024u * 1024u) /* threads 1..N: simple bounded bisection queries, no CREATE INDEX */
+#define WASM_MAX_WORKER_THREADS 8u                     /* up to 8 readers (thread ids 1..8) - an address-space ceiling, not a memory cost (unused slots are never grown into) */
+#define WASM_PREFETCH_HEAP_SIZE (4u   * 1024u * 1024u) /* thread 9: prefetch - runs the same CREATE
+                                                          * INDEX path as the loader, but scoped to
+                                                          * one battle's rows, not the whole table -
+                                                          * grows from here the same way the loader does */
 #define WASM_PREFETCH_THREAD_ID 9
 
-#define WASM_REGION_A_SIZE    (320u * 1024u * 1024u)  /* shared DB blob (+ index overhead) */
-#define WASM_REGION_C_SIZE    (8u   * 1024u * 1024u)  /* shared per-match results */
+/* Real usage is 8 BoundsSlot structs (replay_worker.c's region_c_bounds_slots,
+ * 20 bytes each = 160 bytes) - one per possible reader, written directly
+ * (not grown into), so this can't rely on heap_extend_threaded like the
+ * heap regions above. 4KiB is a page-ish round number with ~25x headroom,
+ * not the 8MiB this used to reserve for a 160-byte array. */
+#define WASM_REGION_C_SIZE    (4u   * 1024u)
 
 extern unsigned char __heap_base;
 
@@ -56,12 +73,9 @@ static inline size_t wasm_thread_heap_size(int thread_id) {
     return (size_t)WASM_PREFETCH_HEAP_SIZE;
 }
 
-static inline unsigned char *wasm_region_a_base(void) {
+static inline unsigned char *wasm_region_c_base(void) {
     return &__heap_base + (size_t)WASM_LOADER_HEAP_SIZE + (size_t)WASM_MAX_WORKER_THREADS * (size_t)WASM_WORKER_HEAP_SIZE
            + (size_t)WASM_PREFETCH_HEAP_SIZE;
-}
-static inline unsigned char *wasm_region_c_base(void) {
-    return wasm_region_a_base() + (size_t)WASM_REGION_A_SIZE;
 }
 static inline unsigned char *wasm_layout_end(void) {
     return wasm_region_c_base() + (size_t)WASM_REGION_C_SIZE;

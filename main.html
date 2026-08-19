@@ -9,8 +9,15 @@
 	<canvas id="canvas"></canvas>
 	<div id="center-crosshair"></div>
 
+	<!-- Chat/System Logs/VFS Trace/SQL Terminal are all draggable (by their
+	     .panel-header - see main.js's makeDraggable()) and independently
+	     `position:absolute` (main.css) - no shared stacking container, since
+	     dragging is now how the user resolves any overlap themselves rather
+	     than the app trying to auto-arrange them. Each still keeps its own
+	     minimize/expand toggle (a plain click on the header, i.e. no real
+	     mouse movement - see makeDraggable). -->
 	<div id="chat-box" class="ui-panel">
-	    <div class="panel-header" onclick="toggleMinimize('chat-content')">
+	    <div class="panel-header">
 		<span>[Chat Replay]</span>
 		<span class="toggle-icon">-</span>
 	    </div>
@@ -19,8 +26,13 @@
 	    </div>
 	</div>
 
-	<div id="log-box" class="ui-panel minimized">
-	    <div class="panel-header" onclick="toggleMinimize('log-content')">
+	<!-- All three below are debug-only (main.js's DEBUG_MODE gate) - an
+	     ordinary user never sees them. Individually shown/hidden via the
+	     hamburger menu's Panels checkboxes (main.js's setPanelVisible) -
+	     System Logs/VFS Trace default OFF even in debug mode, SQL Terminal
+	     defaults ON - rather than all three always appearing together. -->
+	<div id="log-box" class="ui-panel minimized" style="display:none;">
+	    <div class="panel-header">
 		<span>[System Logs]</span>
 		<span class="toggle-icon">-</span>
 	    </div>
@@ -28,7 +40,73 @@
 		Replay engine offline. Upload database.
 	    </div>
 	</div>
-	<button id="reset-btn" onclick="triggerReset()">Load Different Log</button>
+	<div id="debug-panel" class="ui-panel minimized" style="display:none;">
+	    <div class="panel-header">
+		<span>[Debug: VFS Trace]</span>
+		<span class="toggle-icon">-</span>
+	    </div>
+	    <div id="debug-content" class="panel-content">
+		<div>
+		    match idx: <input id="debug-match-idx" type="number" value="0" min="0" style="width:40px;">
+		    <button onclick="debugCheckIndexVisible()">index visible?</button>
+		</div>
+		<div>
+		    <button onclick="debugGetVfsTraces()">get VFS traces</button>
+		    <button onclick="debugResetVfsTraces()">reset traces</button>
+		    <button onclick="debugGetLockCounters()">lock counters</button>
+		    <button onclick="debugGetHeapInfo()">heap info</button>
+		</div>
+		<pre id="debug-output"></pre>
+	    </div>
+	</div>
+	<div id="sql-terminal-panel" class="ui-panel minimized" style="display:none;">
+	    <div class="panel-header">
+		<span>[SQL Terminal]</span>
+		<span class="toggle-icon">-</span>
+	    </div>
+	    <div id="sql-terminal-content" class="panel-content">
+		<textarea id="sql-terminal-input" rows="3" placeholder="SELECT * FROM ticks LIMIT 10"></textarea>
+		<div>
+		    <button onclick="sqlTerminalRun()">Run</button>
+		    <button onclick="sqlTerminalCheckpointSave()">Save checkpoint</button>
+		    <select id="sql-terminal-checkpoints"></select>
+		    <button onclick="sqlTerminalCheckpointRevert()">Revert to</button>
+		</div>
+		<div>
+		    <button onclick="sqlTerminalHighlightOnMap()">Highlight on map</button>
+		    <button onclick="sqlTerminalClearHighlights()">Clear highlights</button>
+		</div>
+		<div id="sql-terminal-status"></div>
+		<div id="sql-terminal-results"></div>
+	    </div>
+	</div>
+
+	<!-- Replaces the old always-floating #reset-btn/#export-btn corner
+	     buttons - one compact icon, opens/closes a small dropdown. Hidden
+	     until a replay/battle is actually loaded, same lifecycle the old
+	     buttons had (see triggerReset/finishLoadAndStartPlayback in main.js). -->
+	<div id="hamburger-container" style="display:none;">
+	    <button id="hamburger-btn" onclick="toggleMainMenu(event)" title="Menu">&#9776;</button>
+	    <div id="main-menu">
+		<button id="reset-btn" onclick="closeMainMenu(); triggerReset();">Load Different Replay / Battle</button>
+		<button id="export-btn" onclick="closeMainMenu(); exportActiveBattle();" style="display:none;" title="Download the currently active battle as a compressed .tar.xz (manifest.json + replay.db + battle.db)">Export Battle</button>
+		<div id="menu-panels-section" style="display:none;">
+		    <div class="menu-divider"></div>
+		    <label class="menu-checkbox-item">
+			<input type="checkbox" id="panel-toggle-log-box" onchange="setPanelVisible('log-box', this.checked)">
+			System Logs
+		    </label>
+		    <label class="menu-checkbox-item">
+			<input type="checkbox" id="panel-toggle-debug-panel" onchange="setPanelVisible('debug-panel', this.checked)">
+			VFS Trace
+		    </label>
+		    <label class="menu-checkbox-item">
+			<input type="checkbox" id="panel-toggle-sql-terminal-panel" checked onchange="setPanelVisible('sql-terminal-panel', this.checked)">
+			SQL Terminal
+		    </label>
+		</div>
+	    </div>
+	</div>
 
 	<div id="upload-overlay" class="overlay">
 	    <div class="card">
@@ -36,6 +114,9 @@
 		<p>Select a recorded <code>replayLog_...sqlite</code> database to visualize.</p>
 		<input type="file" id="file-input" accept=".sqlite" style="display:none;">
 		<button class="file-btn" onclick="document.getElementById('file-input').click()">Load Replay Database</button>
+		<p style="margin-top:16px;">Or load a single previously-exported battle:</p>
+		<input type="file" id="battle-file-input" accept=".xz,.tar.xz" style="display:none;">
+		<button class="file-btn" onclick="document.getElementById('battle-file-input').click()">Load Battle Export (.tar.xz)</button>
 	    </div>
 	</div>
 

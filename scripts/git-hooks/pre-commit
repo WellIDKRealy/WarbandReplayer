@@ -1,0 +1,156 @@
+#!/bin/sh
+# Pre-commit: catches a WASM binary staged for commit that doesn't match a
+# fresh build of the C source it's supposed to come from.
+#
+# This is not hypothetical - it already happened once: a commit shipped a
+# stale replay_worker.wasm that was missing a real bug fix landed in
+# replay_worker.c in the same push, silently reintroducing an already-fixed
+# bug (corpse counts leaking one tick ahead of the displayed frame) for
+# anyone who pulled it. The C source was right; nobody had rebuilt the
+# binary before committing. This hook makes that impossible to do silently.
+#
+# Install (not automatic - .git/hooks/ isn't tracked by git, so this lives
+# here and gets copied in explicitly):
+#   cp scripts/git-hooks/pre-commit .git/hooks/pre-commit
+#   chmod +x .git/hooks/pre-commit
+#
+# Simplification: builds from the WORKING TREE, not a clean checkout of the
+# git index. If you have unstaged wasm-relevant changes sitting alongside
+# what you're about to commit, this can't tell staged-vs-unstaged apart.
+# Normal one-thing-at-a-time commits are unaffected; if you're doing
+# something unusual, double check the diff yourself, or use --no-verify.
+
+SOURCES_PATTERN='(^main\.c$|^replay_worker\.c$|^replay_export\.c$|^sql_terminal\.c$|^replay_internal\.h$|^compress_worker\.c$|^Makefile$|^sqlite3/|^goyslopless-c/|^sql/|^lzma-sdk/|^scripts/gen_canonical_sql_header\.py$)'
+WASM_FILES="main.wasm replay_worker.wasm compress.wasm"
+
+changed=$(git diff --cached --name-only | grep -E "$SOURCES_PATTERN")
+if [ -z "$changed" ]; then
+    exit 0
+fi
+
+# clang/wasm-ld aren't always on PATH by default (e.g. a fresh choco install
+# on Windows) - try the common LLVM location before giving up.
+if ! command -v clang >/dev/null 2>&1; then
+    for candidate in "/c/Program Files/LLVM/bin" "/c/Program Files (x86)/LLVM/bin"; do
+        if [ -d "$candidate" ]; then
+            PATH="$candidate:$PATH"
+        fi
+    done
+fi
+if ! command -v clang >/dev/null 2>&1; then
+    echo "pre-commit: wasm-affecting source changed but clang isn't on PATH - can't verify main.wasm/replay_worker.wasm are up to date."
+    echo "  Rebuild manually ('make') and double-check before committing, or install LLVM."
+    exit 0   # don't block a commit just because the checker itself can't run
+fi
+
+echo "pre-commit: wasm-affecting source staged ($(echo "$changed" | tr '\n' ' ')) - verifying $WASM_FILES are rebuilt..."
+
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+for f in $WASM_FILES; do
+    [ -f "$f" ] && cp "$f" "$TMPDIR/$(basename "$f").before"
+done
+
+BUILD_LOG="$TMPDIR/build.log"
+# -B forces an unconditional rebuild. Plain `make` trusts mtimes, and a
+# `git checkout`/`git reset` of the .wasm can leave it looking NEWER than
+# the .c it's supposed to depend on (checkout writes the file "now",
+# regardless of history) - make then sees the target as up to date and
+# skips rebuilding entirely, which defeats the entire point of this check.
+# Hit this exact trap writing the hook itself: without -B it silently
+# passed on a source change it should have caught.
+if ! make -B $WASM_FILES >"$BUILD_LOG" 2>&1; then
+    echo "pre-commit: FAILED to rebuild $WASM_FILES:"
+    cat "$BUILD_LOG"
+    exit 1
+fi
+
+FAIL=0
+for f in $WASM_FILES; do
+    fresh_hash=$(sha256sum "$f" | cut -d' ' -f1)
+    staged_name=$(git diff --cached --name-only -- "$f")
+    if [ -n "$staged_name" ]; then
+        staged_hash=$(git show ":$f" | sha256sum | cut -d' ' -f1)
+        if [ "$fresh_hash" != "$staged_hash" ]; then
+            echo "pre-commit: STALE $f staged - doesn't match a fresh build of the source in this commit."
+            echo "  Fix: git add $f   (already rebuilt on disk just now)"
+            FAIL=1
+        fi
+    else
+        before_hash=""
+        [ -f "$TMPDIR/$(basename "$f").before" ] && before_hash=$(sha256sum "$TMPDIR/$(basename "$f").before" | cut -d' ' -f1)
+        if [ "$fresh_hash" != "$before_hash" ]; then
+            echo "pre-commit: $f changed as a result of the source in this commit, but isn't staged at all."
+            echo "  Fix: git add $f   (already rebuilt on disk just now)"
+            FAIL=1
+        fi
+    fi
+done
+
+if [ "$FAIL" = "1" ]; then
+    echo ""
+    echo "pre-commit: aborting commit. Stage the rebuilt .wasm and retry."
+    echo "  (bypass with 'git commit --no-verify' if you really mean to commit source without the matching wasm - not recommended)"
+    exit 1
+fi
+
+# Ground-truth correctness suite: the freshness check above only proves the
+# staged wasm matches a build of this source - it says nothing about whether
+# that source is actually still CORRECT. Runs the same 24-fixture suite
+# testdata/run_test_suite.py uses in CI against the wasm just rebuilt above,
+# comparing every sampled frame's positions/corpses/chat against ground_truth.py's
+# independent (never touches replay_worker.wasm) computation. ~50s against
+# this repo's real fixtures as of the run that added this - only paid on
+# commits that touch simulation-affecting source (same SOURCES_PATTERN
+# above), not on every commit. Skip with SKIP_CORRECTNESS_SUITE=1 if you're
+# iterating and will verify manually before the real commit.
+if [ -n "$SKIP_CORRECTNESS_SUITE" ]; then
+    echo "pre-commit: SKIP_CORRECTNESS_SUITE set - skipping ground-truth correctness suite."
+    exit 0
+fi
+
+PY=""
+for candidate in "py -3" python3 python; do
+    if command -v ${candidate%% *} >/dev/null 2>&1; then
+        v=$($candidate -c 'import selenium' >/dev/null 2>&1 && echo ok)
+        if [ "$v" = "ok" ]; then PY="$candidate"; break; fi
+    fi
+done
+if [ -z "$PY" ]; then
+    echo "pre-commit: no Python with 'selenium' installed found (tried py -3, python3, python) -"
+    echo "  can't run the ground-truth correctness suite. Install it ('pip install selenium') or"
+    echo "  set SKIP_CORRECTNESS_SUITE=1 to bypass. Not blocking this commit on a checker that can't run."
+    exit 0
+fi
+
+BASE_URL="http://localhost:8137/testdata"
+STARTED_SERVER=0
+if ! curl -s -o /dev/null "http://localhost:8137/" 2>/dev/null; then
+    echo "pre-commit: starting a temporary dev server on :8137 for the correctness suite..."
+    $PY serve.py 8137 >"$TMPDIR/serve.log" 2>&1 &
+    SERVER_PID=$!
+    STARTED_SERVER=1
+    for i in $(seq 1 30); do
+        curl -s -o /dev/null "http://localhost:8137/" 2>/dev/null && break
+        sleep 0.2
+    done
+fi
+
+echo "pre-commit: running ground-truth correctness suite against the freshly rebuilt wasm..."
+$PY testdata/run_test_suite.py --browsers chrome --base-url "$BASE_URL"
+SUITE_RC=$?
+
+if [ "$STARTED_SERVER" = "1" ]; then
+    kill "$SERVER_PID" >/dev/null 2>&1
+fi
+
+if [ "$SUITE_RC" != "0" ]; then
+    echo ""
+    echo "pre-commit: ground-truth correctness suite FAILED - aborting commit."
+    echo "  See testdata/test_suite_results.json for details."
+    echo "  (bypass with 'git commit --no-verify' or SKIP_CORRECTNESS_SUITE=1 if you really mean to commit anyway - not recommended)"
+    exit 1
+fi
+
+exit 0

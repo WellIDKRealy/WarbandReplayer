@@ -300,7 +300,8 @@
       // replay_worker.c's comment on why index-building itself can't be
       // parallelized under SQLite's single-writer model) with 1 worker vs
       // the full hardwareConcurrency-sized pool.
-      const WASM_MEMORY_PAGES = 16384; // must match Makefile's replay_worker.wasm memory flags
+      const WASM_MEMORY_INITIAL_PAGES = 10240; // 640MiB - must match Makefile's --initial-memory
+      const WASM_MEMORY_MAX_PAGES = 32768;     // 2GiB - must match Makefile's --max-memory
 
       function readCstrShared(memory, ptr) {
         const mem = new Uint8Array(memory.buffer);
@@ -368,11 +369,11 @@
           const hwConcurrency = Math.min(navigator.hardwareConcurrency || 4, 8);
 
           resultEl.textContent = `Running with 1 reader thread (file: ${file.name}, ${(file.size/1024/1024).toFixed(1)}MB)...`;
-          const mem1 = new WebAssembly.Memory({ initial: WASM_MEMORY_PAGES, maximum: WASM_MEMORY_PAGES, shared: true });
+          const mem1 = new WebAssembly.Memory({ initial: WASM_MEMORY_INITIAL_PAGES, maximum: WASM_MEMORY_MAX_PAGES, shared: true });
           const r1 = await loadAndTimeBounds(mem1, module, file, 1);
 
           resultEl.textContent = `Running with ${hwConcurrency} reader threads...`;
-          const memN = new WebAssembly.Memory({ initial: WASM_MEMORY_PAGES, maximum: WASM_MEMORY_PAGES, shared: true });
+          const memN = new WebAssembly.Memory({ initial: WASM_MEMORY_INITIAL_PAGES, maximum: WASM_MEMORY_MAX_PAGES, shared: true });
           const rN = await loadAndTimeBounds(memN, module, file, hwConcurrency);
 
           const speedup = r1.boundsMs / Math.max(rN.boundsMs, 0.001);

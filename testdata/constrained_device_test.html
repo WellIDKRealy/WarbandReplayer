@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html>
+<head>
+<!-- main.js's own fetches (main.wasm, replay_worker.wasm, shaders/, and the
+     bare Worker(...) URLs) are relative to WHATEVER page includes it - main.html
+     lives at the project root next to those files, so this test page (which
+     lives under testdata/) needs a <base> to make main.js's relative paths
+     resolve the same way they would for the real app. -->
+<base href="../">
+<script>
+// Simulates a constrained device BEFORE main.js's module-level
+// `const READER_COUNT = computeReaderCount()` evaluates - navigator.deviceMemory
+// is a real (if coarse) read-only getter, but is configurable via
+// defineProperty in a normal page context, which is what real device-memory
+// emulation tooling does under the hood too.
+Object.defineProperty(navigator, 'deviceMemory', { value: 0.5, configurable: true });
+Object.defineProperty(navigator, 'hardwareConcurrency', { value: 2, configurable: true });
+</script>
+<link rel="stylesheet" href="main.css">
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="center-crosshair"></div>
+<div id="chat-box" class="ui-panel"><div class="panel-header"><span>[Chat Replay]</span></div><div id="chat-content" class="panel-content"></div></div>
+<div id="log-box" class="ui-panel minimized"><div class="panel-header"><span>[System Logs]</span></div><div id="log-content" class="panel-content"></div></div>
+<div id="debug-panel" class="ui-panel" style="display:none;"><div class="panel-header"><span>[Debug]</span></div><div id="debug-content" class="panel-content"><pre id="debug-output"></pre></div></div>
+<div id="sql-terminal-panel" class="ui-panel" style="display:none;"><div class="panel-header"><span>[SQL]</span></div><div id="sql-terminal-content" class="panel-content">
+<textarea id="sql-terminal-input" rows="3"></textarea>
+<div id="sql-terminal-status"></div><div id="sql-terminal-results"></div>
+<select id="sql-terminal-checkpoints"></select>
+</div></div>
+<button id="reset-btn" style="display:none;"></button>
+<div id="upload-overlay" class="overlay">
+    <div class="card">
+        <input type="file" id="file-input" accept=".sqlite" style="display:none;">
+        <input type="file" id="battle-file-input" accept=".xz" style="display:none;">
+    </div>
+</div>
+<div id="loading-overlay" class="overlay" style="display:none;">
+    <div class="card"><div class="progress-container"><div id="progress-fill" class="progress-bar"></div></div><div id="progress-text"></div></div>
+</div>
+<pre id="test-out">running...</pre>
+<script src="main.js"></script>
+<script>
+function line(s) { const el = document.getElementById('test-out'); el.textContent += s + "\n"; console.log(s); }
+(async () => {
+  try {
+    line(`simulated device: deviceMemory=${navigator.deviceMemory}, hardwareConcurrency=${navigator.hardwareConcurrency}`);
+    line(`computed READER_COUNT=${READER_COUNT}`);
+
+    const fileBlob = await (await fetch('testdata/replays_batch/replayLog_2026-07-19_01-12-06.sqlite')).blob();
+    const file = new File([fileBlob], 'replayLog_2026-07-19_01-12-06.sqlite');
+
+    const t0 = performance.now();
+    startReplayLoad(file);
+
+    await new Promise((resolve, reject) => {
+      const check = setInterval(() => {
+        if (currentSimulationState === 'RUNNING') { clearInterval(check); resolve(); }
+      }, 200);
+      setTimeout(() => { clearInterval(check); reject(new Error('timeout waiting for RUNNING state')); }, 60000);
+    });
+    line(`load+bounds completed in ${(performance.now() - t0).toFixed(0)}ms with ${READER_COUNT} reader(s), matchCount=${matches.length}`);
+
+    // real frame request to confirm actual playback data flows correctly.
+    // Intercepts EXCLUSIVELY (does not forward to the real onLoaderMessage) -
+    // 'frame' is harmless to intercept since nothing else needs it acted on
+    // synchronously here, but see the 'exported' case just below for why
+    // exclusive interception matters for real.
+    const frame = await new Promise((resolve, reject) => {
+      const orig = playbackWorker.onmessage;
+      playbackWorker.onmessage = (e) => { if (e.data.type === 'frame') { playbackWorker.onmessage = orig; resolve(e.data); } else { orig(e); } };
+      playbackWorker.postMessage({ type: 'frame', time: totalStartTime + 30, seek: true });
+    });
+    line(`frame at t+30s: count=${frame.count} activeMatch=${frame.activeMatchIndex}`);
+
+    // Real export, but intercepted EXCLUSIVELY - deliberately NOT forwarded to
+    // the real onLoaderMessage/handleExportedTar via orig(e). That handler
+    // would otherwise ALSO run (this page includes the real timeline UI, so
+    // it's fully wired), spin up its OWN compress worker, consume/detach the
+    // SAME transferable tar buffer this script wants to use, and eventually
+    // trigger a REAL file-save dialog via finishExportDownload()'s <a download>
+    // click - not something an automated test should ever do.
+    const exported = await new Promise((resolve, reject) => {
+      const orig = playbackWorker.onmessage;
+      playbackWorker.onmessage = (e) => {
+        if (e.data.type === 'exported') { playbackWorker.onmessage = orig; resolve(e.data); }
+        else if (e.data.type === 'error') { playbackWorker.onmessage = orig; reject(new Error(JSON.stringify(e.data))); }
+        else orig(e);
+      };
+      playbackWorker.postMessage({ type: 'exportBattle', matchIdx: 0 });
+    });
+    const tarSize = exported.tar.length; // captured before the transfer below detaches exported.tar's buffer
+    line(`export produced tar: ${tarSize} bytes`);
+
+    const dictSizeMiB = computeDictSizeMiB();
+    line(`computed dictSizeMiB=${dictSizeMiB} for this device`);
+    const cw = new Worker('compress-worker.js?v=' + Date.now());
+    const compressed = await new Promise((resolve, reject) => {
+      cw.onmessage = (e) => { if (e.data.type === 'compressed') resolve(e.data.out); else if (e.data.type === 'error') reject(new Error(e.data.message)); };
+      cw.postMessage({ type: 'compress', data: exported.tar, dictSizeMiB }, [exported.tar.buffer]);
+    });
+    cw.terminate();
+    line(`compressed with dict=${dictSizeMiB}MiB: ${compressed.length} bytes`);
+
+    const checks = [
+      ["READER_COUNT clamped for constrained device (expected 1)", READER_COUNT === 1],
+      ["load completed and reached RUNNING state", currentSimulationState === 'RUNNING'],
+      ["matches were found", matches.length > 0],
+      ["frame data is non-empty", frame.count > 0],
+      ["export produced a non-trivial tar", tarSize > 1000],
+      ["dictSizeMiB clamped for constrained device (expected 4)", dictSizeMiB === 4],
+      ["compression with the smaller dictionary still worked", compressed.length > 0 && compressed.length < tarSize],
+    ];
+    let allPass = true;
+    line("");
+    for (const [name, ok] of checks) { line((ok ? "PASS" : "FAIL") + ": " + name); if (!ok) allPass = false; }
+    line(allPass ? "\nRESULT: PASS" : "\nRESULT: FAIL");
+  } catch (e) {
+    line("EXCEPTION: " + e.message + "\n" + (e.stack || ""));
+  }
+})();
+</script>
+</body>
+</html>

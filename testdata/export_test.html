@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html><body><pre id="out">running...</pre>
+<script>
+let log = "";
+function line(s) { log += s + "\n"; document.getElementById('out').textContent = log; console.log(s); }
+
+function waitFor(worker, predicate) {
+  return new Promise((resolve, reject) => {
+    const handler = (e) => {
+      if (e.data.type === 'error') { worker.removeEventListener('message', handler); reject(new Error(JSON.stringify(e.data))); return; }
+      if (predicate(e.data)) { worker.removeEventListener('message', handler); resolve(e.data); }
+    };
+    worker.addEventListener('message', handler);
+  });
+}
+
+// ---- minimal ustar reader, independent of the C writer, for verification ----
+// POSIX ustar magic is the 6 bytes 'u','s','t','a','r',0 followed by version
+// "00" - compared as raw byte codes throughout (not round-tripped through a
+// JS string) since the embedded NUL is awkward to express literally in a
+// string constant.
+const USTAR_MAGIC = [117, 115, 116, 97, 114, 0, 48, 48]; // "ustar\0" + "00"
+function parseOctal(bytes) {
+  let s = '';
+  for (const b of bytes) { if (b === 0 || b === 32) break; s += String.fromCharCode(b); }
+  return s.length ? parseInt(s, 8) : 0;
+}
+function parseTar(bytes) {
+  const entries = [];
+  let off = 0;
+  while (off + 512 <= bytes.length) {
+    const header = bytes.subarray(off, off + 512);
+    if (header.every(b => b === 0)) break; // end-of-archive zero block
+    const nameBytes = header.subarray(0, 100);
+    let nameEnd = 0; while (nameEnd < 100 && nameBytes[nameEnd] !== 0) nameEnd++;
+    const name = new TextDecoder().decode(nameBytes.subarray(0, nameEnd));
+    const size = parseOctal(header.subarray(124, 136));
+    const magicBytes = header.subarray(257, 265);
+    const magicOk = USTAR_MAGIC.every((b, i) => magicBytes[i] === b);
+    const storedChk = parseOctal(header.subarray(148, 156));
+    const chkCopy = header.slice();
+    chkCopy.set(new Uint8Array(8).fill(32), 148);
+    let sum = 0; for (const b of chkCopy) sum += b;
+    off += 512;
+    const data = bytes.subarray(off, off + size);
+    entries.push({ name, size, magicOk, checksumOk: sum === storedChk, data });
+    off += size;
+    if (size % 512 !== 0) off += 512 - (size % 512);
+  }
+  return entries;
+}
+
+async function sha256Hex(bytes) {
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+// No <a download> / Blob-URL clicks here on purpose - those trigger a real
+// browser download-permission prompt under automation, which just hangs.
+// Stash everything on window instead so a javascript_tool eval (or another
+// page) can pull bytes out programmatically - no dialogs, no downloads
+// folder to go hunting through.
+function hexDump(bytes, n) {
+  return [...bytes.subarray(0, n)].map(b => b.toString(16).padStart(2, '0')).join(' ');
+}
+
+(async () => {
+  try {
+    line("crossOriginIsolated=" + crossOriginIsolated);
+    const memory = new WebAssembly.Memory({ initial: 1536, maximum: 32768, shared: true });
+    const module = await WebAssembly.compile(await (await fetch('../replay_worker.wasm', { cache: 'no-store' })).arrayBuffer());
+
+    const fileResp = await fetch('synthetic_fixture.sqlite');
+    const fileBlob = await fileResp.blob();
+    const fileBytes = new Uint8Array(await fileBlob.arrayBuffer());
+    const expectedSha256 = await sha256Hex(fileBytes);
+    line(`fetched synthetic_fixture.sqlite: ${fileBytes.length} bytes, sha256=${expectedSha256}`);
+    const file = new File([fileBlob], 'synthetic_fixture.sqlite');
+
+    const loader = new Worker('../replay-worker.js?v=' + Date.now());
+    loader.postMessage({ type: 'init', role: 'loader', memory, module, threadId: 0 });
+    await waitFor(loader, d => d.type === 'ready');
+    line("loader ready");
+
+    const loadedPromise = waitFor(loader, d => d.type === 'loaded');
+    loader.postMessage({ type: 'load', file });
+    const loaded = await loadedPromise;
+    line(`loaded: matchCount=${loaded.matchCount}`);
+    line("matches: " + JSON.stringify(loaded.matches, null, 1));
+
+    if (loaded.matchCount < 1) throw new Error("synthetic fixture has no matches to export");
+
+    const exportedPromise = waitFor(loader, d => d.type === 'exported');
+    loader.postMessage({ type: 'exportBattle', matchIdx: 0 });
+    const exported = await exportedPromise;
+    line(`\n=== EXPORT COMPLETE: matchIdx=${exported.matchIdx}, tar size=${exported.tar.length} bytes ===`);
+    window.__lastTar = exported.tar; // pull out later via javascript_tool if needed
+
+    const entries = parseTar(exported.tar);
+    line(`\nparsed ${entries.length} tar entries:`);
+    for (const e of entries) {
+      line(`  ${e.name}: size=${e.size} magicOk=${e.magicOk} checksumOk=${e.checksumOk}`);
+    }
+
+    const manifestEntry = entries.find(e => e.name === 'manifest.json');
+    const replayEntry = entries.find(e => e.name === 'replay.db');
+    const battleEntry = entries.find(e => e.name === 'battle.db');
+
+    let manifest = null;
+    if (manifestEntry) {
+      const manifestText = new TextDecoder().decode(manifestEntry.data);
+      line("\nmanifest.json:\n" + manifestText);
+      manifest = JSON.parse(manifestText);
+    }
+
+    window.__replayDb = replayEntry ? replayEntry.data : null;
+    window.__battleDb = battleEntry ? battleEntry.data : null;
+    if (replayEntry) line("replay.db first 32 bytes: " + hexDump(replayEntry.data, 32));
+    if (battleEntry) line("battle.db first 32 bytes: " + hexDump(battleEntry.data, 32));
+
+    // real SQLite files start with the 16-byte magic "SQLite format 3\0"
+    const SQLITE_MAGIC = [83,81,76,105,116,101,32,102,111,114,109,97,116,32,51,0];
+    function hasSqliteMagic(bytes) {
+      return SQLITE_MAGIC.every((b, i) => bytes[i] === b);
+    }
+
+    const checks = [
+      ["exactly 3 tar entries", entries.length === 3],
+      ["entry order manifest.json, replay.db, battle.db", entries.map(e=>e.name).join(',') === 'manifest.json,replay.db,battle.db'],
+      ["all tar checksums valid", entries.every(e => e.checksumOk)],
+      ["all tar magic == ustar (POSIX)", entries.every(e => e.magicOk)],
+      ["manifest present and parses as JSON", manifest !== null],
+      ["manifest.source_replay.sha256 matches independently-computed sha256", manifest && manifest.source_replay.sha256 === expectedSha256],
+      ["manifest.source_replay.filename == 'synthetic_fixture.sqlite'", manifest && manifest.source_replay.filename === 'synthetic_fixture.sqlite'],
+      ["manifest.source_replay.size_bytes matches actual file size", manifest && manifest.source_replay.size_bytes === fileBytes.length],
+      ["manifest.battle.match_index == 0", manifest && manifest.battle.match_index === 0],
+      ["replay.db entry has real SQLite header", replayEntry && hasSqliteMagic(replayEntry.data)],
+      ["battle.db entry has real SQLite header", battleEntry && hasSqliteMagic(battleEntry.data)],
+      ["replay.db size_bytes in manifest matches tar entry size", manifest && replayEntry && manifest.replay_db.size_bytes === replayEntry.size],
+      ["battle.db size_bytes in manifest matches tar entry size", manifest && battleEntry && manifest.battle_db.size_bytes === battleEntry.size],
+    ];
+    let allPass = true;
+    line("");
+    for (const [name, ok] of checks) { line((ok ? "PASS" : "FAIL") + ": " + name); if (!ok) allPass = false; }
+    line(allPass ? "\nRESULT: PASS" : "\nRESULT: FAIL");
+
+    loader.terminate();
+  } catch (e) {
+    line("EXCEPTION: " + e.message + "\n" + (e.stack || ""));
+  }
+})();
+</script>
+</body></html>

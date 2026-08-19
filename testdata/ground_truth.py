@@ -1,13 +1,26 @@
 #!/usr/bin/env python3
 """
 Ground-truth generator for verifying replay_worker.c's output WITHOUT rendering
-anything. Independently reimplements, directly against the .sqlite file's SQL,
-the exact same algorithms replay_worker.c uses:
+anything. Checks replay_worker.c's algorithms against independent SQL:
   - scan_matches() - map/score/faction-switch boundary detection + merge/min-
     length rules (see tick_index_for_id/scan_matches in replay_worker.c).
-  - apply_roster_delta() - single-pass, event-id-ordered spawn/kill replay
-    (a kill's corpse team is whatever the roster says for that agent_id AT
-    THE MOMENT the kill is processed, matching the C single-pass semantics).
+    Reimplemented in Python here, since that merge/threshold logic has no SQL
+    equivalent in the C engine either (it's a C loop over a SQL query there
+    too - see the comment on scan_matches in replay_worker.c).
+  - roster/corpse replay - NOT reimplemented in Python anymore. Runs
+    sql/canonical_roster_corpse.sql directly, the same canonical definition
+    replay_worker.c compiles in (see scripts/gen_canonical_sql_header.py) and
+    that exported battle.db files hash into _table_provenance. This used to
+    be a hand-written Python fold that independently reimplemented
+    apply_roster_delta()'s single-pass, event-id-ordered semantics - kept in
+    sync by hand, which is exactly the kind of drift this convergence is
+    meant to close. Switching to the canonical SQL surfaced and fixed one
+    real, previously-invisible-to-this-suite divergence: the old Python fold
+    defaulted a killed-but-never-spawned-in-window agent's corpse team to -1,
+    while the C engine's actual default (RosterEntry.team, zeroed by
+    memset() before any delta is applied - replay_worker.c's roster struct)
+    is 0. corpseCount-only comparisons never caught this; per-corpse team
+    values weren't checked. The canonical SQL matches the real C behavior.
   - fetch_positions() - plain tick_id lookup against agent_states (the C
     engine's rowid-bisection is purely a locality/performance optimization,
     not a correctness-changing filter, so a plain tick_id match is an
@@ -25,9 +38,15 @@ Usage: python ground_truth.py <sqlite_path> [samples_per_match] [out.json]
 import sqlite3
 import sys
 import json
+import pathlib
 
 MAX_AGENT_SLOTS = 1025
 MAX_MATCHES = 16
+
+CANONICAL_ROSTER_CORPSE_SQL = (
+    pathlib.Path(__file__).resolve().parent.parent
+    / "sql" / "canonical_roster_corpse.sql"
+).read_text(encoding="utf-8")
 
 
 def load_ticks(conn):
@@ -82,41 +101,31 @@ def scan_matches(conn, ticks):
     return matches
 
 
-def parse_team(t):
-    if t == '0':
-        return 0
-    if t == '1':
-        return 1
-    return -1
-
-
 def replay_roster_and_corpses(conn, from_tick, to_tick):
-    """Exactly mirrors apply_roster_delta(): single pass over (from_tick, to_tick]
-    in event-id order, spawns and kills interleaved. Returns (roster, corpses)."""
+    """Runs sql/canonical_roster_corpse.sql - the same canonical definition
+    replay_worker.c compiles in (see scripts/gen_canonical_sql_header.py) -
+    and reshapes its two JSON columns into the (roster dict, corpses list)
+    shape the rest of this file expects. See that .sql file's header comment
+    for the exact semantics (event-id-ordered fold, spawn overwrites, corpse
+    team = roster's current value for that agent_id at kill time, defaulting
+    to 0 - not -1 - for an agent never spawned within [from_tick, to_tick])."""
+    row = conn.execute(
+        CANONICAL_ROSTER_CORPSE_SQL,
+        {"from_tick": from_tick, "to_tick": to_tick}
+    ).fetchone()
+    roster_json, corpses_json = row
+    raw_roster = json.loads(roster_json)
+    corpses = json.loads(corpses_json)
+
     roster = {}
-    corpses = []
-    rows = conn.execute(
-        "SELECT e.event_type, "
-        "  CASE e.event_type WHEN 'spawn' THEN s.agent_id ELSE k.dead_id END AS agent_ref, "
-        "  s.is_human, s.team, s.event_id, "
-        "  k.dead_id, k.dead_x, k.dead_y "
-        "FROM events e "
-        "LEFT JOIN spawns s ON e.event_type='spawn' AND s.event_id = e.id "
-        "LEFT JOIN kills k ON e.event_type='kill' AND k.event_id = e.id "
-        "WHERE e.tick_id > ? AND e.tick_id <= ? AND e.event_type IN ('spawn','kill') "
-        "ORDER BY e.id ASC", (from_tick, to_tick)).fetchall()
-    for event_type, agent_ref, is_human, team, spawn_event_id, dead_id, dead_x, dead_y in rows:
-        if agent_ref is None or agent_ref < 0 or agent_ref >= MAX_AGENT_SLOTS:
+    for agent_id_str, r in raw_roster.items():
+        agent_id = int(agent_id_str)
+        if agent_id < 0 or agent_id >= MAX_AGENT_SLOTS:
             continue
-        if event_type == 'spawn':
-            roster[agent_ref] = {
-                'active': True, 'is_human': bool(is_human),
-                'team': parse_team(team), 'spawn_event_id': spawn_event_id,
-            }
-        else:
-            if dead_id is not None and 0 <= dead_id < MAX_AGENT_SLOTS:
-                dead_team = roster.get(dead_id, {}).get('team', -1)
-                corpses.append({'x': dead_x, 'y': dead_y, 'team': dead_team})
+        roster[agent_id] = {
+            'active': bool(r['active']), 'is_human': bool(r['is_human']),
+            'team': r['team'], 'spawn_event_id': r['spawn_event_id'],
+        }
     return roster, corpses
 
 

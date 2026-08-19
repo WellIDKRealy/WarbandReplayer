@@ -41,7 +41,7 @@ window.__testResult = { done: false };
     line(`ground truth: ${gt.matchCount} matches, ${gt.samples.length} samples`);
     result.expectedMatchCount = gt.matchCount;
 
-    const memory = new WebAssembly.Memory({ initial: 16384, maximum: 16384, shared: true });
+    const memory = new WebAssembly.Memory({ initial: 1536, maximum: 32768, shared: true }); // 96MiB initial, 2GiB max
     const module = await WebAssembly.compile(await (await fetch('../replay_worker.wasm', { cache: 'no-store' })).arrayBuffer());
     const fileBlob = await (await fetch(sqliteFile)).blob();
     const file = new File([fileBlob], sqliteFile);
@@ -71,6 +71,20 @@ window.__testResult = { done: false };
     }
     line(`loaded: matchCount=${loadResult.matchCount} (ground truth says ${gt.matchCount})`);
     result.actualMatchCount = loadResult.matchCount;
+
+    // Optional: exercise the evict-then-rebuild path (replay_evict_battle/
+    // replay_ensure_battle_ready in replay_worker.c) on every sample below
+    // instead of build-once, by forcing a tiny memory budget before the
+    // sampling loop starts. Ground truth is computed independently (never
+    // touches replay_worker.wasm - see ground_truth.py), so any position/
+    // corpse/chat mismatch here is a real eviction-path bug (e.g. a stale
+    // prepared statement after finalize, or a wrong rowid slice after a
+    // rebuild), not a stale expectation.
+    const primingBudgetBytes = params.get('primingBudgetBytes');
+    if (primingBudgetBytes) {
+      loader.postMessage({ type: 'setPrimingBudget', bytes: parseInt(primingBudgetBytes, 10) });
+      line(`priming budget forced to ${primingBudgetBytes} bytes - exercising evict+rebuild on every sample`);
+    }
 
     const checks = [];
     checks.push(['match count matches ground truth', loadResult.matchCount === gt.matchCount]);

@@ -37,6 +37,26 @@ Requires:
     auto-downloads chromedriver/geckodriver - no manual driver install
     needed for those two, on either OS).
   For webkit on Linux: sudo apt install webkit2gtk-driver
+  Optional: pip install psutil - enables --max-suite-memory-mb (see below).
+    Without it, that flag is accepted but has no effect (a warning is
+    printed once).
+
+Memory budget (--max-suite-memory-mb): this suite can spawn a lot of
+concurrent browser processes (concurrency-per-browser x browser count),
+each a real Chrome/Firefox instance with its own subprocess tree. On a
+machine also being used for other things at the same time, that's a real
+problem. --max-suite-memory-mb caps how much RAM THIS SUITE'S OWN spawned
+processes (tracked by PID/process-tree, summed via psutil) are allowed to
+use at once - it does NOT look at, and NEVER touches, anything else running
+on the machine. When a new case would push the suite over that cap, it
+waits (polling, no fixed timeout death spiral) for a currently-running case
+to finish and free memory, rather than launching immediately. Guarded
+against the degenerate case of a cap set below what even one browser
+instance needs: with zero cases currently running, a new one is always let
+through immediately (waiting would just deadlock forever), and there's also
+a bounded max-wait fallback that proceeds-with-a-warning rather than hang
+indefinitely if the cap stays exceeded for too long even with something
+already running.
 
 Requires: testdata/*.sqlite served by serve.py on localhost with COOP/COEP
 headers (needed for crossOriginIsolated/SharedArrayBuffer - plain
@@ -48,6 +68,7 @@ Usage:
                             [--concurrency-per-browser N] [--only substr]
 """
 import argparse
+import contextlib
 import json
 import logging
 import os
@@ -61,8 +82,13 @@ from pathlib import Path
 from selenium import webdriver
 from selenium.webdriver.support.ui import WebDriverWait
 
+try:
+    import psutil
+except ImportError:
+    psutil = None
+
 TESTDATA_DIR = Path(__file__).parent
-DEFAULT_BASE_URL = "http://localhost:8126/testdata"
+DEFAULT_BASE_URL = "http://localhost:8137/testdata"  # matches serve.py's/run_ui_tests.py's convention
 
 # Substrings that mean "the browser process itself died" (OOM under
 # concurrency, most likely) rather than a real test failure - worth exactly
@@ -89,6 +115,23 @@ def discover_cases():
             yield (sqlite_path.name, f"replays_batch/{sqlite_path.name}", f"gt_batch/{sqlite_path.stem}.json")
 
 
+def _default_chrome_binary():
+    """If a chromedriver is going to be resolved from PATH (the branch
+    below), pin the browser binary to a matching PATH entry too, instead of
+    letting Selenium Manager silently auto-download a DIFFERENT Chrome
+    version to pair with it. That skew is a real, confirmed footgun here:
+    chromedriver picked up chromium 150.x from PATH while Selenium Manager
+    downloaded Chrome-for-Testing 151.x into ~/.cache/selenium and used that
+    instead - two different browser builds, only one of them actually
+    matching the driver talking to it."""
+    import shutil
+    for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return None
+
+
 def make_driver(browser, args):
     if browser == "chrome":
         from selenium.webdriver.chrome.options import Options
@@ -98,6 +141,17 @@ def make_driver(browser, args):
         opts.add_argument("--disable-gpu")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
+        if args.chrome_binary:
+            opts.binary_location = args.chrome_binary
+        elif not args.chromedriver:
+            # Neither pinned explicitly - if a system chromedriver exists on
+            # PATH, pin the matching system browser too so the two can't
+            # silently drift apart (see _default_chrome_binary above).
+            import shutil
+            if shutil.which("chromedriver"):
+                default_binary = _default_chrome_binary()
+                if default_binary:
+                    opts.binary_location = default_binary
         service = Service(args.chromedriver) if args.chromedriver else Service()
         return webdriver.Chrome(service=service, options=opts)
 
@@ -140,6 +194,135 @@ def looks_transient(error_text):
     return any(s in e for s in TRANSIENT_RESULT_SIGNS)
 
 
+class MemoryBudget:
+    """Gates new browser launches against a memory cap that covers ONLY this
+    suite's own spawned processes (tracked by root PID + full descendant
+    tree via psutil, summed RSS) - never system-wide usage, never anything
+    this suite didn't itself launch, and this class never kills or signals
+    any process, ever - it only decides when to let a new `make_driver()`
+    call proceed. See the module docstring's "Memory budget" section for
+    the deadlock-avoidance reasoning behind the guards below.
+
+    Usage is `with budget.launch_slot(): driver = make_driver(...); pid =
+    ...; budget.register(pid)` - NOT separate acquire()/release() calls
+    bracketing the whole test case. That distinction matters: a real
+    browser process takes a moment after launch before psutil can see its
+    true memory footprint (chromedriver spawns, then chrome spawns, then
+    its renderer/GPU/utility subprocesses start up and actually allocate).
+    An earlier version of this class checked "is anything registered yet"
+    and let a launch through immediately whenever nothing was - which,
+    tested under real concurrency, let MULTIPLE threads slip through
+    together at pool startup (all racing the same "nothing registered yet"
+    window) or immediately after any one case finished (release happening
+    before the replacement case's process had ramped up), silently
+    defeating the cap entirely rather than just being imprecise about it.
+    launch_slot() fixes this by holding a single lock across the ENTIRE
+    decide-then-launch-then-settle sequence, so only one browser is ever in
+    its startup ramp-up window at a time - the cap is enforced against
+    what's actually running, not against what's been reported running."""
+
+    SETTLE_S = 3.0  # time to let a freshly-launched browser's memory footprint
+                     # become visible to psutil before the next waiting launch
+                     # re-checks usage - see the class docstring.
+
+    def __init__(self, max_mb, print_lock):
+        self.max_mb = max_mb
+        self._print_lock = print_lock
+        self._lock = threading.Lock()
+        self._launch_lock = threading.Lock()  # serializes the launch+settle window itself
+        self._roots = set()
+        self._warned_no_psutil = False
+
+    def _current_usage_mb(self):
+        with self._lock:
+            roots = list(self._roots)
+        total_bytes = 0
+        for pid in roots:
+            try:
+                proc = psutil.Process(pid)
+                total_bytes += proc.memory_info().rss
+                for child in proc.children(recursive=True):
+                    try:
+                        total_bytes += child.memory_info().rss
+                    except psutil.NoSuchProcess:
+                        pass  # child exited between listing and sampling - fine, just skip it
+            except psutil.NoSuchProcess:
+                pass  # root itself already exited (quit() raced this check) - fine
+        return total_bytes / (1024 * 1024)
+
+    @contextlib.contextmanager
+    def launch_slot(self, poll_interval_s=2.0, max_wait_s=300.0):
+        """Blocks (polling, not a condition variable - simplest thing that's
+        correct here) until launching a new browser process would keep the
+        suite's own tracked usage under max_mb, then holds the launch lock
+        for SETTLE_S seconds AFTER the caller's `with` block finishes (by
+        which point it should have called register() with the new
+        process's PID) so the NEXT waiting launch sees this one's real
+        memory footprint instead of a startup-window zero."""
+        if self.max_mb is None or psutil is None:
+            if self.max_mb is not None and psutil is None and not self._warned_no_psutil:
+                with self._print_lock:
+                    print("  [budget] --max-suite-memory-mb requires psutil (pip install psutil) - "
+                          "no memory limit is being enforced this run.", flush=True)
+                self._warned_no_psutil = True
+            yield
+            return
+
+        with self._launch_lock:
+            waited = 0.0
+            while True:
+                with self._lock:
+                    active_count = len(self._roots)
+                if active_count == 0:
+                    # Nothing of ours is running yet. If we blocked here
+                    # anyway, a cap set below what even one instance needs
+                    # would wait forever for usage to drop below a floor
+                    # nothing has ever reached - deadlocking the entire
+                    # suite permanently. Always let the first launch
+                    # through; the cap still applies to every launch after.
+                    break
+                usage = self._current_usage_mb()
+                if usage < self.max_mb:
+                    break
+                if waited >= max_wait_s:
+                    with self._print_lock:
+                        print(f"  [budget] still over cap after waiting {max_wait_s:.0f}s "
+                              f"(usage={usage:.0f}MB, cap={self.max_mb:.0f}MB, "
+                              f"{active_count} case(s) still running) - proceeding anyway "
+                              f"rather than wait indefinitely.", flush=True)
+                    break
+                time.sleep(poll_interval_s)
+                waited += poll_interval_s
+
+            yield  # caller launches + registers here, still holding _launch_lock
+
+            time.sleep(self.SETTLE_S)  # let this launch become visible before releasing the lock
+
+    def register(self, pid):
+        if pid is None:
+            return
+        with self._lock:
+            self._roots.add(pid)
+
+    def release(self, pid):
+        if pid is None:
+            return
+        with self._lock:
+            self._roots.discard(pid)
+
+
+def _driver_root_pid(driver):
+    """Best-effort: the OS PID of the driver process Selenium launched (the
+    browser itself is a child of this, picked up via children(recursive=True)
+    when summing usage) - returns None if this Selenium version/setup
+    doesn't expose it, in which case that one case just isn't tracked by the
+    budget rather than erroring the whole run."""
+    try:
+        return driver.service.process.pid
+    except Exception:
+        return None
+
+
 def probe_browser(browser, args):
     """Launch and immediately quit one driver before running any real cases.
     Catches a browser that can't start AT ALL (missing/mismatched driver,
@@ -159,47 +342,74 @@ def probe_browser(browser, args):
                 pass
 
 
-def run_case(browser, args, label, file_path, gt_path):
+def run_case(browser, args, label, file_path, gt_path, budget):
     """Runs one (browser, replay) test case. Every attempt gets a brand new
     driver process and always quits it afterward - so a crashed/poisoned
-    browser can never leak into the next case, retry or not."""
+    browser can never leak into the next case, retry or not.
+
+    Retries on a transient-looking failure use a backoff delay, not an
+    immediate retry. Confirmed by direct packet capture that this specific
+    failure mode (Chrome's own client socket sending an RST mid-transfer on
+    a large fetch(), independent of file content, COEP headers, IPv4/IPv6,
+    Selenium vs raw CDP, chrome/chromedriver version match - all ruled out
+    individually) comes and goes with real transient load on the machine
+    running the browsers: the exact same case can fail 100% of attempts for
+    several minutes, then pass 100% cleanly with nothing in this script
+    changed. An immediate retry races against whatever's causing that
+    load; a short delay gives it a chance to actually clear.
+
+    budget.launch_slot() below waits (if --max-suite-memory-mb is set) for
+    room under the suite's own memory cap before launching each new browser
+    process - see MemoryBudget's docstring."""
     url = f"{args.base_url}/verify_against_truth.html?file={file_path}&gt={gt_path}"
+    if args.priming_budget_bytes:
+        url += f"&primingBudgetBytes={args.priming_budget_bytes}"
     t0 = time.time()
     last_err = None
+    max_attempts = args.max_attempts
 
-    for attempt in range(2):  # one retry, only on a crash- or network-flake-like failure
+    for attempt in range(max_attempts):
         driver = None
+        pid = None
         try:
-            driver = make_driver(browser, args)
+            with budget.launch_slot():
+                driver = make_driver(browser, args)
+                pid = _driver_root_pid(driver)
+                budget.register(pid)
             driver.set_page_load_timeout(args.timeout_s)
             driver.get(url)
             WebDriverWait(driver, args.timeout_s).until(
                 lambda d: d.execute_script("return !!(window.__testResult && window.__testResult.done === true)")
             )
             result = driver.execute_script("return window.__testResult")
-            if not result.get("allPass") and looks_transient(result.get("error")) and attempt == 0:
+            if not result.get("allPass") and looks_transient(result.get("error")) and attempt < max_attempts - 1:
                 last_err = RuntimeError(result.get("error"))
-                continue  # retry once - Selenium's own round-trip was fine, the page's fetch() wasn't
+                time.sleep(args.retry_backoff_s * (attempt + 1))
+                continue
             result["wallMs"] = round((time.time() - t0) * 1000)
             if attempt > 0:
                 result["retried"] = attempt
             return result
         except Exception as e:
             last_err = e
-            if not any(s in str(e).lower() for s in CRASH_SIGNS) or attempt == 1:
+            if not any(s in str(e).lower() for s in CRASH_SIGNS) or attempt == max_attempts - 1:
                 break
+            time.sleep(args.retry_backoff_s * (attempt + 1))
         finally:
             if driver is not None:
                 try:
                     driver.quit()
                 except Exception:
                     pass
+            budget.release(pid)  # after quit() completes, not before - a waiting
+                                  # launch shouldn't see "room" until the memory's
+                                  # actually being freed, not just about to be
 
     return {"allPass": False, "error": short_error(last_err) if last_err is not None else "unknown error",
             "wallMs": round((time.time() - t0) * 1000)}
 
 
-def run_browser(browser, cases, args, results, print_lock):
+def run_browser(browser, cases, args, results, print_lock, budget):
     """Runs every case for this browser, up to --concurrency-per-browser at
     once. Called from its own thread (one per browser) so all browsers run
     at the same time; the pool here bounds concurrency WITHIN one browser -
@@ -214,7 +424,7 @@ def run_browser(browser, cases, args, results, print_lock):
         return
 
     with ThreadPoolExecutor(max_workers=args.concurrency_per_browser) as pool:
-        futures = {pool.submit(run_case, browser, args, label, fp, gp): label for label, fp, gp in cases}
+        futures = {pool.submit(run_case, browser, args, label, fp, gp, budget): label for label, fp, gp in cases}
         for future in as_completed(futures):
             label = futures[future]
             r = future.result()
@@ -236,10 +446,23 @@ def main():
     ap.add_argument("--browsers", default="chrome,firefox,webkit")
     ap.add_argument("--timeout-s", type=int, default=120)
     ap.add_argument("--concurrency-per-browser", type=int, default=3)
+    ap.add_argument("--max-attempts", type=int, default=3, help="attempts per case before giving up on a transient-looking failure (default: 3, i.e. up to 2 retries)")
+    ap.add_argument("--retry-backoff-s", type=float, default=3.0, help="base delay before a retry, multiplied by attempt number (default: 3s, 6s, ...) - gives transient machine load a chance to clear instead of racing it")
     ap.add_argument("--only", default=None, help="substring filter on filename")
+    ap.add_argument("--priming-budget-bytes", type=int, default=None,
+                     help="force replay_worker.wasm's per-battle-index memory budget to this many bytes "
+                          "before the ground-truth sampling pass, so every sample exercises the evict-then-"
+                          "rebuild path (replay_evict_battle/replay_ensure_battle_ready) instead of build-once. "
+                          "Unset = default device-tiered budget, same as normal use.")
     ap.add_argument("--chromedriver", default=None, help="path to chromedriver (default: auto)")
+    ap.add_argument("--chrome-binary", default=None, help="path to chrome/chromium binary (default: auto-paired with chromedriver, see make_driver)")
     ap.add_argument("--geckodriver", default=None, help="path to geckodriver (default: auto)")
     ap.add_argument("--webkitwebdriver", default=None, help="path to WebKitWebDriver (default: PATH)")
+    ap.add_argument("--max-suite-memory-mb", type=float, default=None,
+                     help="cap on THIS SUITE'S OWN spawned-process memory usage (MB) - never looks at or "
+                          "touches other programs on the machine. New browser launches wait for a running "
+                          "case to finish and free memory rather than exceed it. Requires `pip install psutil` "
+                          "(warns once and runs unlimited if missing). Unset = no limit (default).")
     args = ap.parse_args()
 
     # Best-effort: silence Selenium's own internal INFO/WARNING chatter (e.g.
@@ -273,8 +496,11 @@ def main():
     t0 = time.time()
     results = {}
     print_lock = threading.Lock()
+    budget = MemoryBudget(args.max_suite_memory_mb, print_lock)
+    if args.max_suite_memory_mb is not None and psutil is not None:
+        print(f"Suite memory cap: {args.max_suite_memory_mb:.0f}MB (this suite's own processes only)\n", flush=True)
 
-    threads = [threading.Thread(target=run_browser, args=(b, cases, args, results, print_lock), daemon=True)
+    threads = [threading.Thread(target=run_browser, args=(b, cases, args, results, print_lock, budget), daemon=True)
                for b in browsers]
     for t in threads:
         t.start()
