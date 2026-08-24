@@ -63,6 +63,12 @@ float cam_x = 0.0f, cam_y = 0.0f, cam_zoom = 1.0f;
 int screen_width = 800, screen_height = 600;
 int keys[4] = {0, 0, 0, 0};
 
+// A RENDER-ONLY offset, deliberately independent of cam_x/cam_y - see
+// set_view_shift's own comment below for why this exists as a second,
+// separate pair of floats rather than just folding into cam_x/cam_y
+// directly (the far simpler-looking option, and the wrong one here).
+float view_shift_x = 0.0f, view_shift_y = 0.0f;
+
 float map_min_x = -100.0f, map_max_x = 100.0f;
 float map_min_y = -100.0f, map_max_y = 100.0f;
 
@@ -144,6 +150,53 @@ void set_map_bounds(float min_x, float max_x, float min_y, float max_y) {
 }
 
 void set_screen_dimensions(int w, int h) { screen_width = w; screen_height = h; }
+
+/* World-space position of the crosshair fixed at screen center, for the SQL
+ * terminal's CURSOR_X()/CURSOR_Y() variable functions (replay_worker.c) - a
+ * SEPARATE WASM instance/memory from this one, so main.js reads these and
+ * forwards the values across (replay_set_cursor_world_pos). The camera is
+ * centered on (cam_x, cam_y) by construction (the ortho projection below is
+ * built centered there), so the crosshair's world position simply IS
+ * (cam_x, cam_y) - no inverse-projection math needed. */
+float get_cam_x(void) { return cam_x; }
+float get_cam_y(void) { return cam_y; }
+
+/* Sets the render-only visual shift (view_shift_x/y above) - used by main.js
+ * to make the currently active battle's own position bounds LOOK centered
+ * on screen (rather than set_map_bounds' whole-file bounds), without
+ * touching cam_x/cam_y at all. This is deliberately NOT "move the camera to
+ * x,y" (an earlier version of this feature did exactly that, via cam_x/cam_y
+ * directly, and got explicitly rejected for it): cam_x/cam_y is the user's
+ * own interactive viewport state - what WASD/drag-pan move, what
+ * get_cam_x/get_cam_y above report, and therefore what CURSOR_X()/CURSOR_Y()
+ * (replay_worker.c) and every query built on them see. A "center on the
+ * battle" feature that wrote into cam_x/cam_y would change the DEFAULT value
+ * those queries observe, and would fight the user's own WASD/drag pan the
+ * moment it re-applied.
+ *
+ * Also deliberately NOT folded into the shared view/projection transform
+ * either (render_frame built and tried that too, and it was ALSO rejected):
+ * shifting the grid background and the map-bounds box along with everything
+ * else reads as a camera snap to the eye, indistinguishable from actually
+ * moving cam_x/cam_y even though the number itself never changed. Applied
+ * per-object instead - added directly to each agent's and highlight's own
+ * world position in render_frame, nowhere else - so the grid and the box
+ * stay a rock-solid fixed reference frame and only the plotted dots visibly
+ * move, which is what actually reads as "this battle's units are drawn
+ * centered" rather than "the view just snapped".
+ *
+ * main.js recomputes this shift as
+ * (get_cam_x() - battle_center_x, get_cam_y() - battle_center_y) each time
+ * it wants a new battle to look centered; WASD/drag pan keeps moving
+ * cam_x/cam_y exactly as before and is visually additive on top of whatever
+ * shift is currently set, which is also what makes "stop auto-recentering
+ * once the user has manually panned" work for free on the JS side - the
+ * shift and the camera were never coupled to begin with. */
+void set_view_shift(float x, float y) {
+    view_shift_x = x;
+    view_shift_y = y;
+}
+
 void set_key_state(int key_idx, int is_pressed) { if (key_idx >= 0 && key_idx < 4) keys[key_idx] = is_pressed; }
 
 void apply_zoom(float delta_y) {
@@ -234,6 +287,16 @@ void render_frame(float dt_seconds) {
     mat4 projection;
     glm_ortho(-x_bound, x_bound, -y_bound, y_bound, -1.0f, 1.0f, projection);
 
+    // Grid, map-bounds box, and the view/projection itself are built from
+    // the RAW camera (cam_x/cam_y) only - view_shift (set_view_shift) never
+    // reaches this transform. It's applied per-object instead, only to
+    // agent/highlight positions below - the fixed reference frame (grid
+    // lines, the box) staying rock-solid is exactly what makes this read as
+    // "the units are drawn shifted" instead of "the camera just snapped",
+    // which is what happened when an earlier version of this folded the
+    // shift into cam_x/cam_y (rejected) and then into this shared vp matrix
+    // (also rejected, for the same reason - visually indistinguishable from
+    // an actual camera pan even though cam_x/cam_y itself never moved).
     mat4 view = GLM_MAT4_IDENTITY_INIT;
     glm_scale_uni(view, cam_zoom);
     vec3 translate_vec = {-cam_x, -cam_y, 0.0f};
@@ -270,8 +333,9 @@ void render_frame(float dt_seconds) {
     gl_vertex_attrib_pointer(attr_position_main, 3, GL_FLOAT, 0, 12, 0);
 
     for (int i = 0; i < active_agent_count; i++) {
-        float ax = agent_buffer[i * 3 + 0];
-        float ay = agent_buffer[i * 3 + 1];
+        // view_shift here, not in the shared vp above - see that comment.
+        float ax = agent_buffer[i * 3 + 0] + view_shift_x;
+        float ay = agent_buffer[i * 3 + 1] + view_shift_y;
         float team = agent_buffer[i * 3 + 2];
 
         mat4 model = GLM_MAT4_IDENTITY_INIT;
@@ -311,8 +375,11 @@ void render_frame(float dt_seconds) {
         gl_uniform3f(loc_uColor, 1.0f, 0.9f, 0.1f);
 
         for (int i = 0; i < active_highlight_count; i++) {
-            float hx = highlight_buffer[i * 2 + 0];
-            float hy = highlight_buffer[i * 2 + 1];
+            // Shifted along with the agents above, for the same reason -
+            // a highlight ring marks a query result relative to a specific
+            // agent's position, so it needs to move with it on screen.
+            float hx = highlight_buffer[i * 2 + 0] + view_shift_x;
+            float hy = highlight_buffer[i * 2 + 1] + view_shift_y;
 
             mat4 model = GLM_MAT4_IDENTITY_INIT;
             vec3 translate = {hx, hy, 0.0f};

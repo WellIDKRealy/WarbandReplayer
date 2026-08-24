@@ -159,7 +159,7 @@ typedef struct RosterEntry {
 } RosterEntry;
 static RosterEntry g_roster[MAX_AGENT_SLOTS];
 static sqlite3_int64 g_roster_synced_tick_id = -1;
-static int g_active_match_index = -1;
+int g_active_match_index = -1; /* not static - replay_export.c's on-demand replay.db/battle.db views read this, see replay_internal.h */
 
 /* Every kill within the current battle gets its own permanent corpse entry -
  * NOT indexed by agent_id (a reused engine slot: the same slot dies and
@@ -445,6 +445,25 @@ int replay_get_battle_ready_mask(void) {
     return mask;
 }
 
+/* Resolves matchIdx's [rowid_lo, rowid_hi] agent_states slice if not already
+ * known - the same bisection the prefetch worker would have done, just on
+ * g_db (the only path when prefetch never ran). Deliberately just the
+ * bisection, not the index-build/eviction that follows it in
+ * replay_ensure_battle_ready() below - factored out so a read-only "what's
+ * this battle's rowid range" query (the CURRENT_BATTLE_ROWID_LO/HI() SQL
+ * functions, see common_finish_load_setup) can resolve it without the
+ * heavier side effect of possibly evicting another battle just to answer a
+ * read. */
+static void ensure_bounds_known(int matchIdx) {
+    if (g_bounds_known[matchIdx]) return;
+    MatchInfo *m = &g_matches[matchIdx];
+    if (g_as_rowid_min < 0) agent_states_rowid_span_on(g_db, &g_as_rowid_min, &g_as_rowid_max);
+    m->rowid_lo = lower_bound_rowid_on(g_stmt_id_lookup, g_as_rowid_min, g_as_rowid_max, m->start_tick_id);
+    sqlite3_int64 hi = upper_bound_rowid_on(g_stmt_id_lookup, g_as_rowid_min, g_as_rowid_max, m->end_tick_id) - 1;
+    m->rowid_hi = (hi >= m->rowid_lo) ? hi : m->rowid_lo - 1; /* empty slice guard */
+    g_bounds_known[matchIdx] = 1;
+}
+
 int replay_ensure_battle_ready(int matchIdx) {
     if (matchIdx < 0 || matchIdx >= g_match_count) return 0;
     if (g_battle_ready[matchIdx]) return 0;
@@ -462,16 +481,7 @@ int replay_ensure_battle_ready(int matchIdx) {
     }
 
     MatchInfo *m = &g_matches[matchIdx];
-    if (!g_bounds_known[matchIdx]) {
-        /* self-healing fallback: nobody prefetched this battle, resolve its
-         * rowid slice ourselves (same bisection the prefetch worker would
-         * have done, just on g_db - the only path when prefetch never ran). */
-        if (g_as_rowid_min < 0) agent_states_rowid_span_on(g_db, &g_as_rowid_min, &g_as_rowid_max);
-        m->rowid_lo = lower_bound_rowid_on(g_stmt_id_lookup, g_as_rowid_min, g_as_rowid_max, m->start_tick_id);
-        sqlite3_int64 hi = upper_bound_rowid_on(g_stmt_id_lookup, g_as_rowid_min, g_as_rowid_max, m->end_tick_id) - 1;
-        m->rowid_hi = (hi >= m->rowid_lo) ? hi : m->rowid_lo - 1; /* empty slice guard */
-        g_bounds_known[matchIdx] = 1;
-    }
+    ensure_bounds_known(matchIdx);
 
     char sql[224];
     build_battle_index_sql(sql, matchIdx, m->rowid_lo, m->rowid_hi);
@@ -1019,6 +1029,119 @@ static int scan_matches(void) {
     return 0;
 }
 
+/* ---- SQL variable functions (SQL terminal "VARIABLES" feature) ----------
+ * Real SQLite scalar functions (sqlite3_create_function), registered once
+ * per g_db below - not text substitution, so they're usable anywhere a
+ * value works (WHERE clauses, computed columns, nested expressions) and are
+ * genuine SQL rather than a bespoke syntax layered on top. Every one reads
+ * live state directly on each call, never cached - a query using
+ * CURRENT_TICK() genuinely sees "the tick on screen right now" even while
+ * the user is actively scrubbing with the terminal open. Deliberately NOT
+ * registered with SQLITE_DETERMINISTIC: that flag tells SQLite the result
+ * only depends on its (here, zero) arguments and is safe to constant-fold/
+ * reuse within a statement - true for a real deterministic function, false
+ * for all of these by design, so marking it would let SQLite silently reuse
+ * a stale evaluation. */
+static void sqlfn_current_tick(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc; (void)argv;
+    if (g_current_tick_id < 0) { sqlite3_result_null(ctx); return; }
+    sqlite3_result_int64(ctx, g_current_tick_id);
+}
+static void sqlfn_current_time(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc; (void)argv;
+    sqlite3_result_double(ctx, g_relative_time);
+}
+static void sqlfn_current_battle(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc; (void)argv;
+    if (g_active_match_index < 0 || g_active_match_index >= g_match_count) { sqlite3_result_null(ctx); return; }
+    sqlite3_result_text(ctx, g_matches[g_active_match_index].faction_text, -1, SQLITE_TRANSIENT);
+}
+static void sqlfn_current_battle_tick_start(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc; (void)argv;
+    if (g_active_match_index < 0 || g_active_match_index >= g_match_count) { sqlite3_result_null(ctx); return; }
+    sqlite3_result_int64(ctx, g_matches[g_active_match_index].start_tick_id);
+}
+static void sqlfn_current_battle_tick_end(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc; (void)argv;
+    if (g_active_match_index < 0 || g_active_match_index >= g_match_count) { sqlite3_result_null(ctx); return; }
+    sqlite3_result_int64(ctx, g_matches[g_active_match_index].end_tick_id);
+}
+/* The two ROWID variants resolve the bisection on demand (ensure_bounds_known,
+ * just above replay_ensure_battle_ready) rather than requiring the battle to
+ * already be fully "ready" (index + prepared statement built) - a read-only
+ * variable lookup shouldn't have to pay for, or risk evicting another
+ * primed battle to make room for, a full battle build it doesn't need. */
+static void sqlfn_current_battle_rowid_lo(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc; (void)argv;
+    if (g_active_match_index < 0 || g_active_match_index >= g_match_count) { sqlite3_result_null(ctx); return; }
+    ensure_bounds_known(g_active_match_index);
+    sqlite3_result_int64(ctx, g_matches[g_active_match_index].rowid_lo);
+}
+static void sqlfn_current_battle_rowid_hi(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc; (void)argv;
+    if (g_active_match_index < 0 || g_active_match_index >= g_match_count) { sqlite3_result_null(ctx); return; }
+    ensure_bounds_known(g_active_match_index);
+    sqlite3_result_int64(ctx, g_matches[g_active_match_index].rowid_hi);
+}
+/* World-space position of the crosshair fixed at screen center - NOT the
+ * mouse pointer. The camera is centered on (cam_x, cam_y) by construction
+ * (main.c's ortho projection is built centered there), so the crosshair's
+ * world position simply IS (cam_x, cam_y) - no inverse-projection math
+ * needed. cam_x/cam_y themselves live in main.wasm, a separate WASM
+ * instance/memory from this one (the graphics module vs. the SQL engine) -
+ * main.js is the only thing that can see both, so it reads them and forwards
+ * the value here via replay_set_cursor_world_pos() right before every query. */
+static double g_cursor_world_x = 0.0, g_cursor_world_y = 0.0;
+void replay_set_cursor_world_pos(double x, double y) { g_cursor_world_x = x; g_cursor_world_y = y; }
+static void sqlfn_cursor_x(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc; (void)argv;
+    sqlite3_result_double(ctx, g_cursor_world_x);
+}
+static void sqlfn_cursor_y(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc; (void)argv;
+    sqlite3_result_double(ctx, g_cursor_world_y);
+}
+
+typedef void (*sql_scalar_fn)(sqlite3_context *, int, sqlite3_value **);
+static int register_sql_variable_functions(void) {
+    static const struct { const char *name; sql_scalar_fn fn; } vars[] = {
+        { "CURRENT_TICK",              sqlfn_current_tick },
+        { "CURRENT_TIME",              sqlfn_current_time },
+        { "CURRENT_BATTLE",            sqlfn_current_battle },
+        { "CURRENT_BATTLE_TICK_START", sqlfn_current_battle_tick_start },
+        { "CURRENT_BATTLE_TICK_END",   sqlfn_current_battle_tick_end },
+        { "CURRENT_BATTLE_ROWID_LO",   sqlfn_current_battle_rowid_lo },
+        { "CURRENT_BATTLE_ROWID_HI",   sqlfn_current_battle_rowid_hi },
+        { "CURSOR_X",                  sqlfn_cursor_x },
+        { "CURSOR_Y",                  sqlfn_cursor_y },
+    };
+    for (unsigned i = 0; i < sizeof(vars) / sizeof(vars[0]); i++) {
+        if (sqlite3_create_function(g_db, vars[i].name, 0, SQLITE_UTF8, 0, vars[i].fn, 0, 0) != SQLITE_OK) {
+            set_error("failed to register SQL variable function");
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* ---- live-edit-aware cache invalidation for replay.db/battle.db views ----
+ * (replay_export.c's on-demand r/b schemas) - a monotonic counter bumped by
+ * SQLite's own update hook on every row-level write to ANY table on this
+ * connection. Deliberately a cheap counter, not a real content hash: hashing
+ * actual row bytes on every write would cost real time against a
+ * multi-million-row table for a feature that only needs to answer "has
+ * ANYTHING changed since r/b was last built" - a monotonic generation number
+ * answers that exactly as well as a content hash would, at zero marginal
+ * cost per write. Paired with generator_sql_sha256-based staleness
+ * (replay_export.c) to form the full (matchIdx, data_generation, sql_hash)
+ * cache key those views are built against. */
+static int g_data_generation = 0;
+int replay_get_data_generation(void) { return g_data_generation; }
+static void on_row_changed(void *pArg, int op, const char *zDb, const char *zTable, sqlite3_int64 rowid) {
+    (void)pArg; (void)op; (void)zDb; (void)zTable; (void)rowid;
+    g_data_generation++;
+}
+
 /* Shared by replay_finish_load() (a full multi-battle source upload) and
  * replay_finish_load_battle_file() (Phase 5: a single already-exported
  * battle's replay.db loaded directly) - both open the same OPFS-backed
@@ -1037,6 +1160,10 @@ static int common_finish_load_setup(void) {
 
     int rc = sqlite3_open_v2("main.db", &g_db, SQLITE_OPEN_READWRITE, 0);
     if (rc != SQLITE_OK) { set_error("sqlite3_open_v2 failed"); return -1; }
+
+    if (register_sql_variable_functions() != 0) return -13;
+    g_data_generation = 0; /* fresh connection, fresh generation - see on_row_changed above */
+    sqlite3_update_hook(g_db, on_row_changed, 0);
 
     /* temp_store=FILE (not MEMORY): the external sorter CREATE INDEX drives
      * over agent_states (2M+ rows) needs a real spill target once its

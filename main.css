@@ -1,3 +1,4 @@
+@charset "UTF-8";
 body, html {
     margin: 0; padding: 0;
     width: 100vw; height: 100vh;
@@ -68,37 +69,41 @@ canvas {
    debug mode rather than via a checkbox change). Chat is the one panel
    that's always visible and never goes through setPanelVisible - see its
    own bottom-anchoring comment below. */
-#chat-box {
+[data-panel-type="chat-box"] {
     bottom: 110px; /* Sits perfectly above the timeline controller */
     left: 20px;
     width: 360px;
 }
 
-/* Chat is bottom-anchored (see main.js's reanchorChatBottom) - as messages
-   accumulate the panel should visibly grow taller, not just internally
-   scroll within a small fixed box, so this needs real headroom past the
-   generic 150px every other .panel-content uses. Still caps out somewhere
-   (unbounded growth would eventually run into the hamburger/timeline) and
-   scrolls internally past that. The minimized (collapsed-to-0) case is set
-   inline by main.js's toggleMinimize() instead of a `.minimized
-   #chat-content` override here - see the comment there for why. */
-#chat-content {
-    max-height: 400px;
+/* The original chat-box instance is bottom-anchored (see main.js's
+   reanchorChatBottom) - as messages accumulate the panel should visibly grow
+   taller, not just internally scroll within a small fixed box, so this needs
+   real headroom past the generic 150px every other .panel-content uses.
+   Still caps out somewhere (unbounded growth would eventually run into the
+   hamburger/timeline) and scrolls internally past that. The minimized
+   (collapsed-to-0) case is set inline by main.js's toggleMinimize() instead
+   of a `.minimized .chat-content` override here - see the comment there for
+   why. (Class-based, not ID-based: a cloned chat window - see
+   openNewPanelInstance - reuses this exact rule; clones are plain
+   draggable/resizable panels, not bottom-anchored, but their content area
+   should still get the same generous default height.) */
+.chat-content {
+    max-height: 424px; /* 400px + 24px padding - see .panel-content's box-sizing comment */
 }
 
-#log-box {
+[data-panel-type="log-box"] {
     top: 80px;
     left: 20px;
     width: 280px;
 }
 
-#debug-panel {
+[data-panel-type="debug-panel"] {
     top: 220px;
     right: 20px;
     width: 320px;
 }
 
-#debug-panel button {
+[data-panel-type="debug-panel"] button {
     background: transparent;
     border: 1px solid rgba(0, 255, 0, 0.4);
     color: #00ff00;
@@ -109,11 +114,11 @@ canvas {
     cursor: pointer;
 }
 
-#debug-panel button:hover {
+[data-panel-type="debug-panel"] button:hover {
     background: rgba(0, 255, 0, 0.15);
 }
 
-#debug-panel input {
+[data-panel-type="debug-panel"] input {
     background: #111;
     border: 1px solid rgba(0, 255, 0, 0.3);
     color: #00ff00;
@@ -121,20 +126,20 @@ canvas {
     font-size: 10px;
 }
 
-#debug-output {
+.debug-output {
     white-space: pre-wrap;
     word-break: break-all;
     margin: 6px 0 0 0;
     color: #0c0;
 }
 
-#sql-terminal-panel {
+[data-panel-type="sql-terminal-panel"] {
     top: 20px;
     right: 20px;
     width: 440px;
 }
 
-#sql-terminal-panel textarea {
+[data-panel-type="sql-terminal-panel"] textarea {
     width: 100%;
     box-sizing: border-box;
     background: #111;
@@ -145,7 +150,10 @@ canvas {
     resize: vertical;
 }
 
-#sql-terminal-panel button, #sql-terminal-panel select {
+[data-panel-type="sql-terminal-panel"] button, [data-panel-type="sql-terminal-panel"] select,
+[data-panel-type="schema-explorer-panel"] button, [data-panel-type="schema-explorer-panel"] select,
+[data-panel-type="sql-data-viewer-panel"] button,
+[data-panel-type="generator-script-popout-panel"] button {
     background: transparent;
     border: 1px solid rgba(0, 255, 0, 0.4);
     color: #00ff00;
@@ -156,44 +164,649 @@ canvas {
     cursor: pointer;
 }
 
-#sql-terminal-panel button:hover {
+[data-panel-type="sql-terminal-panel"] button:hover, [data-panel-type="schema-explorer-panel"] button:hover,
+[data-panel-type="sql-data-viewer-panel"] button:hover,
+[data-panel-type="generator-script-popout-panel"] button:hover {
     background: rgba(0, 255, 0, 0.15);
 }
 
-#sql-terminal-status {
+/* <select> specifically: background:transparent above is not enough on its
+   own - confirmed directly (computed appearance:auto, rendering a visible
+   native white widget well UNDER the color override regardless) - browsers
+   draw native OS widget chrome for a <select> unless appearance is
+   explicitly disabled. appearance:none strips that, and since it also
+   removes the native dropdown arrow, a small hand-drawn one (a CSS
+   background-image triangle, not an image asset) replaces it so the control
+   doesn't look like it lost its affordance. */
+[data-panel-type="sql-terminal-panel"] select, [data-panel-type="schema-explorer-panel"] select {
+    appearance: none;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    padding-right: 18px;
+    background-image: linear-gradient(45deg, transparent 50%, #00ff00 50%), linear-gradient(135deg, #00ff00 50%, transparent 50%);
+    background-position: calc(100% - 11px) center, calc(100% - 7px) center;
+    background-size: 5px 5px, 5px 5px;
+    background-repeat: no-repeat;
+}
+
+[data-panel-type="sql-terminal-panel"] select option, [data-panel-type="schema-explorer-panel"] select option {
+    background: #0a0a0a;
+    color: #00ff00;
+}
+
+/* One flex-wrap row per logical control group, not a fixed block <div> per
+   group - a block <div> can never share a line with another <div>'s
+   controls no matter how much horizontal room opens up, which is exactly
+   what made resizing the panel wider (main.js's makeResizable()) do nothing
+   for these: the buttons stayed stuck exactly where they started instead of
+   consolidating onto fewer rows. flex-wrap here means they now genuinely
+   reflow with the panel's real width, same as any content should. */
+.button-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+}
+
+.sql-terminal-status {
     margin-top: 4px;
     color: #888;
     font-size: 10px;
 }
 
-#sql-terminal-results {
+.schema-explorer-status {
+    margin-top: 4px;
+    color: #888;
+    font-size: 10px;
+    min-height: 12px; /* reserves its own line so appearing/disappearing text doesn't shift the tree below it */
+}
+
+.schema-explorer-status.is-error {
+    color: #ff5555;
+}
+
+/* Every .panel-content's real children live one level deeper, inside a
+   .panel-zoom-wrap (main.js's ensurePanelZoomWrap) - a plain, unconstrained
+   div that Ctrl+Scroll zooming (main.js's applyTextZoomDelta) is applied to
+   INSTEAD of .panel-content itself, specifically so zooming can never touch
+   .panel-content's own box model (its max-height cap, its inline resize/
+   minimize state) - only .panel-content's already-existing overflow-y:auto
+   clips/scrolls the now-larger zoomed wrap, so the panel's own on-screen
+   footprint never changes size as you zoom, only how much of it needs
+   scrolling to see. No box-model opinions of its own beyond what's needed
+   so it doesn't collapse while near-empty. */
+.panel-zoom-wrap {
+    min-height: 100%;
+}
+
+/* .sql-terminal-content's flex column lives on ITS zoom wrap, not directly
+   on .panel-content, for the same reason as above - so the results table -
+   and only the results table - can still consume whatever room is left over
+   once the DB selector row/editor/buttons/status take their own natural
+   size, instead of being capped at a fixed 240px regardless of how much
+   taller the panel itself gets resized to. Confirmed directly before this
+   fix: resizing the panel from 174px to 474px tall left .sql-terminal-results
+   still pinned at exactly 240px, both wasting the new space AND (since its
+   content could already exceed 240px) overflowing past its own container's
+   bottom edge instead of being contained by it. `height` (not `min-height`)
+   here specifically: at zoom:1 this must match .panel-content's own
+   available height exactly so flex:1 1 auto below behaves identically to
+   before zooming existed at all - only once actually zoomed does the wrap
+   render taller than that on screen (zoom scales the rendered box AFTER
+   this 100% is resolved against the real, unzoomed .panel-content), which
+   is what makes the extra space scrollable rather than the results table
+   just staying pinned to its un-zoomed size. Class-based (not ID-based)
+   since every SQL Terminal window instance - the original plus any opened
+   via openNewPanelInstance - needs this same layout independently. */
+.sql-terminal-content > .panel-zoom-wrap {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+.sql-terminal-results {
+    flex: 1 1 auto;
+    min-height: 60px; /* never collapse to nothing while still reserving visible room for a result */
     overflow: auto;
-    max-height: 240px;
     margin-top: 6px;
 }
 
-#sql-terminal-results table {
-    border-collapse: collapse;
+.sql-terminal-results table {
+    /* separate + zero spacing, NOT collapse - with collapsed borders, the
+       border shared between the sticky header row and the row scrolling
+       underneath it gets painted OUTSIDE the header cell's own background
+       box, so a sliver of the scrolled row's pixels shows through right at
+       the header's bottom edge even though the header background itself is
+       opaque (the literal "background data pixels barely get above header"
+       bug report). Separate borders make every cell paint its own full
+       border inside its own box - adjacent cells' borders land on the same
+       pixel and still look like one line, but nothing can leak past a
+       sticky cell's edge anymore. */
+    border-collapse: separate;
+    border-spacing: 0;
     width: 100%;
     font-size: 10px;
 }
 
-#sql-terminal-results th, #sql-terminal-results td {
+.sql-terminal-results th, .sql-terminal-results td {
     border: 1px solid rgba(0, 255, 0, 0.2);
     padding: 2px 5px;
     text-align: left;
     white-space: nowrap;
 }
 
-#sql-terminal-results th {
-    background: rgba(0, 255, 0, 0.08);
+.sql-terminal-results th {
+    /* Opaque, NOT the translucent rgba(0,255,0,0.08) this used to be - a
+       sticky header needs a real background to actually occlude the data
+       rows scrolling underneath it, otherwise both layers show through and
+       blend together at once (confirmed as the literal "headers overlap
+       with data, making them unreadable" bug report - the header was never
+       failing to STICK, it just couldn't hide anything under itself once
+       stuck). #0a0a0a matches the other solid dark surfaces in this theme
+       (.autocomplete-list, generator-script editors' own backdrop). */
+    background: #0a0a0a;
     position: sticky;
     top: 0;
 }
 
-#sql-terminal-results tr:hover td {
+.sql-terminal-results tr:hover td {
     background: rgba(0, 255, 0, 0.08);
+}
+
+/* Editable results (main.js's buildResultsRow/collectResultsTableEdits) -
+   shared by the main SQL Terminal's own results area AND the pop-out Data
+   Viewer (both build their table via the exact same functions and this
+   exact same .sql-terminal-results class, which is what actually keeps the
+   two visually identical rather than merely "similar"). A cell only becomes
+   contenteditable when the source query is a plain single-table SELECT
+   (queryWriteBackTable) - read-only results render exactly as before, no
+   editing affordance shown at all. */
+.sql-terminal-results td[contenteditable="true"] {
+    cursor: text;
+}
+
+.sql-terminal-results td[contenteditable="true"]:focus {
+    outline: 1px solid #0f0;
+    outline-offset: -1px;
+    background: rgba(0, 255, 0, 0.05);
+}
+
+/* An edited-but-not-yet-saved cell - distinct from :hover/:focus so it's
+   still visible after the cursor moves elsewhere, right up until Save
+   changes (or a re-run) clears it. */
+.sql-terminal-results td.cell-dirty {
+    background: rgba(255, 170, 0, 0.18);
+    color: #ffcc66;
+}
+
+.sql-terminal-results td.results-row-delete {
+    padding: 0 2px;
+    text-align: center;
+    width: 1%; /* shrink-to-fit - just wide enough for the × button, never eating space from real columns */
+}
+
+.sql-terminal-results td.results-row-delete button {
+    background: transparent;
+    border: 1px solid rgba(255, 85, 85, 0.4);
+    color: #ff5555;
+    font-family: inherit;
+    font-size: 10px;
+    line-height: 1;
+    padding: 1px 5px;
     cursor: pointer;
+}
+
+.sql-terminal-results td.results-row-delete button:hover {
+    background: rgba(255, 85, 85, 0.15);
+}
+
+/* A row marked for deletion (the × was clicked) - struck through and
+   dimmed so it reads as "gone" immediately, without actually removing it
+   from the DOM until Save changes turns it into a real DELETE. Clicking ×
+   again un-marks it (results-row-delete's own onclick toggles this). */
+.sql-terminal-results tr.results-row-deleted td {
+    text-decoration: line-through;
+    color: #666;
+    background: rgba(255, 85, 85, 0.06);
+}
+
+.sql-terminal-results tr.results-row-deleted td[contenteditable] {
+    cursor: default;
+}
+
+.sql-db-status {
+    font-size: 10px;
+    color: #888;
+    margin-left: 6px;
+}
+
+/* Syntax-highlighting overlay (main.js's renderSqlHighlight()): the real
+   <textarea> stays in normal flow (so rows="3"/resize:vertical keep working
+   exactly as before - only its own height drives the wrapper's height); the
+   colored backdrop is absolutely positioned on top of it and must match its
+   box model EXACTLY (padding/border-width/font/line-height) for the two
+   texts to land on the same pixels. Text itself is invisible on the real
+   textarea (color:transparent) - only its caret shows - so what's actually
+   visible is always the backdrop's colored spans underneath. */
+.sql-terminal-editor-wrap {
+    position: relative;
+}
+
+.sql-terminal-highlight {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    margin: 0;
+    padding: 4px;
+    border: 1px solid transparent; /* same WIDTH as the textarea's real border, transparent so it doesn't double up */
+    box-sizing: border-box;
+    font-family: inherit;
+    font-size: 11px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    overflow: hidden; /* the real textarea owns scrolling - main.js mirrors scrollTop/scrollLeft onto this */
+    color: #0f0;
+    pointer-events: none;
+    z-index: 0;
+}
+
+[data-panel-type="sql-terminal-panel"] textarea.sql-terminal-input {
+    position: relative;
+    z-index: 1;
+    background: transparent;
+    color: transparent;
+    caret-color: #0f0;
+    line-height: 1.4;
+    padding: 4px;
+}
+
+/* Token colors: distinct HUES per category, not shades of one hue - the
+   previous palette used near-identical greens for keyword/identifier
+   (#00ff00 vs #0f0, literally the same color) and dim green-gray for
+   comments/operators, all of which sit right on top of this app's own
+   default green text and each other. Hue-separated palettes (Solarized,
+   One Dark/Monokai, etc.) exist specifically because distinguishing tokens
+   by BRIGHTNESS alone doesn't work well, especially against a saturated
+   background color like this app's green - these values are Solarized
+   Dark's own accent hues (https://ethanschoonover.com/solarized/), each
+   brightened somewhat from Solarized's originals since that scheme assumes
+   a dark teal background (#002b36), not this app's near-black one, and
+   would read as too muted here otherwise. Only .tok-identifier keeps the
+   app's own signature green - that's "plain code", not a category needing
+   its own color. */
+.tok-keyword { color: #4fa8f5; font-weight: bold; } /* Solarized blue */
+.tok-identifier { color: #00ff00; } /* app's own default text color - plain code, not a highlighted category */
+.tok-string { color: #ffaa00; } /* Solarized yellow/orange */
+.tok-number { color: #c78bff; } /* Solarized violet */
+.tok-comment { color: #7a8a94; font-style: italic; } /* neutral gray - deliberately NOT green-tinted, reads as dimmed rather than a dim identifier */
+.tok-param { color: #ff6ec7; } /* Solarized magenta */
+.tok-operator, .tok-punct { color: #4dd9c8; } /* Solarized cyan */
+
+/* Autocomplete suggestion list (main.js's positionAutocompleteList/
+   renderAutocompleteList) - ONE shared element appended straight to <body>
+   (ensureSharedAutocompleteList), not embedded inside whichever panel is
+   being edited. position:fixed + viewport coordinates (not absolute +
+   coordinates relative to a panel-internal wrap) so it floats freely above
+   every window's own border/overflow/stacking context - the previous
+   embedded-per-panel version could render partly or fully clipped behind
+   the panel's own edge when editing a line near the bottom. z-index is a
+   large constant, deliberately not tied to panelZIndexCounter (main.js) -
+   this must outrank every panel unconditionally, including whichever one is
+   currently frontmost, and a fixed huge number is simpler and just as safe
+   as reading+exceeding a counter that only ever grows. */
+.autocomplete-list {
+    position: fixed;
+    z-index: 2147483000;
+    background: #0a0a0a;
+    border: 1px solid rgba(0, 255, 0, 0.4);
+    max-height: 160px;
+    overflow-y: auto;
+    min-width: 140px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.6);
+}
+
+.autocomplete-item {
+    padding: 3px 8px;
+    font-size: 11px;
+    color: #0f0;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.autocomplete-item.selected, .autocomplete-item:hover {
+    background: rgba(0, 255, 0, 0.2);
+}
+
+/* Schema explorer tree (main.js's renderSchemaExplorerTree) - indentation
+   via nested padding, .collapsed hides a node's children (table rows start
+   collapsed by default; schemas start expanded - see the collapsed class
+   applied per-node in renderSchemaExplorerTree). */
+[data-panel-type="schema-explorer-panel"] {
+    top: 20px;
+    right: 480px;
+    width: 380px;
+}
+
+.schema-tree-node {
+    margin: 2px 0;
+}
+
+.schema-tree-schema > .schema-tree-tables {
+    margin-left: 4px;
+    border-left: 1px solid rgba(0, 255, 0, 0.15);
+    padding-left: 6px;
+}
+
+.schema-tree-table > .schema-tree-columns {
+    margin-left: 12px;
+    border-left: 1px solid rgba(0, 255, 0, 0.1);
+    padding-left: 6px;
+}
+
+.schema-tree-header {
+    cursor: pointer;
+    font-size: 11px;
+    color: #0f0;
+    user-select: none;
+}
+
+.schema-tree-schema > .schema-tree-header {
+    font-weight: bold;
+}
+
+.schema-tree-header::before {
+    content: "▾ ";
+    display: inline-block;
+    width: 10px;
+}
+
+.collapsed > .schema-tree-header::before {
+    content: "▸ ";
+}
+
+.collapsed > .schema-tree-tables,
+.collapsed > .schema-tree-columns,
+.collapsed > .generator-script-editor {
+    display: none;
+}
+
+.schema-tree-column {
+    font-size: 10px;
+    color: #888;
+    padding: 1px 0 1px 12px;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+}
+
+/* Same hue-differentiated approach as the .tok-* token colors (main.css's
+   own comment on that palette): PK gets the "important/highlighted" amber,
+   FK the "reference/link" blue, NOT NULL a neutral constraint gray - three
+   different signals, three different colors, not three shades of one. */
+.schema-tree-badge {
+    font-size: 9px;
+    font-weight: bold;
+    padding: 1px 4px;
+    border-radius: 2px;
+    white-space: nowrap;
+}
+
+.schema-tree-badge-pk {
+    color: #ffaa00;
+    background: rgba(255, 170, 0, 0.12);
+    border: 1px solid rgba(255, 170, 0, 0.35);
+}
+
+.schema-tree-badge-fk {
+    color: #4fa8f5;
+    background: rgba(79, 168, 245, 0.12);
+    border: 1px solid rgba(79, 168, 245, 0.35);
+}
+
+.schema-tree-badge-notnull {
+    color: #999;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    font-weight: normal;
+}
+
+.generator-script-editor {
+    margin: 8px 0 4px 4px;
+    padding: 6px;
+    border: 1px solid rgba(0, 255, 0, 0.15);
+}
+
+.generator-script-label {
+    font-size: 10px;
+    color: #888;
+    margin-bottom: 3px;
+}
+
+/* Same backdrop-<pre>-behind-transparent-textarea technique as
+   #sql-terminal-editor-wrap/#sql-terminal-highlight above, but class-based
+   rather than ID-based: several generator-script editors (one per schema)
+   can exist on screen simultaneously, each needing its own backdrop kept in
+   sync with its own textarea (main.js's attachSqlHighlighting). Box model
+   (padding/border-width/font/line-height) must match the textarea rule
+   below EXACTLY for the two texts to land on the same pixels. */
+.generator-script-editor-wrap {
+    position: relative;
+    background: #111;
+    border: 1px solid rgba(0, 255, 0, 0.3);
+}
+
+.generator-script-highlight {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    margin: 0;
+    padding: 4px;
+    border: 1px solid transparent;
+    box-sizing: border-box;
+    font-family: inherit;
+    font-size: 10px;
+    line-height: 1.4;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    overflow: hidden;
+    color: #0f0;
+    pointer-events: none;
+    z-index: 0;
+}
+
+.generator-script-textarea {
+    position: relative;
+    z-index: 1;
+    width: 100%;
+    box-sizing: border-box;
+    /* transparent, NOT #111 - the wrapper (.generator-script-editor-wrap,
+       above) already paints that dark background BEHIND the colored
+       backdrop; an opaque background here, on the element sitting ABOVE
+       (z-index:1) the backdrop (z-index:0), would completely hide every
+       colored span underneath it - confirmed as a real bug this way (every
+       generator script rendered as a plain black box, no syntax color
+       visible at all, only the textarea's own transparent-by-default text
+       reachable via selection). Matches the main SQL terminal's own
+       textarea, which already gets this right. */
+    background: transparent;
+    color: transparent;
+    caret-color: #0f0;
+    border: 1px solid rgba(0, 255, 0, 0.3);
+    font-family: inherit;
+    font-size: 10px;
+    line-height: 1.4;
+    padding: 4px;
+    resize: vertical;
+}
+
+.generator-script-status {
+    font-size: 10px;
+    color: #888;
+    margin-top: 3px;
+}
+
+.generator-script-status.is-error {
+    color: #ff5555;
+}
+
+/* Pop-out generator script window: a genuinely separate, larger "proper text
+   editor" layout, NOT the compact tree-embedded .generator-script-editor
+   above reused verbatim. No buttons anywhere - the editor fills the whole
+   window edge to edge and resizes with it, Run is Ctrl+Enter
+   (main.js's wireGeneratorScriptEditorBehavior), and status/errors show in
+   an Emacs-style minibuffer line pinned to the bottom instead of a toolbar.
+   Still shares the exact same backdrop-<pre>-behind-transparent-textarea
+   technique as the compact version - only the DOM/box layout differs. */
+[data-panel-type="generator-script-popout-panel"] {
+    top: 20px;
+    right: 20px;
+    width: 640px;
+}
+
+[data-panel-type="generator-script-popout-panel"] .panel-content {
+    /* height, not just max-height: an editor area sized via height:100% below
+       it (.panel-zoom-wrap/.generator-popout-root/-editor-wrap) needs a
+       genuinely DEFINITE parent height to resolve that percentage against -
+       max-height alone doesn't count as definite per spec (Chrome resolves
+       it anyway, Firefox doesn't - confirmed as a real Firefox-only "editor
+       doesn't fill/resize with the window" bug). main.js's makeResizable/
+       toggleMinimize set this same inline once the user manually resizes or
+       minimizes, this is just the un-resized starting value. */
+    height: 480px;
+    max-height: 480px;
+    padding: 0; /* edge-to-edge - no generic .panel-content padding fighting the "fill it fully" editor */
+}
+
+/* Same reasoning as .sql-terminal-content > .panel-zoom-wrap above: the flex
+   column lives on the zoom wrap, not .panel-content itself, so Ctrl+Scroll
+   zooming can never touch .panel-content's own resize/max-height box. */
+[data-panel-type="generator-script-popout-panel"] .panel-content > .panel-zoom-wrap {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+.generator-popout-root {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+}
+
+.generator-popout-editor-wrap {
+    position: relative;
+    background: #111;
+    flex: 1 1 auto;
+    min-height: 0; /* let flex actually shrink/grow with the window instead of overflowing it */
+}
+
+/* Emacs-style minibuffer/echo area: a thin status+error line pinned to the
+   bottom of the window - the ONLY chrome around the editor, replacing the
+   old button toolbar entirely. */
+.generator-popout-minibuffer {
+    flex: 0 0 auto;
+    font-size: 11px;
+    color: #888;
+    padding: 3px 8px;
+    border-top: 1px solid rgba(0, 255, 0, 0.2);
+    background: rgba(0, 0, 0, 0.35);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.generator-popout-minibuffer.is-error {
+    color: #ff5555;
+}
+
+.generator-popout-highlight {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    margin: 0;
+    padding: 8px;
+    border: none; /* must match .generator-popout-textarea's box model exactly - see that rule's comment */
+    box-sizing: border-box;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    overflow: hidden;
+    color: #0f0;
+    pointer-events: none;
+    z-index: 0;
+}
+
+.generator-popout-textarea {
+    position: relative;
+    z-index: 1;
+    width: 100%;
+    height: 100%;
+    box-sizing: border-box;
+    background: transparent; /* see .generator-script-textarea's comment - same rule applies */
+    color: transparent;
+    caret-color: #0f0;
+    border: none; /* edge-to-edge, no-chrome buffer - the minibuffer's own top border is the only separator */
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.5;
+    padding: 8px;
+    resize: none; /* window resize handles govern size, not the textarea's own handle */
+}
+
+[data-panel-type="sql-docs-panel"] {
+    top: 20px;
+    right: 20px;
+    width: 420px;
+}
+
+.sql-docs-content {
+    max-height: 400px;
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+.sql-docs-content p {
+    margin: 0 0 10px 0;
+}
+
+.sql-docs-content ul {
+    margin: 4px 0 10px 0;
+    padding-left: 18px;
+}
+
+/* Color itself comes from the real tokenizer now (main.js's
+   highlightStaticCode(), applied once at startup - see the
+   `.tok-*` rules above) rather than one flat color for the whole
+   element - only the box (background/padding) is styled here. */
+.sql-docs-content code {
+    background: rgba(0, 255, 0, 0.08);
+    padding: 1px 3px;
+    border-radius: 2px;
+}
+
+[data-panel-type="sql-data-viewer-panel"] {
+    top: 20px;
+    right: 20px;
+    width: 480px;
+}
+
+/* The Data Viewer's actual result grid is a plain .sql-terminal-results
+   table (main.js's renderSqlDataViewer) - the exact same class/markup the
+   main SQL Terminal's own results use, not a separate style of its own, so
+   the two can never visually drift apart again (this used to be a raw
+   tab-separated <textarea> here - inconsistent styling from the terminal's
+   real table AND the source of a real cursor-position bug: a textarea's
+   caret follows character offsets, not visual tab-stop columns, so it could
+   land far from where the text it was next to actually rendered). */
+.sql-data-viewer-note {
+    font-size: 10px;
+    color: #888;
+    margin: 4px 0;
+}
+
+.sql-data-viewer-status {
+    font-size: 10px;
+    color: #888;
+    margin-top: 4px;
 }
 
 /* Draggable by mousedown-and-move (main.js's makeDraggable()); a plain click
@@ -214,9 +827,47 @@ canvas {
     letter-spacing: 1px;
 }
 
+/* Groups the close button with the existing minimize toggle-icon on the
+   header's right side (justify-content:space-between only expects two
+   children: the title span and this wrapper) - main.js's wirePanelInstance
+   attaches both buttons' click handlers programmatically. */
+.panel-header-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+/* Close (x): hides the original singleton instance of a panel (same as
+   unchecking its hamburger checkbox), or fully removes a cloned instance
+   from the document (main.js's closePanelInstance). stopPropagation in the
+   click handler keeps this from also triggering the header's own
+   drag-to-move/click-to-minimize behavior. */
+.panel-close-btn {
+    cursor: pointer;
+    font-size: 14px;
+    line-height: 1;
+    opacity: 0.7;
+}
+
+.panel-close-btn:hover {
+    opacity: 1;
+    color: #ff5555;
+}
+
 .panel-content {
+    /* border-box, not the default content-box: main.js's makeResizable()
+       measures/sets height via offsetHeight and inline min/max-height,
+       which are only consistent with each other under border-box (content-
+       box would double-count this padding into every resize, growing the
+       box 24px taller than the mouse actually moved - confirmed directly).
+       174px (was 150px before this) keeps the un-resized default's visible
+       content area pixel-identical to before - border-box makes max-height
+       include the 24px of vertical padding it previously excluded, so the
+       cap needs the same 24px added back to still net out to 150px of
+       actual content. */
+    box-sizing: border-box;
     padding: 12px;
-    max-height: 150px;
+    max-height: 174px;
     overflow-y: auto;
     font-size: 11px;
     transition: max-height 0.2s ease-out, padding 0.2s ease-out;
@@ -231,6 +882,51 @@ canvas {
 
 .minimized .panel-header {
     border-bottom: none;
+}
+
+/* 8 invisible resize hit-zones per panel (main.js's makeResizable()) - 4
+   edges + 4 corners, straddling the panel's own border (negative offsets)
+   the way a real OS window's resize border works: no visible affordance at
+   rest, cursor is the only hint, exactly on hover. Corners sit above the
+   edges (DOM order: edges appended first, corners last) and are small
+   enough that a mouse near a corner always lands on the diagonal cursor,
+   not one of the two edges it's between. Hidden while minimized: a
+   collapsed panel has nothing to resize, and (main.js's toggleMinimize())
+   the collapse itself depends on nothing fighting .panel-content's height
+   back open. */
+.resize-handle {
+    position: absolute;
+}
+
+.resize-handle.n, .resize-handle.s {
+    left: 12px;
+    right: 12px;
+    height: 8px;
+    cursor: ns-resize;
+}
+.resize-handle.n { top: -4px; }
+.resize-handle.s { bottom: -4px; }
+
+.resize-handle.e, .resize-handle.w {
+    top: 12px;
+    bottom: 12px;
+    width: 8px;
+    cursor: ew-resize;
+}
+.resize-handle.e { right: -4px; }
+.resize-handle.w { left: -4px; }
+
+.resize-handle.ne, .resize-handle.nw, .resize-handle.se, .resize-handle.sw {
+    width: 14px;
+    height: 14px;
+}
+.resize-handle.ne { top: -4px; right: -4px; cursor: nesw-resize; }
+.resize-handle.nw { top: -4px; left: -4px; cursor: nwse-resize; }
+.resize-handle.se { bottom: -4px; right: -4px; cursor: nwse-resize; }
+.resize-handle.sw { bottom: -4px; left: -4px; cursor: nesw-resize; }
+
+.minimized .resize-handle {
+    display: none;
 }
 
 /* Top-Left. Replaces what used to be two separately floating corner buttons
@@ -309,6 +1005,36 @@ canvas {
 
 .menu-checkbox-item input {
     cursor: pointer;
+}
+
+/* "Open another" - clones a brand new, independent instance of that panel
+   type (main.js's openNewPanelInstance) alongside the checkbox that shows/
+   hides the original singleton instance. Sits at the row's far right via
+   the item's own flex layout + this margin-left:auto push. */
+.menu-open-new-btn {
+    margin-left: auto;
+    background: transparent;
+    border: 1px solid rgba(0, 255, 0, 0.4);
+    color: #00ff00;
+    font-family: inherit;
+    font-size: 12px;
+    /* flexbox centering, not line-height alone - a <button>'s own default
+       rendering (baseline alignment, UA-agent internal padding) leaves a
+       plain line-height:1 "+" glyph visibly off-center, confirmed directly;
+       flex is the reliable way to center content in a box regardless of
+       those per-browser quirks. */
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+.menu-open-new-btn:hover {
+    background: rgba(0, 255, 0, 0.15);
 }
 
 #export-btn {

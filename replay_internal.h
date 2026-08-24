@@ -16,6 +16,7 @@ typedef struct MatchInfo {
 } MatchInfo;
 
 extern sqlite3 *g_db; /* the one long-lived read-write connection, main.db as primary */
+extern int g_active_match_index; /* -1 = none yet; the battle replay.db/battle.db's on-demand views are built for, see replay_export.c */
 
 int replay_ensure_battle_ready(int matchIdx);
 int replay_get_match_count(void);
@@ -25,5 +26,6 @@ const char *replay_get_source_sha256_hex(void); /* 64 hex chars + NUL, valid aft
 const char *replay_get_source_filename(void);    /* JS-supplied via replay_get_filename_buf_ptr/replay_set_filename_len */
 double replay_get_source_size_bytes(void);
 double replay_get_export_time_unix(void);        /* JS-supplied via replay_set_export_time_unix, real Unix epoch seconds */
+int replay_get_data_generation(void); /* monotonic write counter (sqlite3_update_hook), see replay_worker.c */
 
 #endif

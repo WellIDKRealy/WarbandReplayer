@@ -1,6 +1,18 @@
 <!DOCTYPE html>
 <html>
     <head>
+	<!-- Must be the very first thing in <head> (spec requires it within the
+	     document's first 1024 bytes): with no charset signal at all, the
+	     browser has to guess the document's own encoding, and per the HTML5
+	     fallback rule, external scripts with no charset of their own (like
+	     main.js below) inherit THAT guess too - confirmed as the actual
+	     cause of real mojibake (the FK badge's "→" arrow literal in main.js
+	     rendering as "â†’") once main.js started containing real non-ASCII
+	     characters, not just main.css (which already declares its own
+	     @charset "UTF-8" separately - a <link>ed stylesheet's encoding is
+	     resolved independently of the HTML document's, so that fix never
+	     covered this). -->
+	<meta charset="UTF-8">
 	<script src="coi-shim.js"></script>
 	<title>Warband Replay Match Viewer</title>
 	<link rel="stylesheet" href="main.css">
@@ -16,12 +28,15 @@
 	     than the app trying to auto-arrange them. Each still keeps its own
 	     minimize/expand toggle (a plain click on the header, i.e. no real
 	     mouse movement - see makeDraggable). -->
-	<div id="chat-box" class="ui-panel">
+	<div id="chat-box" class="ui-panel" data-panel-type="chat-box">
 	    <div class="panel-header">
 		<span>[Chat Replay]</span>
-		<span class="toggle-icon">-</span>
+		<span class="panel-header-controls">
+		    <span class="toggle-icon">-</span>
+		    <span class="panel-close-btn" title="Close window">&times;</span>
+		</span>
 	    </div>
-	    <div id="chat-content" class="panel-content">
+	    <div class="panel-content chat-content">
 		<div>System: Chat initialized...</div>
 	    </div>
 	</div>
@@ -31,53 +46,173 @@
 	     hamburger menu's Panels checkboxes (main.js's setPanelVisible) -
 	     System Logs/VFS Trace default OFF even in debug mode, SQL Terminal
 	     defaults ON - rather than all three always appearing together. -->
-	<div id="log-box" class="ui-panel minimized" style="display:none;">
+	<div id="log-box" class="ui-panel minimized" style="display:none;" data-panel-type="log-box">
 	    <div class="panel-header">
 		<span>[System Logs]</span>
-		<span class="toggle-icon">-</span>
+		<span class="panel-header-controls">
+		    <span class="toggle-icon">-</span>
+		    <span class="panel-close-btn" title="Close window">&times;</span>
+		</span>
 	    </div>
-	    <div id="log-content" class="panel-content">
+	    <div class="panel-content log-content">
 		Replay engine offline. Upload database.
 	    </div>
 	</div>
-	<div id="debug-panel" class="ui-panel minimized" style="display:none;">
+	<div id="debug-panel" class="ui-panel minimized" style="display:none;" data-panel-type="debug-panel">
 	    <div class="panel-header">
 		<span>[Debug: VFS Trace]</span>
-		<span class="toggle-icon">-</span>
+		<span class="panel-header-controls">
+		    <span class="toggle-icon">-</span>
+		    <span class="panel-close-btn" title="Close window">&times;</span>
+		</span>
 	    </div>
-	    <div id="debug-content" class="panel-content">
+	    <div class="panel-content">
 		<div>
-		    match idx: <input id="debug-match-idx" type="number" value="0" min="0" style="width:40px;">
-		    <button onclick="debugCheckIndexVisible()">index visible?</button>
+		    match idx: <input class="debug-match-idx" type="number" value="0" min="0" style="width:40px;">
+		    <button onclick="debugCheckIndexVisible(this)">index visible?</button>
 		</div>
 		<div>
-		    <button onclick="debugGetVfsTraces()">get VFS traces</button>
-		    <button onclick="debugResetVfsTraces()">reset traces</button>
-		    <button onclick="debugGetLockCounters()">lock counters</button>
-		    <button onclick="debugGetHeapInfo()">heap info</button>
+		    <button onclick="debugGetVfsTraces(this)">get VFS traces</button>
+		    <button onclick="debugResetVfsTraces(this)">reset traces</button>
+		    <button onclick="debugGetLockCounters(this)">lock counters</button>
+		    <button onclick="debugGetHeapInfo(this)">heap info</button>
 		</div>
-		<pre id="debug-output"></pre>
+		<pre class="debug-output"></pre>
 	    </div>
 	</div>
-	<div id="sql-terminal-panel" class="ui-panel minimized" style="display:none;">
+	<div id="sql-terminal-panel" class="ui-panel minimized" style="display:none;" data-panel-type="sql-terminal-panel">
 	    <div class="panel-header">
 		<span>[SQL Terminal]</span>
-		<span class="toggle-icon">-</span>
+		<span class="panel-header-controls">
+		    <span class="toggle-icon">-</span>
+		    <span class="panel-close-btn" title="Close window">&times;</span>
+		</span>
 	    </div>
-	    <div id="sql-terminal-content" class="panel-content">
-		<textarea id="sql-terminal-input" rows="3" placeholder="SELECT * FROM ticks LIMIT 10"></textarea>
-		<div>
-		    <button onclick="sqlTerminalRun()">Run</button>
-		    <button onclick="sqlTerminalCheckpointSave()">Save checkpoint</button>
-		    <select id="sql-terminal-checkpoints"></select>
-		    <button onclick="sqlTerminalCheckpointRevert()">Revert to</button>
+	    <div class="panel-content sql-terminal-content">
+		<div class="button-row">
+		    <select class="sql-terminal-db-select" onchange="sqlTerminalDbChanged(this)" title="Which of the 3 logical databases new bare table references target - see the Docs panel">
+			<option value="main">Main</option>
+			<option value="replay">Replay DB (this battle)</option>
+			<option value="battle">Battle DB (this battle)</option>
+		    </select>
+		    <span class="sql-terminal-db-status sql-db-status"></span>
 		</div>
-		<div>
-		    <button onclick="sqlTerminalHighlightOnMap()">Highlight on map</button>
-		    <button onclick="sqlTerminalClearHighlights()">Clear highlights</button>
+		<!-- Syntax-highlighting backdrop technique (main.js): .sql-terminal-highlight
+		     is an inert <pre> rendered exactly UNDER the real textarea, sharing
+		     identical font metrics/padding, filled with colored <span>s per
+		     sql-tokenizer.js token; the textarea itself stays on top with
+		     transparent text (only its caret is visible) so typing/selection/
+		     scrolling behave exactly like a plain textarea always did. Class-
+		     based (not ID-based): each SQL Terminal window instance - the
+		     original plus any opened via openNewPanelInstance - gets its own
+		     independent input/backdrop found via
+		     this.closest('[data-panel-type="sql-terminal-panel"]').querySelector(...).
+		     The autocomplete suggestion list itself is NOT per-instance - one
+		     shared, position:fixed popup (main.js's ensureSharedAutocompleteList)
+		     floats above every window regardless of which editor is active. -->
+		<div class="sql-terminal-editor-wrap">
+		    <pre class="sql-terminal-highlight" aria-hidden="true"></pre>
+		    <textarea class="sql-terminal-input" rows="3" placeholder="SELECT * FROM ticks LIMIT 10" spellcheck="false" autocomplete="off"></textarea>
 		</div>
-		<div id="sql-terminal-status"></div>
-		<div id="sql-terminal-results"></div>
+		<!-- One flex-wrap row, not several fixed <div> groups - so widening the
+		     panel (main.js's makeResizable()) actually lets these consolidate
+		     onto fewer rows instead of staying stuck exactly where they started. -->
+		<div class="button-row">
+		    <button onclick="sqlTerminalRun(this)">Run</button>
+		    <button onclick="sqlTerminalCheckpointSave(this)">Save checkpoint</button>
+		    <select class="sql-terminal-checkpoints"></select>
+		    <button onclick="sqlTerminalCheckpointRevert(this)">Revert to</button>
+		    <button onclick="sqlTerminalHighlightOnMap(this)">Highlight on map</button>
+		    <button onclick="sqlTerminalClearHighlights(this)">Clear highlights</button>
+		    <!-- Hidden by default (main.js's runSqlIntoResultsTable) - only
+		         shown once a Run produces write-back-eligible results (a
+		         plain single-table SELECT, see queryWriteBackTable), same as
+		         the pop-out Data Viewer's own Save changes button. -->
+		    <button class="sql-terminal-save-btn" onclick="saveSqlTerminalResultsChanges(this)" style="display:none;" title="Apply any edited cells / rows marked for deletion directly in the results table above">Save changes</button>
+		    <button onclick="sqlPopOutDataViewer(this)" title="Open the last completed query's results in their own separate, larger window">Pop out data</button>
+		    <button onclick="setPanelVisible('schema-explorer-panel', true); document.getElementById('panel-toggle-schema-explorer-panel').checked = true;">Schema</button>
+		    <button onclick="setPanelVisible('sql-docs-panel', true); document.getElementById('panel-toggle-sql-docs-panel').checked = true;">Docs</button>
+		</div>
+		<div class="sql-terminal-status"></div>
+		<div class="sql-terminal-results"></div>
+	    </div>
+	</div>
+
+	<div id="schema-explorer-panel" class="ui-panel minimized" style="display:none;" data-panel-type="schema-explorer-panel">
+	    <div class="panel-header">
+		<span>[Schema Explorer]</span>
+		<span class="panel-header-controls">
+		    <span class="toggle-icon">-</span>
+		    <span class="panel-close-btn" title="Close window">&times;</span>
+		</span>
+	    </div>
+	    <div class="panel-content">
+		<div class="button-row">
+		    <select class="schema-explorer-filter" onchange="refreshSchemaExplorer(this)">
+			<option value="all">All databases</option>
+			<option value="main">Main</option>
+			<option value="r">Replay DB</option>
+			<option value="b">Battle DB</option>
+		    </select>
+		    <button onclick="refreshSchemaExplorer(this)">Refresh</button>
+		</div>
+		<!-- Loading/error state lives here, NOT in the tree itself - a
+		     refresh that finds the tree already populated leaves it exactly
+		     as it was (main.js's updateSchemaExplorerTree patches it in
+		     place instead of wiping and rebuilding) so expand/collapse
+		     state, scroll position, and an in-progress generator-script
+		     edit all survive a background refresh instead of flickering
+		     away and resetting on every one. -->
+		<div class="schema-explorer-status"></div>
+		<div class="schema-explorer-tree"></div>
+	    </div>
+	</div>
+
+	<div id="sql-docs-panel" class="ui-panel minimized" style="display:none;" data-panel-type="sql-docs-panel">
+	    <div class="panel-header">
+		<span>[SQL Docs]</span>
+		<span class="panel-header-controls">
+		    <span class="toggle-icon">-</span>
+		    <span class="panel-close-btn" title="Close window">&times;</span>
+		</span>
+	    </div>
+	    <div class="panel-content sql-docs-content">
+		<p><b>Three databases.</b> <code>main</code> is always present - the full
+		multi-battle source, or (loading a single previously-exported battle
+		directly) that one battle's data. <code>r</code> (Replay DB) is this
+		battle's raw source rows, copied verbatim. <code>b</code> (Battle DB) is a
+		derived roster/corpse snapshot. The dropdown above picks which one new
+		bare table references target; you can always address any of them
+		explicitly regardless of the dropdown, e.g. <code>SELECT * FROM
+		r.agent_states</code> or <code>SELECT * FROM b.roster_corpse_final</code>.
+		Replay DB/Battle DB always reflect whichever battle is currently active on
+		the timeline, rebuilding automatically if you scrub to a different one.</p>
+
+		<p><b>Variables.</b> Real SQL functions, usable anywhere a value works:</p>
+		<ul>
+		    <li><code>CURRENT_TICK()</code> - the tick currently on screen</li>
+		    <li><code>CURRENT_TIME()</code> - current replay time within the active battle</li>
+		    <li><code>CURRENT_BATTLE()</code> - active battle's faction text</li>
+		    <li><code>CURRENT_BATTLE_TICK_START()</code> / <code>CURRENT_BATTLE_TICK_END()</code> - active battle's tick range</li>
+		    <li><code>CURRENT_BATTLE_ROWID_LO()</code> / <code>CURRENT_BATTLE_ROWID_HI()</code> - active battle's agent_states rowid slice</li>
+		    <li><code>CURSOR_X()</code> / <code>CURSOR_Y()</code> - world position of the crosshair fixed at screen center</li>
+		</ul>
+		<p>Example: <code>SELECT * FROM agent_states WHERE tick_id = CURRENT_TICK()</code></p>
+
+		<p><b>Live editing.</b> Writes to <code>main</code> (e.g. <code>UPDATE
+		agent_states SET pos_x=... WHERE id=...</code>) show up on the very next
+		rendered frame - positions are read fresh from the table every frame,
+		never cached. Editing <code>ticks</code>/<code>events</code> (tick timing,
+		match boundaries) is <i>not</i> reflected - those are loaded once into
+		memory at load time.</p>
+
+		<p><b>Generator scripts.</b> Replay DB/Battle DB are built by real SQL too
+		- open the Schema Explorer and click into <code>r</code> or <code>b</code>
+		to see and edit the actual populate/derive query, with a Run and a Reset
+		to default button. Rebuilds are smart: a view is only actually rebuilt
+		when the active battle changes, the underlying data changes, or the
+		generator script text itself changes (each tracked independently) -
+		re-querying an unchanged view never redoes the work.</p>
 	    </div>
 	</div>
 
@@ -90,19 +225,49 @@
 	    <div id="main-menu">
 		<button id="reset-btn" onclick="closeMainMenu(); triggerReset();">Load Different Replay / Battle</button>
 		<button id="export-btn" onclick="closeMainMenu(); exportActiveBattle();" style="display:none;" title="Download the currently active battle as a compressed .tar.xz (manifest.json + replay.db + battle.db)">Export Battle</button>
+		<!-- Auto-follow (main.js's cameraFollowActiveBattle) turns off the
+		     moment the user pans with WASD or a canvas drag, so this is both
+		     the on-demand "center on the current battle right now" action
+		     AND how the user resumes auto-following later. A render-only
+		     visual shift (set_view_shift) - never touches the camera state
+		     itself, zoom, the map-bounds box, or any query. -->
+		<button id="recenter-camera-btn" onclick="closeMainMenu(); recenterCameraOnActiveBattle(true);" title="Re-center the view on the currently active battle and resume auto-following each new battle, without changing zoom">Recenter Camera</button>
 		<div id="menu-panels-section" style="display:none;">
 		    <div class="menu-divider"></div>
+		    <!-- "+" opens a brand new, independent instance of that panel type
+		         (main.js's openNewPanelInstance) - separate from the checkbox,
+		         which only shows/hides the ORIGINAL singleton instance. Chat has
+		         no checkbox (it's always visible, never toggled via this menu -
+		         see main.js's chatBottomAnchor comment) but can still be opened
+		         again as an extra window. -->
+		    <label class="menu-checkbox-item">
+			<span style="flex:1 1 auto;">Chat Replay</span>
+			<button type="button" class="menu-open-new-btn" onclick="openNewPanelInstance('chat-box')" title="Open another Chat Replay window">+</button>
+		    </label>
 		    <label class="menu-checkbox-item">
 			<input type="checkbox" id="panel-toggle-log-box" onchange="setPanelVisible('log-box', this.checked)">
-			System Logs
+			<span style="flex:1 1 auto;">System Logs</span>
+			<button type="button" class="menu-open-new-btn" onclick="openNewPanelInstance('log-box')" title="Open another System Logs window">+</button>
 		    </label>
 		    <label class="menu-checkbox-item">
 			<input type="checkbox" id="panel-toggle-debug-panel" onchange="setPanelVisible('debug-panel', this.checked)">
-			VFS Trace
+			<span style="flex:1 1 auto;">VFS Trace</span>
+			<button type="button" class="menu-open-new-btn" onclick="openNewPanelInstance('debug-panel')" title="Open another VFS Trace window">+</button>
 		    </label>
 		    <label class="menu-checkbox-item">
-			<input type="checkbox" id="panel-toggle-sql-terminal-panel" checked onchange="setPanelVisible('sql-terminal-panel', this.checked)">
-			SQL Terminal
+			<input type="checkbox" id="panel-toggle-sql-terminal-panel" onchange="setPanelVisible('sql-terminal-panel', this.checked)">
+			<span style="flex:1 1 auto;">SQL Terminal</span>
+			<button type="button" class="menu-open-new-btn" onclick="openNewPanelInstance('sql-terminal-panel')" title="Open another SQL Terminal window">+</button>
+		    </label>
+		    <label class="menu-checkbox-item">
+			<input type="checkbox" id="panel-toggle-schema-explorer-panel" onchange="setPanelVisible('schema-explorer-panel', this.checked)">
+			<span style="flex:1 1 auto;">Schema Explorer</span>
+			<button type="button" class="menu-open-new-btn" onclick="openNewPanelInstance('schema-explorer-panel')" title="Open another Schema Explorer window">+</button>
+		    </label>
+		    <label class="menu-checkbox-item">
+			<input type="checkbox" id="panel-toggle-sql-docs-panel" onchange="setPanelVisible('sql-docs-panel', this.checked)">
+			<span style="flex:1 1 auto;">SQL Docs</span>
+			<button type="button" class="menu-open-new-btn" onclick="openNewPanelInstance('sql-docs-panel')" title="Open another SQL Docs window">+</button>
 		    </label>
 		</div>
 	    </div>
@@ -130,6 +295,7 @@
 	    </div>
 	</div>
 	
+	<script src="sql-tokenizer.js"></script>
 	<script src="main.js"></script>
     </body>
 </html>

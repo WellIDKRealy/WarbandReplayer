@@ -25,7 +25,7 @@ LZMA-SRC = lzma-sdk/LzFind.c lzma-sdk/LzmaEnc.c lzma-sdk/Lzma2Enc.c lzma-sdk/Xz.
            lzma-sdk/XzCrc64.c lzma-sdk/XzCrc64Opt.c lzma-sdk/7zCrc.c lzma-sdk/7zCrcOpt.c \
            lzma-sdk/Sha256.c lzma-sdk/CpuArch.c
 
-MAIN-EXPORTS = set_screen_dimensions set_map_bounds get_vs_main_ptr get_fs_main_ptr get_vs_grid_ptr get_fs_grid_ptr init_engine init_gl_programs ensure_agent_capacity update_frame_data render_frame apply_zoom pan_camera set_key_state ensure_highlight_capacity update_highlight_data
+MAIN-EXPORTS = set_screen_dimensions set_map_bounds get_vs_main_ptr get_fs_main_ptr get_vs_grid_ptr get_fs_grid_ptr init_engine init_gl_programs ensure_agent_capacity update_frame_data render_frame apply_zoom pan_camera set_key_state ensure_highlight_capacity update_highlight_data get_cam_x get_cam_y set_view_shift
 BENCHMARK-EXPORTS = main
 COMPRESS-EXPORTS = compress_begin compress_get_input_chunk_ptr compress_feed_chunk compress_finish \
                    decompress_finish \
@@ -73,7 +73,11 @@ WORKER-EXPORTS = thread_main \
                  sql_terminal_get_query_buf_ptr sql_terminal_run sql_terminal_column_count \
                  sql_terminal_column_name sql_terminal_step sql_terminal_column_is_null \
                  sql_terminal_column_text sql_terminal_get_last_error \
-                 sql_checkpoint_save sql_checkpoint_revert sql_checkpoint_get_last_error
+                 sql_checkpoint_save sql_checkpoint_revert sql_checkpoint_get_last_error \
+                 replay_set_cursor_world_pos replay_get_data_generation \
+                 replay_get_default_replaydb_sql replay_get_default_battledb_sql \
+                 replay_get_generator_script_buf_ptr replay_run_generator_script replay_reset_generator_script \
+                 replay_ensure_db_view
 # Phase 6: 96MiB - 8MiB loader heap + 8*2MiB reader heaps (16MiB) + 4MiB
 # prefetch heap + 4KiB Region C + ~40.6MB stack/TLS pools = ~68.6MiB of
 # wasm_layout.h's own addressed regions, plus headroom for the module's

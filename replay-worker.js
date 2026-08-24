@@ -494,29 +494,47 @@ function runCombineBounds(ex, data) {
 // than one giant postMessage, so a broad `SELECT *` over agent_states can't
 // stall the worker's message loop or blow up structured-clone cost.
 const SQL_ROW_BATCH_SIZE = 500;
-function runSql(ex, data) {
+// Shared by runSql (the user's own query, "sql*" message types) and
+// runSchemaQuery (the schema explorer's background PRAGMA/sqlite_master
+// probes, "schema*" message types) - both go through the exact same
+// sql_terminal_run/step/column exports (sql_terminal.c only ever has ONE
+// "live" statement at a time), but need to land in different UI state on
+// the JS side, not overwrite each other - hence the separate message-type
+// prefix rather than one shared "sql*" family. A schema refresh can never
+// actually interleave with an in-flight runSql call at the C level either
+// way: this whole function runs to completion synchronously within one
+// worker message handler, so the next queued message (whichever it is)
+// only starts once this one has fully returned.
+//
+// requestId is opaque here - just echoed back on every posted message
+// unchanged. main.js now supports any number of independent SQL Terminal/
+// Schema Explorer windows all sharing this one worker (still strictly
+// serialized, per the above), and needs it to route each response back to
+// whichever window's own request this was, or to the schema-probing promise
+// that asked for it - see main.js's sqlRequestQueue/postSqlRequest.
+function runSqlGeneric(ex, sql, msgPrefix, requestId) {
   const mem8 = new Uint8Array(sharedMemory.buffer);
-  const queryBytes = new TextEncoder().encode(data.sql);
+  const queryBytes = new TextEncoder().encode(sql);
   const bufPtr = ex.sql_terminal_get_query_buf_ptr();
   mem8.set(queryBytes, bufPtr); // sql_terminal_run() itself clamps/truncates to its buffer size
 
   const rc = ex.sql_terminal_run(queryBytes.length);
   if (rc !== 0) {
-    postMessage({ type: "sqlError", message: readCstr(ex.sql_terminal_get_last_error()) });
+    postMessage({ type: msgPrefix + "Error", requestId, message: readCstr(ex.sql_terminal_get_last_error()) });
     return;
   }
 
   const colCount = ex.sql_terminal_column_count();
   const columns = [];
   for (let i = 0; i < colCount; i++) columns.push(readCstr(ex.sql_terminal_column_name(i)));
-  postMessage({ type: "sqlColumns", columns });
+  postMessage({ type: msgPrefix + "Columns", requestId, columns });
 
   let batch = [];
   let rowCount = 0;
   for (;;) {
     const stepRc = ex.sql_terminal_step();
     if (stepRc < 0) {
-      postMessage({ type: "sqlError", message: readCstr(ex.sql_terminal_get_last_error()) });
+      postMessage({ type: msgPrefix + "Error", requestId, message: readCstr(ex.sql_terminal_get_last_error()) });
       return;
     }
     if (stepRc === 0) break;
@@ -527,12 +545,56 @@ function runSql(ex, data) {
     batch.push(row);
     rowCount++;
     if (batch.length >= SQL_ROW_BATCH_SIZE) {
-      postMessage({ type: "sqlRows", rows: batch });
+      postMessage({ type: msgPrefix + "Rows", requestId, rows: batch });
       batch = [];
     }
   }
-  if (batch.length > 0) postMessage({ type: "sqlRows", rows: batch });
-  postMessage({ type: "sqlDone", rowCount });
+  if (batch.length > 0) postMessage({ type: msgPrefix + "Rows", requestId, rows: batch });
+  postMessage({ type: msgPrefix + "Done", requestId, rowCount });
+}
+
+function runSql(ex, data) {
+  // CURSOR_X()/CURSOR_Y() (replay_worker.c) read whatever was last set here -
+  // main.js reads main.wasm's cam_x/cam_y (a separate WASM instance/memory)
+  // and sends them along with every query, right before it's run.
+  if (typeof data.cursorX === "number" && typeof data.cursorY === "number") {
+    ex.replay_set_cursor_world_pos(data.cursorX, data.cursorY);
+  }
+  runSqlGeneric(ex, data.sql, "sql", data.requestId);
+}
+
+function runSchemaQuery(ex, data) {
+  runSqlGeneric(ex, data.sql, "schema", data.requestId);
+}
+
+// ---- multi-database SQL terminal: replay.db/battle.db on-demand views ----
+// viewKind: 1 = replay.db (r), 2 = battle.db (b) - matches replay_export.c's
+// replay_ensure_db_view()/replay_run_generator_script() convention.
+function runEnsureDbView(ex, data) {
+  const rc = ex.replay_ensure_db_view(data.viewKind);
+  if (rc < 0) postMessage({ type: "dbViewError", viewKind: data.viewKind, message: readCstr(ex.replay_export_get_last_error()) });
+  else postMessage({ type: "dbViewReady", viewKind: data.viewKind, rebuilt: rc === 1 });
+}
+
+function runGeneratorScript(ex, data) {
+  const mem8 = new Uint8Array(sharedMemory.buffer);
+  const bytes = new TextEncoder().encode(data.sql);
+  const bufPtr = ex.replay_get_generator_script_buf_ptr();
+  mem8.set(bytes, bufPtr);
+  const rc = ex.replay_run_generator_script(data.viewKind, bytes.length);
+  if (rc < 0) postMessage({ type: "dbViewError", viewKind: data.viewKind, message: readCstr(ex.replay_export_get_last_error()) });
+  else postMessage({ type: "dbViewReady", viewKind: data.viewKind, rebuilt: true });
+}
+
+function runResetGeneratorScript(ex, data) {
+  const rc = ex.replay_reset_generator_script(data.viewKind);
+  if (rc < 0) postMessage({ type: "dbViewError", viewKind: data.viewKind, message: readCstr(ex.replay_export_get_last_error()) });
+  else postMessage({ type: "dbViewReady", viewKind: data.viewKind, rebuilt: true });
+}
+
+function runGetDefaultGeneratorSql(ex, data) {
+  const ptr = data.viewKind === 1 ? ex.replay_get_default_replaydb_sql() : ex.replay_get_default_battledb_sql();
+  postMessage({ type: "defaultGeneratorSql", viewKind: data.viewKind, sql: readCstr(ptr) });
 }
 
 function runCheckpointSave(ex) {
@@ -763,6 +825,21 @@ onmessage = async (e) => {
         break;
       case "checkpointRevert":
         runCheckpointRevert(ex, data);
+        break;
+      case "schemaQuery":
+        runSchemaQuery(ex, data);
+        break;
+      case "ensureDbView":
+        runEnsureDbView(ex, data);
+        break;
+      case "runGeneratorScript":
+        runGeneratorScript(ex, data);
+        break;
+      case "resetGeneratorScript":
+        runResetGeneratorScript(ex, data);
+        break;
+      case "getDefaultGeneratorSql":
+        runGetDefaultGeneratorSql(ex, data);
         break;
       default:
         postMessage({ type: "error", message: "unknown message type: " + data.type });
