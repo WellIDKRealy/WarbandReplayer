@@ -52,9 +52,7 @@ WORKER-EXPORTS = thread_main \
                  replay_get_total_start_time replay_get_total_end_time \
                  replay_advance_to_time replay_seek_to_time \
                  replay_get_frame_buffer_ptr replay_get_frame_count \
-                 replay_get_active_match_index replay_get_relative_time \
-                 replay_get_new_chat_count replay_get_chat_username_ptr replay_get_chat_message_ptr \
-                 replay_get_chat_team replay_advance_chat_cursor \
+                 replay_get_active_match_index replay_get_relative_time replay_get_current_tick_id \
                  replay_reader_compute_bounds replay_combine_bounds \
                  replay_get_map_min_x replay_get_map_max_x replay_get_map_min_y replay_get_map_max_y \
                  replay_ensure_battle_ready replay_prefetch_battle replay_debug_index_visible \

@@ -853,6 +853,93 @@ window.__testResult = { done: false };
       }
     }
 
+    // ---- 16. Chat: a pure "visualization of a SQL query" (chats/events
+    // tables, gated by CURRENT_TICK()/CURRENT_BATTLE_TICK_START()), not an
+    // append-only feed driven by frame events - the actual bug report this
+    // exists to fix: scrubbing back past a chat message's tick and then
+    // forward again used to re-deliver it a second time, because the old
+    // mechanism was a monotonic, advance-only cursor with no way to know
+    // playback had rewound. Reuses the still-loaded SQL terminal fixture
+    // (matches[0] is a real match in it - real chat messages included). ----
+    if (matches.length > 0) {
+      const playBtn = document.getElementById('tl-play-btn');
+      if (playBtn && playBtn.innerText === 'Pause') playBtn.click(); // pause - deterministic seeking needs playback to hold still
+
+      async function seekAndSettle(t) {
+        const start = Date.now();
+        let landed = null;
+        while (Date.now() - start < 10000) {
+          seekTo(t);
+          await new Promise((r) => setTimeout(r, 150));
+          if (latestFrame && latestFrame.activeMatchIndex === 0) { landed = latestFrame; break; }
+        }
+        await new Promise((r) => setTimeout(r, 1000)); // let refreshChatFromQuery's async round-trip finish
+        return landed;
+      }
+      function chatWrapEl() { return document.querySelector('#chat-box .panel-content > .panel-zoom-wrap'); }
+      function chatMessageDivCount() { const wrap = chatWrapEl(); return wrap ? wrap.children.length : 0; }
+
+      const chatDbSelect = panel.querySelector('.sql-terminal-db-select');
+      chatDbSelect.value = 'main';
+      sqlTerminalDbChanged(chatDbSelect);
+      runSqlSync(
+        'SELECT c.event_id, e.tick_id, t.time FROM chats c JOIN events e ON c.event_id = e.id ' +
+        'JOIN ticks t ON t.id = e.tick_id ' +
+        `WHERE e.tick_id >= ${matches[0].startTickId} AND e.tick_id <= ${matches[0].endTickId} ` +
+        'ORDER BY e.id ASC LIMIT 1'
+      );
+      await waitForSqlDone();
+      const firstChatText = panel.querySelector('.sql-terminal-results').innerText;
+      const chatRow = firstChatText.split('\n')[1]; // header line, then one data line if found
+      checks.push(['chat regression fixture has at least one real chat message in the first match', !!chatRow, firstChatText]);
+
+      if (chatRow) {
+        // event_id captured directly from the chat row itself, NOT
+        // re-derived from tick_id alone - a tick can carry several events
+        // (spawn/kill/chat all share the same events table), so "the first
+        // event at this tick" is not reliably the chat event.
+        const [msgEventId, , msgTime] = chatRow.split('\t').map(Number);
+        const before = Math.max(matches[0].startTime + 0.5, msgTime - 3);
+        const after = msgTime + 3;
+
+        // 16a. Before the message's tick: chat shows the empty-state
+        // placeholder, not a blank box (a genuinely empty box "reads as
+        // broken" - the other half of this same bug report).
+        const beforeFrame = await seekAndSettle(before);
+        const emptyStateText = chatWrapEl() ? chatWrapEl().textContent : '';
+        checks.push(['chat shows a placeholder instead of a blank box before any message is due',
+          !!beforeFrame && emptyStateText.includes('No chat messages yet'), emptyStateText]);
+
+        // 16b. Seek past the message once - it appears exactly once.
+        await seekAndSettle(after);
+        const countAfterFirstPass = chatMessageDivCount();
+
+        // 16c. Scrub BACK before it again, then FORWARD past it again - the
+        // actual reported bug: this used to duplicate the message.
+        await seekAndSettle(before);
+        await seekAndSettle(after);
+        const countAfterRescrub = chatMessageDivCount();
+        checks.push(['scrubbing back before a chat message and forward past it again does not duplicate it',
+          countAfterFirstPass === 1 && countAfterRescrub === 1,
+          `countAfterFirstPass=${countAfterFirstPass} countAfterRescrub=${countAfterRescrub}`]);
+
+        // 16d. Editing the chats table directly via the SQL Terminal shows
+        // up in the chat box on the next refresh - chat reads the live
+        // table, not a stale snapshot cached at match-activation time.
+        const marker = 'REGRESSION_TEST_MARKER_' + Date.now();
+        runSqlSync(`UPDATE chats SET message = '${marker}' WHERE event_id = ${msgEventId}`);
+        await waitForSqlDone();
+        // Nudge the tick so refreshChatFromQuery's gate key actually
+        // changes (it only re-queries when activeMatchIndex/currentTickId
+        // change, by design - an edit alone with no playback movement has
+        // nothing to gate on).
+        await seekAndSettle(after + 2);
+        const textAfterEdit = chatWrapEl() ? chatWrapEl().textContent : '';
+        checks.push(['editing the chats table via the SQL Terminal shows up in the chat box on the next refresh',
+          textAfterEdit.includes(marker), textAfterEdit]);
+      }
+    }
+
     result.checks = checks.map(([name, ok, detail]) => ({ name, ok: !!ok, detail: detail || undefined }));
     result.allPass = checks.every(([, ok]) => ok);
     result.done = true;

@@ -1,13 +1,15 @@
 /*
  * Owns everything DB-related for the replay viewer: the load pipeline,
  * all SQL, the incremental roster/cursor algorithm, match segmentation,
- * chat cache, and the interpolated frame buffer. Never runs on the main
- * thread - only inside Web Workers, instantiated from replay_worker.wasm.
+ * and the interpolated frame buffer. Never runs on the main thread - only
+ * inside Web Workers, instantiated from replay_worker.wasm.
  *
  * JS is a thin stub: it hands raw file bytes to replay_feed_chunk, calls
  * replay_finish_load once, then drives playback via replay_advance_to_time/
- * replay_seek_to_time + reads the resulting frame/match/chat buffers
- * through the getters below. No SQL or tick bookkeeping happens in JS.
+ * replay_seek_to_time + reads the resulting frame/match buffers through the
+ * getters below. No SQL or tick bookkeeping happens in JS. Chat is not part
+ * of this at all - it's a plain SQL query main.js runs through the normal
+ * SQL Terminal execution path (see replay_get_current_tick_id below).
  */
 #include "sqlite3.h"
 #include "wasm_thread.h"
@@ -27,7 +29,6 @@ extern void js_log_string(const char *msg);
 #define MAX_AGENT_SLOTS    1025  /* lua/main.lua: for agent = 0, 1024 do - a real engine limit on simultaneous living units */
 #define MAX_MATCHES        16    /* up to 15 real battles per file, +1 headroom */
 #define LOAD_CHUNK_SIZE    (1024 * 1024)
-#define MAX_CHAT_ENTRIES   4096
 
 static char g_last_error[256];
 static void set_error(const char *msg) {
@@ -669,7 +670,7 @@ static float *g_frame_buffer = 0;
 static int g_frame_buffer_capacity = 0;
 static int g_frame_count = 0;
 static double g_relative_time = 0.0;
-static sqlite3_int64 g_current_tick_id = -1; /* tickA of the most recent build_frame_at_time() call - chat gates on this */
+static sqlite3_int64 g_current_tick_id = -1; /* tickA of the most recent build_frame_at_time() call - backs CURRENT_TICK() (the SQL variable function) and replay_get_current_tick_id() */
 
 static void ensure_frame_buffer_capacity(int n) {
     if (n <= g_frame_buffer_capacity) return;
@@ -685,6 +686,11 @@ float *replay_get_frame_buffer_ptr(void) { return g_frame_buffer; }
 int replay_get_frame_count(void) { return g_frame_count; }
 int replay_get_active_match_index(void) { return g_active_match_index; }
 double replay_get_relative_time(void) { return g_relative_time; }
+/* Exposed so main.js can gate chat re-querying on "did the tick actually
+ * change" instead of re-running the chat SQL query on every animation frame
+ * (see main.js's refreshChatFromQuery) - a double, not int, because tick ids
+ * are sqlite3_int64 and JS's Number safely covers that range anyway. */
+double replay_get_current_tick_id(void) { return (double)g_current_tick_id; }
 
 static int find_tick_index_for_time(double t) {
     if (g_tick_count == 0) return 0;
@@ -812,7 +818,7 @@ static void build_frame_at_time(double t) {
         out++;
     }
     g_frame_count = out;
-    g_current_tick_id = tickA_id; /* chat delivery (replay_get_new_chat_count) gates on this */
+    g_current_tick_id = tickA_id; /* backs CURRENT_TICK() and replay_get_current_tick_id() */
 
     g_relative_time = 0.0;
     if (g_active_match_index >= 0) g_relative_time = t - g_matches[g_active_match_index].start_time;
@@ -821,83 +827,16 @@ static void build_frame_at_time(double t) {
 void replay_advance_to_time(double t) { build_frame_at_time(t); }
 void replay_seek_to_time(double t) { build_frame_at_time(t); }
 
-/* ---- chat cache (scoped to the active match, extended lazily) ---------- */
-typedef struct ChatEntry {
-    sqlite3_int64 tick_id;
-    signed char team;
-    char username[32];
-    char message[160];
-} ChatEntry;
-static ChatEntry *g_chats = 0;
-static int g_chat_count = 0;
-static int g_chat_capacity = 0;
-static int g_chat_scoped_match = -2; /* which match g_chats currently covers */
-static int g_chat_read_cursor = 0;
-
-static void copy_text(char *dst, int dstSize, const unsigned char *src) {
-    int i = 0;
-    if (src) while (src[i] && i < dstSize - 1) { dst[i] = (char)src[i]; i++; }
-    dst[i] = 0;
-}
-
-static void load_chats_for_match(int match_idx) {
-    g_chat_count = 0;
-    g_chat_read_cursor = 0;
-    g_chat_scoped_match = match_idx;
-    if (match_idx < 0 || !g_db) return;
-
-    sqlite3_stmt *stmt = 0;
-    const char *sql = "SELECT e.tick_id, c.username, c.message, c.team "
-                       "FROM chats c JOIN events e ON c.event_id = e.id "
-                       "WHERE e.tick_id >= ?1 AND e.tick_id <= ?2 ORDER BY e.id ASC";
-    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, 0) != SQLITE_OK) return;
-    sqlite3_bind_int64(stmt, 1, g_matches[match_idx].start_tick_id);
-    sqlite3_bind_int64(stmt, 2, g_matches[match_idx].end_tick_id);
-
-    while (sqlite3_step(stmt) == SQLITE_ROW && g_chat_count < g_chat_capacity) {
-        ChatEntry *e = &g_chats[g_chat_count];
-        e->tick_id = sqlite3_column_int64(stmt, 0);
-        copy_text(e->username, sizeof(e->username), sqlite3_column_text(stmt, 1));
-        copy_text(e->message, sizeof(e->message), sqlite3_column_text(stmt, 2));
-        e->team = parse_team(sqlite3_column_text(stmt, 3));
-        g_chat_count++;
-    }
-    sqlite3_finalize(stmt);
-}
-
-/* returns the number of chat entries newly DUE since the last call - "due"
- * meaning their tick_id has actually been reached by playback
- * (g_current_tick_id, set every build_frame_at_time() call), not just
- * "loaded for this match". Without this gate, the whole match's chat log -
- * loaded all at once by load_chats_for_match() below - would all report as
- * "new" the instant the match becomes active, dumping every message into
- * the chat panel in one burst instead of as each was actually said. A
- * monotonic cursor either way (JS never re-scans, just drains what's due),
- * re-scoping the cache when the active match has changed. */
-int replay_get_new_chat_count(void) {
-    if (g_active_match_index != g_chat_scoped_match) load_chats_for_match(g_active_match_index);
-    int due = g_chat_read_cursor;
-    while (due < g_chat_count && g_chats[due].tick_id <= g_current_tick_id) due++;
-    int n = due - g_chat_read_cursor;
-    return n > 0 ? n : 0;
-}
-static int chat_ref(int i) { return g_chat_read_cursor + i; } /* index relative to the unread window */
-const char *replay_get_chat_username_ptr(int i) {
-    int idx = chat_ref(i);
-    return (idx >= 0 && idx < g_chat_count) ? g_chats[idx].username : "";
-}
-const char *replay_get_chat_message_ptr(int i) {
-    int idx = chat_ref(i);
-    return (idx >= 0 && idx < g_chat_count) ? g_chats[idx].message : "";
-}
-int replay_get_chat_team(int i) {
-    int idx = chat_ref(i);
-    return (idx >= 0 && idx < g_chat_count) ? g_chats[idx].team : -1;
-}
-void replay_advance_chat_cursor(int count) {
-    g_chat_read_cursor += count;
-    if (g_chat_read_cursor > g_chat_count) g_chat_read_cursor = g_chat_count;
-}
+/* Chat has no dedicated cache/cursor here at all - main.js just runs a real
+ * SQL query (chats JOIN events, gated by CURRENT_TICK()/CURRENT_BATTLE_TICK_START())
+ * through the exact same SQL Terminal execution path a user's own query
+ * uses, and fully re-renders the chat panel from the result every time. That
+ * makes it trivially correct under scrubbing back and forth (a plain query
+ * against "now" can never double-deliver a message the way a monotonic
+ * advance-only cursor did) and means a live edit to the chats table via the
+ * SQL Terminal shows up immediately, since it's reading the same live table
+ * instead of a snapshot copied out at match-activation time. See main.js's
+ * refreshChatFromQuery.*/
 
 /* ---- one-time load finalization: indexes, tick index, match scan -------- */
 
@@ -1146,7 +1085,7 @@ static void on_row_changed(void *pArg, int op, const char *zDb, const char *zTab
  * replay_finish_load_battle_file() (Phase 5: a single already-exported
  * battle's replay.db loaded directly) - both open the same OPFS-backed
  * main.db slot g_load_file just finished streaming into, need the same
- * pragmas/indexes/tick-index/chat-cache/prepared-statements, and only
+ * pragmas/indexes/tick-index/prepared-statements, and only
  * diverge on how g_matches[]/g_match_count get populated afterward
  * (scan_matches()'s boundary-event heuristic vs. reading replay.db's own
  * replay_meta table directly). Returns 0 on success, matching the negative
@@ -1203,10 +1142,6 @@ static int common_finish_load_setup(void) {
     ) != SQLITE_OK) return -3;
 
     if (load_tick_index() != 0) return -4;
-
-    g_chat_capacity = MAX_CHAT_ENTRIES;
-    g_chats = (ChatEntry *)malloc(sizeof(ChatEntry) * (size_t)g_chat_capacity);
-    if (!g_chats) { set_error("out of memory allocating chat cache"); return -6; }
 
     const char *roster_delta_sql =
         "SELECT e.event_type, e.tick_id, "

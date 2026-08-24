@@ -635,17 +635,6 @@ function runFrame(ex, data) {
   const out = new Float32Array(count * 3);
   out.set(floatView);
 
-  const chatMessages = [];
-  const newChats = ex.replay_get_new_chat_count();
-  for (let i = 0; i < newChats; i++) {
-    chatMessages.push({
-      username: readCstr(ex.replay_get_chat_username_ptr(i)),
-      message: readCstr(ex.replay_get_chat_message_ptr(i)),
-      team: ex.replay_get_chat_team(i),
-    });
-  }
-  if (newChats > 0) ex.replay_advance_chat_cursor(newChats);
-
   postMessage(
     {
       type: "frame",
@@ -653,7 +642,10 @@ function runFrame(ex, data) {
       count,
       activeMatchIndex: ex.replay_get_active_match_index(),
       relativeTime: ex.replay_get_relative_time(),
-      chatMessages,
+      // Chat is not delivered here at all - main.js runs a real SQL query
+      // (gated by this) through the normal SQL Terminal path instead of a
+      // frame-coupled push feed (see main.js's refreshChatFromQuery for why).
+      currentTickId: ex.replay_get_current_tick_id(),
       // replay_seek_to_time/replay_advance_to_time above may have called
       // fetch_positions() -> replay_ensure_battle_ready(), which can evict a
       // farther-away battle to make room under a tight budget - this mask

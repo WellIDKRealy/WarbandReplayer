@@ -304,6 +304,7 @@ function triggerReset() {
     // ticks fast enough that a request is almost always in flight the
     // instant a reset fires).
     pendingFrameRequest = false;
+    lastChatQueryKey = null; // force the next 'frame' to re-query chat, not skip it as "unchanged"
 
     panelContentElements('chat-box').forEach((el) => { el.innerHTML = '<div>System: Chat initialized...</div>'; });
     appendToConsoleLog("[System] Reset complete. Select a new sqlite database.");
@@ -1205,33 +1206,92 @@ function updateSliderPosition() {
     }
 }
 
+// Chat is nothing more than a visualization of a SQL query - "every chat
+// message at or before the current moment" - re-run and fully re-rendered
+// from scratch, NOT an append-only feed driven by frame events. That used to
+// be a monotonic advance-only cursor on the C side (replay_get_new_chat_count/
+// replay_advance_chat_cursor): scrubbing backward then forward past a
+// message's tick re-delivered it as "new" a second time, since the cursor
+// only ever moved forward and had no idea the user had rewound. A query
+// keyed on "now" can't double-deliver - re-running it at the same tick just
+// reproduces the same result set - and since it reads the live `chats` table
+// directly (through the same SQL Terminal execution path a user's own query
+// uses - see runSchemaQueryAsync), an UPDATE/DELETE against `chats` made from
+// the SQL Terminal shows up here too, on the very next refresh.
+let lastChatQueryKey = null; // `${activeMatchIndex}:${currentTickId}` - see refreshChatFromQuery
+
+function parseTeamText(teamText) {
+    // Mirrors replay_worker.c's parse_team() exactly - the chats.team column
+    // is raw text ('0'/'1'/anything else), not a pre-parsed int.
+    if (teamText === '0') return 0;
+    if (teamText === '1') return 1;
+    return -1;
+}
+
 // Chat is a single shared feed, not per-window state (see panelContentElements)
-// - a message is appended into EVERY currently open chat-box window
-// independently, each keeping its OWN near-bottom/scroll bookkeeping (one
-// window might be scrolled back through history while another follows live).
-function appendChatToUI(chat) {
-    let color = '#00ff00';
-    if (chat.team === 0) color = '#ff5151';
-    else if (chat.team === 1) color = '#51adff';
-    const html = `<span style="color: ${color}; font-weight: bold;">${chat.username}</span>: <span style="color: #e0e0e0;">${chat.message}</span>`;
-
+// - every currently open chat-box window gets the same full rebuild, each
+// keeping its OWN near-bottom/scroll bookkeeping (one window might be
+// scrolled back through history while another follows live).
+function renderChatMessages(rows) {
+    const NEAR_BOTTOM_PX = 24;
     for (const chatContent of panelContentElements('chat-box')) {
-        // Only follow new messages down if the user was already at (or very
-        // near) the bottom - otherwise they're reading back through history,
-        // and yanking their scroll position to the newest message on every
-        // arrival makes that unreadable. Measured BEFORE appending, since
-        // appending changes scrollHeight.
-        const NEAR_BOTTOM_PX = 24;
-        const wasNearBottom = chatContent.scrollHeight - chatContent.scrollTop - chatContent.clientHeight <= NEAR_BOTTOM_PX;
+        // panelContentElements returns the .panel-zoom-wrap CHILD (for the
+        // Ctrl+Scroll zoom feature), not the actual scrolling element -
+        // .panel-content, the wrap's OWN parent, is the one with
+        // overflow-y:auto (main.css). Reading/writing scrollTop on the wrap
+        // itself is a no-op (it never clips its own content, so its
+        // scrollTop is always 0) - confirmed as the actual cause of "follow
+        // to bottom" silently never doing anything.
+        const scrollEl = chatContent.parentElement;
+        // Measured BEFORE rebuilding, since rebuilding changes scrollHeight.
+        const wasNearBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight <= NEAR_BOTTOM_PX;
 
-        const msgDiv = document.createElement('div');
-        msgDiv.style.marginBottom = '5px';
-        msgDiv.style.wordBreak = 'break-word';
-        msgDiv.innerHTML = html;
-        chatContent.appendChild(msgDiv);
-        // Cap history so the panel doesn't grow unbounded over a long session.
-        while (chatContent.children.length > 40) chatContent.removeChild(chatContent.firstChild);
-        if (wasNearBottom) chatContent.scrollTop = chatContent.scrollHeight;
+        const frag = document.createDocumentFragment();
+        if (rows.length === 0) {
+            // An empty box reads as broken, not "no messages yet" - match
+            // the same placeholder triggerReset() shows before any replay
+            // is even loaded.
+            const note = document.createElement('div');
+            note.textContent = 'System: No chat messages yet.';
+            frag.appendChild(note);
+        }
+        for (const [username, message, teamText] of rows) {
+            const team = parseTeamText(teamText);
+            let color = '#00ff00';
+            if (team === 0) color = '#ff5151';
+            else if (team === 1) color = '#51adff';
+            const msgDiv = document.createElement('div');
+            msgDiv.style.marginBottom = '5px';
+            msgDiv.style.wordBreak = 'break-word';
+            msgDiv.innerHTML = `<span style="color: ${color}; font-weight: bold;">${escapeHtml(username)}</span>: <span style="color: #e0e0e0;">${escapeHtml(message)}</span>`;
+            frag.appendChild(msgDiv);
+        }
+        chatContent.innerHTML = '';
+        chatContent.appendChild(frag);
+        if (wasNearBottom) scrollEl.scrollTop = scrollEl.scrollHeight;
+    }
+}
+
+// Re-runs the chat query and re-renders from scratch. Gated by the frame
+// handler on `${activeMatchIndex}:${currentTickId}` actually changing, not
+// fired on every animation frame - ticks advance far slower than rendered
+// frames (interpolation alpha moves in between), so this naturally throttles
+// to real tick-rate frequency. background:true (via runSchemaQueryAsync) so
+// it can never sit ahead of a user's own explicit terminal query.
+async function refreshChatFromQuery(activeMatchIndex) {
+    if (!playbackWorker) return;
+    // No active match (e.g. the gap between battles) - render as empty
+    // rather than leaving whatever the PREVIOUS match's chat happened to be
+    // stuck on screen.
+    if (activeMatchIndex < 0) { renderChatMessages([]); return; }
+    try {
+        const res = await runSchemaQueryAsync(
+            'SELECT c.username, c.message, c.team FROM chats c JOIN events e ON c.event_id = e.id ' +
+            'WHERE e.tick_id >= CURRENT_BATTLE_TICK_START() AND e.tick_id <= CURRENT_TICK() ORDER BY e.id ASC'
+        );
+        renderChatMessages(res.rows);
+    } catch (e) {
+        // Transient (e.g. a reset landed mid-query) - the next tick change retries.
     }
 }
 
@@ -1543,7 +1603,13 @@ function onLoaderMessage(e) {
         case 'frame': {
             pendingFrameRequest = false;
             latestFrame = { buffer: d.buffer, count: d.count, activeMatchIndex: d.activeMatchIndex, relativeTime: d.relativeTime };
-            if (d.chatMessages && d.chatMessages.length) d.chatMessages.forEach(appendChatToUI);
+            {
+                const chatKey = d.activeMatchIndex + ':' + d.currentTickId;
+                if (chatKey !== lastChatQueryKey) {
+                    lastChatQueryKey = chatKey;
+                    refreshChatFromQuery(d.activeMatchIndex);
+                }
+            }
             updateSliderPosition();
             // A battle can become ready without ever going through the
             // prefetch/prime pipeline - e.g. the very first battle on load,
