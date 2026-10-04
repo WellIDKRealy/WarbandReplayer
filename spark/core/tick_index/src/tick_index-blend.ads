@@ -26,15 +26,16 @@ is
    --  VERBATIM old formula  x + (bx - x) * alpha  with one float rounding per operator.
    --  In floating point this is NOT guaranteed to stay between the endpoints (it can overshoot by a few
    --  ulp) and at alpha = 1 it can differ from bx by an ulp; both are impossible to prove because false
-   --  (e.g. A = 1.0, B = 1.0E-8, Alpha = 1.0 gives 0.0).  What IS proved: it is exactly A at alpha = 0 or
-   --  A = B, and it never leaves the bracket [A, A + (B - A)] spanned by its own two float operations.
+   --  (e.g. A = 1.0, B = 1.0E-8, Alpha = 1.0 gives 0.0).  What IS proved: the formula itself, no overflow,
+   --  and that the result is exactly A at alpha = 0 or A = B.  (That it never leaves the bracket
+   --  [A, A + (B - A)] is true by IEEE monotone rounding but the SMT solvers cannot discharge the float
+   --  multiplication bound within the 60 s budget, so it is not claimed - see PROOF.md.)
    function Lerp_Raw (A, B : Coord; Alpha : Alpha_Type) return Coord_Raw
    with
      Global => null,
      Post   =>
        Lerp_Raw'Result = A + (B - A) * Alpha
-       and then (if Alpha = 0.0 or else A = B then Lerp_Raw'Result = A)
-       and then Lerp_Raw'Result in Float'Min (A, A + (B - A)) .. Float'Max (A, A + (B - A));
+       and then (if Alpha = 0.0 or else A = B then Lerp_Raw'Result = A);
 
    --  The lerp the new engine should use: the old value, except that it is forced between its
    --  endpoints and exact at both ends.
@@ -69,9 +70,7 @@ is
      Global => null,
      Post   =>
        Lerp64_Raw'Result = A + (B - A) * Alpha
-       and then (if Alpha = 0.0 or else A = B then Lerp64_Raw'Result = A)
-       and then Lerp64_Raw'Result
-                  in Long_Float'Min (A, A + (B - A)) .. Long_Float'Max (A, A + (B - A));
+       and then (if Alpha = 0.0 or else A = B then Lerp64_Raw'Result = A);
 
    function Lerp64 (A, B : Coord64; Alpha : Alpha_Wide) return Coord64
    with
@@ -151,17 +150,35 @@ is
        and then (if B - A < -180.0 - 1.0E-6 and then B - A >= -540.0 then
                    abs (Shortest_Delta'Result - ((B - A) + 360.0)) <= 1.0E-12);
 
+   --  VERBATIM old formula  a + delta * alpha.  Proved: the formula, no overflow, A at alpha = 0,
+   --  A + delta at alpha = 1.
+   function Blend_Angle_Deg_Raw (A, B : Angle_Deg; Alpha : Alpha_Wide) return Angle_Out
+   with
+     Global => null,
+     Post   =>
+       Blend_Angle_Deg_Raw'Result = A + Shortest_Delta (A, B) * Alpha
+       and then (if Alpha = 0.0 then Blend_Angle_Deg_Raw'Result = A)
+       and then (if Alpha = 1.0 then Blend_Angle_Deg_Raw'Result = A + Shortest_Delta (A, B));
+
+   --  The shortest-angle blend the new engine should use: the old value, forced onto the arc between A and
+   --  A + delta (it can only differ from the old value by a rounding overshoot of that arc).
+   --    * Result in [min (A, A + delta), max (A, A + delta)]  and  A - 180 <= Result <= A + 180:
+   --      the blend never leaves the short arc, so it travels at most half a turn (no 359deg -> 0deg spin)
+   --    * alpha = 0 -> A,  alpha = 1 -> A + delta
+   --    * alpha < 1 -> Clamp64 (old formula, arc ends)
    function Blend_Angle_Deg (A, B : Angle_Deg; Alpha : Alpha_Wide) return Angle_Out
    with
      Global => null,
      Post   =>
-       Blend_Angle_Deg'Result = A + Shortest_Delta (A, B) * Alpha
+       Blend_Angle_Deg'Result
+         in Long_Float'Min (A, A + Shortest_Delta (A, B)) .. Long_Float'Max (A, A + Shortest_Delta (A, B))
+       and then Blend_Angle_Deg'Result in A - 180.0 .. A + 180.0
        and then (if Alpha = 0.0 then Blend_Angle_Deg'Result = A)
        and then (if Alpha = 1.0 then Blend_Angle_Deg'Result = A + Shortest_Delta (A, B))
-       --  the blend never leaves the arc from A to A + delta, so it travels at most half a turn
-       and then Blend_Angle_Deg'Result
-                  in Long_Float'Min (A, A + Shortest_Delta (A, B))
-                  .. Long_Float'Max (A, A + Shortest_Delta (A, B))
-       and then Blend_Angle_Deg'Result in A - 180.0 .. A + 180.0;
+       and then (if Alpha < 1.0 then
+                   Blend_Angle_Deg'Result =
+                     Clamp64 (Blend_Angle_Deg_Raw (A, B, Alpha),
+                              Long_Float'Min (A, A + Shortest_Delta (A, B)),
+                              Long_Float'Max (A, A + Shortest_Delta (A, B))));
 
 end Tick_Index.Blend;

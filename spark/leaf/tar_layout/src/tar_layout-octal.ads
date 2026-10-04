@@ -50,6 +50,9 @@ is
          when others => 1_152_921_504_606_846_976)
    with Ghost, Pre => N <= 20;
 
+   procedure Lemma_Pow8_Succ (N : Natural)
+   with Ghost, Pre => N < 20, Post => Pow8 (N + 1) = 8 * Pow8 (N);
+
    --  V / 8**N, computed by repeated division by 8 (no variable divisor).
    function Shift (V : Count; N : Natural) return Count is
      (if N = 0 then V else Shift (V / 8, N - 1))
@@ -60,16 +63,17 @@ is
      (Byte (48 + Shift (V, N) mod 8))
    with Ghost;
 
-   --  Numeral value of the N digits F (First .. First + N - 1), most significant first.
-   function Val (F : Byte_Array; First : Count; N : Count) return Count is
-     (if N = 0 then 0
-      else 8 * Val (F, First, N - 1) + (Count (F (First + (N - 1))) - 48))
+   --  Numeral value of the N digits F (First .. First + N - 1), most significant first:
+   --  Val (N) = 8 * Val (N - 1) + digit (N - 1), Val (0) = 0.
+   function Val (F : Byte_Array; First : Count; N : Count) return Count
    with Ghost,
-        Pre => N <= Max_Width
-               and then First >= F'First
-               and then First - F'First <= F'Length - N
-               and then (for all J in Count range 0 .. N - 1 => Is_Digit (F (First + J))),
-        Post => Val'Result < Pow8 (Natural (N)),
+        Pre  => N <= Max_Width
+                and then First >= F'First
+                and then First + N - 1 <= F'Last
+                and then (for all J in Count range 0 .. N - 1 => Is_Digit (F (First + J))),
+        Post => Val'Result = (if N = 0 then 0
+                              else 8 * Val (F, First, N - 1) + (Count (F (First + (N - 1))) - 48))
+                and then Val'Result < Pow8 (Natural (N)),
         Subprogram_Variant => (Decreases => N);
 
    --  F holds the numeral of V in the old writer's layout: Length-1 digits (leading zeros),
@@ -135,9 +139,6 @@ is
    --  Ghost lemmas
    ---------------------------------------------------------------------------
 
-   procedure Lemma_Pow8_Succ (N : Natural)
-   with Ghost, Pre => N < 20, Post => Pow8 (N + 1) = 8 * Pow8 (N);
-
    procedure Lemma_Pow8_Mono (A : Natural; B : Natural)
    with Ghost, Pre => A <= B and then B <= 20, Post => Pow8 (A) <= Pow8 (B),
         Subprogram_Variant => (Decreases => B);
@@ -151,6 +152,12 @@ is
    with Ghost, Pre => N <= 20,
         Post => (Shift (V, N) = 0) = (V < Pow8 (N)),
         Subprogram_Variant => (Decreases => N);
+
+   --  Digit_Byte is an ASCII octal digit holding the digit of V worth 8**N.
+   procedure Lemma_Digit_Byte (V : Count; N : Natural)
+   with Ghost,
+        Post => Is_Digit (Digit_Byte (V, N))
+                and then Count (Digit_Byte (V, N)) - 48 = Shift (V, N) mod 8;
 
    --  The digits of a field in the old layout denote V.
    procedure Lemma_Val_Of_Field (F : Byte_Array; V : Count)

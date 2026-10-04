@@ -288,6 +288,7 @@ procedure Test_Tick_Index is
    Div32_Over    : Natural := 0;
    Div64_Alpha1  : Natural := 0;
    Div64_Over    : Natural := 0;
+   Angle_Over    : Natural := 0;
 
    procedure Do_Set (F : File_Type) is
       Cls : constant String := Next_Word;
@@ -450,13 +451,29 @@ procedure Test_Tick_Index is
             Wd : constant Unsigned_64 := Next_Hex;
             Wr : constant Unsigned_64 := Next_Hex;
             D  : constant Long_Float := Shortest_Delta (A, B);
+            Rw : constant Long_Float := Blend_Angle_Deg_Raw (A, B, Al);
             R  : constant Long_Float := Blend_Angle_Deg (A, B, Al);
+            E  : constant Long_Float := A + D;
+            Lo : constant Long_Float := Long_Float'Min (A, E);
+            Hi : constant Long_Float := Long_Float'Max (A, E);
          begin
             Angle_Cases := Angle_Cases + 1;
             Check (To_U64 (D) = Wd, "Shortest_Delta bits vs old blendAngleDeg: a=" & Long_Float'Image (A)
                    & " b=" & Long_Float'Image (B));
-            Check (To_U64 (R) = Wr, "Blend_Angle_Deg bits vs old blendAngleDeg: a=" & Long_Float'Image (A)
+            Check (To_U64 (Rw) = Wr, "Blend_Angle_Deg_Raw bits vs old blendAngleDeg: a=" & Long_Float'Image (A)
                    & " b=" & Long_Float'Image (B));
+            Check (R >= Lo and then R <= Hi and then R >= A - 180.0 and then R <= A + 180.0,
+                   "Blend_Angle_Deg stays on the short arc (at most half a turn)");
+            if Al = 0.0 then
+               Check (R = A, "Blend_Angle_Deg alpha 0 exact");
+            end if;
+            if Al = 1.0 then
+               Check (R = E and then To_U64 (R) = Wr, "Blend_Angle_Deg alpha 1 = a + delta, as old");
+            elsif Rw >= Lo and then Rw <= Hi then
+               Check (To_U64 (R) = Wr, "Blend_Angle_Deg identical to old JS when the old value is on the arc");
+            else
+               Angle_Over := Angle_Over + 1;
+            end if;
          end;
       end loop;
    end Do_Angle;
@@ -536,6 +553,7 @@ begin
    Put_Line ("oracle: lerp32 =" & Natural'Image (Lerp32_Cases) & " lerp64 =" & Natural'Image (Lerp64_Cases)
              & " angle =" & Natural'Image (Angle_Cases) & " fmod =" & Natural'Image (Fmod_Cases));
    Put_Line ("oracle: match intervals cases =" & Natural'Image (Match_Cases));
+   Put_Line ("angle blend: old value off the arc (clamped by the new code):" & Natural'Image (Angle_Over));
    Put_Line ("lerp divergences old-vs-new (intentional): 32-bit alpha=1 differs" & Natural'Image (Div32_Alpha1)
              & ", overshoot clamped" & Natural'Image (Div32_Over) & "; 64-bit alpha=1 differs"
              & Natural'Image (Div64_Alpha1) & ", overshoot clamped" & Natural'Image (Div64_Over));

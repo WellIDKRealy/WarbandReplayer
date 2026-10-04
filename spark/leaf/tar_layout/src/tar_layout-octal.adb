@@ -3,12 +3,47 @@ package body Tar_Layout.Octal
 is
 
    ---------------------------------------------------------------------------
-   --  Ghost lemmas
+   --  Ghost specification bodies and lemmas
    ---------------------------------------------------------------------------
+
+   function Val (F : Byte_Array; First : Count; N : Count) return Count is
+   begin
+      if N = 0 then
+         return 0;
+      end if;
+      declare
+         Prev : constant Count := Val (F, First, N - 1);
+      begin
+         Lemma_Pow8_Succ (Natural (N) - 1);
+         return 8 * Prev + (Count (F (First + (N - 1))) - 48);
+      end;
+   end Val;
 
    procedure Lemma_Pow8_Succ (N : Natural) is
    begin
-      null;
+      case N is
+         when 0 => pragma Assert (Pow8 (1) = 8 * Pow8 (0));
+         when 1 => pragma Assert (Pow8 (2) = 8 * Pow8 (1));
+         when 2 => pragma Assert (Pow8 (3) = 8 * Pow8 (2));
+         when 3 => pragma Assert (Pow8 (4) = 8 * Pow8 (3));
+         when 4 => pragma Assert (Pow8 (5) = 8 * Pow8 (4));
+         when 5 => pragma Assert (Pow8 (6) = 8 * Pow8 (5));
+         when 6 => pragma Assert (Pow8 (7) = 8 * Pow8 (6));
+         when 7 => pragma Assert (Pow8 (8) = 8 * Pow8 (7));
+         when 8 => pragma Assert (Pow8 (9) = 8 * Pow8 (8));
+         when 9 => pragma Assert (Pow8 (10) = 8 * Pow8 (9));
+         when 10 => pragma Assert (Pow8 (11) = 8 * Pow8 (10));
+         when 11 => pragma Assert (Pow8 (12) = 8 * Pow8 (11));
+         when 12 => pragma Assert (Pow8 (13) = 8 * Pow8 (12));
+         when 13 => pragma Assert (Pow8 (14) = 8 * Pow8 (13));
+         when 14 => pragma Assert (Pow8 (15) = 8 * Pow8 (14));
+         when 15 => pragma Assert (Pow8 (16) = 8 * Pow8 (15));
+         when 16 => pragma Assert (Pow8 (17) = 8 * Pow8 (16));
+         when 17 => pragma Assert (Pow8 (18) = 8 * Pow8 (17));
+         when 18 => pragma Assert (Pow8 (19) = 8 * Pow8 (18));
+         when 19 => pragma Assert (Pow8 (20) = 8 * Pow8 (19));
+         when others => null;
+      end case;
    end Lemma_Pow8_Succ;
 
    procedure Lemma_Pow8_Mono (A : Natural; B : Natural) is
@@ -39,17 +74,32 @@ is
       end if;
    end Lemma_Shift_Zero;
 
+   procedure Lemma_Digit_Byte (V : Count; N : Natural) is
+   begin
+      null;
+   end Lemma_Digit_Byte;
+
    procedure Lemma_Val_Of_Field (F : Byte_Array; V : Count) is
       D : constant Natural := Natural (F'Length) - 1;
       K : Natural := 0;
    begin
       Lemma_Shift_Zero (V, D);
+      pragma Assert
+        (for all J in Count range 0 .. Count (D) - 1 =>
+           F (F'First + J) = Digit_Byte (V, D - 1 - Natural (J)));
+      for J in Count range 0 .. Count (D) - 1 loop
+         pragma Loop_Invariant
+           (for all I in Count range 0 .. J - 1 => Is_Digit (F (F'First + I)));
+         Lemma_Digit_Byte (V, D - 1 - Natural (J));
+         pragma Assert (F (F'First + J) = Digit_Byte (V, D - 1 - Natural (J)));
+         pragma Assert (Is_Digit (Digit_Byte (V, D - 1 - Natural (J))));
+         pragma Assert (Is_Digit (F (F'First + J)));
+      end loop;
       while K < D loop
          pragma Loop_Invariant (K <= D);
          pragma Loop_Invariant (Val (F, F'First, Count (K)) = Shift (V, D - K));
          Lemma_Shift_Succ (V, D - K - 1);
-         pragma Assert (Is_Digit (F (F'First + Count (K))));
-         pragma Assert (F (F'First + Count (K)) = Digit_Byte (V, D - 1 - K));
+         Lemma_Digit_Byte (V, D - 1 - K);
          K := K + 1;
       end loop;
    end Lemma_Val_Of_Field;

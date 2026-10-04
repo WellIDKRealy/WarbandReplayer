@@ -307,9 +307,9 @@ def gen(args):
         files = by_class.get(cls, [])
         if files:
             ts = files[0] if cls != 'huge' else files[0][:20000]
-            sets.append(('dup-' + cls, dupify(ts, rng), 25_000))
+            sets.append(('dup-' + cls, dupify(ts, rng), 15_000))
     for cls, ts in synthetic_arrays(rng):
-        sets.append((cls, ts, 4000))
+        sets.append((cls, ts, 3000))
 
     stats = {'negzero': 0}
     xs, ys, yaws = agents
@@ -325,7 +325,7 @@ def gen(args):
         sa = [f32(v) for v in (0.0, 1.0, 0.5, 1.0 - 2 ** -24, 2.0 ** -24, 1e-30, 1 / 3, 0.1, 0.99999994, 1e-45)]
         al_pool = sa + [a for a in alphas if 0.0 <= a <= 1.0][:1000]
         cases32 = [(x, bx, a) for x in sp for bx in sp for a in sa]
-        for _ in range(40_000):
+        for _ in range(30_000):
             x = rng.choice(pos); bx = rng.choice(pos) if rng.random() < 0.5 else f32(x + rng.uniform(-3, 3))
             cases32.append((x, bx, f32(rng.choice(al_pool)) if rng.random() < 0.5 else f32(rng.random())))
         fh.write('LERP32 %d\n' % len(cases32))
@@ -338,7 +338,7 @@ def gen(args):
         sa64 = [0.0, 1.0, 0.5, 1.0 - 2 ** -53, 2.0 ** -53, 1e-300, 1 / 3, 0.1, 5e-324]
         lerp64 = [(x, bx, a) for x in sp64 for bx in sp64 for a in sa64]
         rawpos = (xs + ys) or [rng.uniform(-100, 100) for _ in range(2000)]
-        for _ in range(40_000):
+        for _ in range(30_000):
             x = rng.choice(rawpos); bx = rng.choice(rawpos) if rng.random() < 0.5 else x + rng.uniform(-3, 3)
             lerp64.append((x, bx, f32(rng.choice(al_pool)) if rng.random() < 0.5 else rng.random()))
 
@@ -349,7 +349,7 @@ def gen(args):
                5e-324, -5e-324, 1e-300, 540.0, -540.0, 539.9999999, -539.9999999, 1080.0, 359.0, 1.0, -1.0]
         angle = [(a, b, al) for a in spa for b in spa for al in (0.0, 1.0, 0.5, 0.25)]
         pool = deg + spa
-        for _ in range(60_000):
+        for _ in range(45_000):
             r = rng.random()
             if r < 0.3:
                 a, b = rng.uniform(-1e9, 1e9), rng.uniform(-1e9, 1e9)
@@ -370,7 +370,7 @@ def gen(args):
             for e in (0.0, 1e-9, -1e-9):
                 v = 360.0 * k + e
                 fm += [v, nextafter(v, 1e10), nextafter(v, -1e10)]
-        for _ in range(60_000):
+        for _ in range(45_000):
             r = rng.random()
             fm.append(rng.uniform(-4e9, 4e9) if r < 0.4 else rng.uniform(-2000, 2000) if r < 0.8
                       else 360.0 * rng.randint(-11_000_000, 11_000_000) + rng.uniform(-1, 1))

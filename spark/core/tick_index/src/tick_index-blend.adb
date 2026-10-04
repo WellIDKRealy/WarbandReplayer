@@ -3,50 +3,12 @@ package body Tick_Index.Blend
 is
 
    -----------------------------------------------------------------------------------------------
-   --  Scaling of a difference by alpha in [0, 1]: rounding is monotone, so the product keeps D's sign
-   --  and never exceeds it in magnitude.
-   -----------------------------------------------------------------------------------------------
-
-   subtype Diff32 is Float range -2.0E30 .. 2.0E30;
-   subtype Diff64 is Long_Float range -2.0E150 .. 2.0E150;
-
-   function Scale32 (D : Diff32; Alpha : Alpha_Type) return Diff32
-   with
-     Global => null,
-     Post   => Scale32'Result = D * Alpha
-               and then (if D >= 0.0 then Scale32'Result >= 0.0 and then Scale32'Result <= D
-                         else Scale32'Result <= 0.0 and then Scale32'Result >= D)
-               and then (if Alpha = 0.0 or else D = 0.0 then Scale32'Result = 0.0)
-   is
-   begin
-      return D * Alpha;
-   end Scale32;
-
-   function Scale64 (D : Diff64; Alpha : Alpha_Wide) return Diff64
-   with
-     Global => null,
-     Post   => Scale64'Result = D * Alpha
-               and then (if D >= 0.0 then Scale64'Result >= 0.0 and then Scale64'Result <= D
-                         else Scale64'Result <= 0.0 and then Scale64'Result >= D)
-               and then (if Alpha = 0.0 or else D = 0.0 then Scale64'Result = 0.0)
-   is
-   begin
-      return D * Alpha;
-   end Scale64;
-
-   -----------------------------------------------------------------------------------------------
    --  32-bit lerp
    -----------------------------------------------------------------------------------------------
 
    function Lerp_Raw (A, B : Coord; Alpha : Alpha_Type) return Coord_Raw is
-      D : constant Diff32 := B - A;
-      P : constant Diff32 := Scale32 (D, Alpha);
-      R : constant Float := A + P;           --  old: x = x + (bx - x) * alpha;
    begin
-      --  monotone rounding of the final addition: A + P lies between A and A + D
-      pragma Assert (if D >= 0.0 then R >= A and then R <= A + D
-                     else R <= A and then R >= A + D);
-      return R;
+      return A + (B - A) * Alpha;        --  old: x = x + (bx - x) * alpha;
    end Lerp_Raw;
 
    function Lerp (A, B : Coord; Alpha : Alpha_Type) return Coord is
@@ -75,13 +37,8 @@ is
    -----------------------------------------------------------------------------------------------
 
    function Lerp64_Raw (A, B : Coord64; Alpha : Alpha_Wide) return Coord64_Raw is
-      D : constant Diff64 := B - A;
-      P : constant Diff64 := Scale64 (D, Alpha);
-      R : constant Long_Float := A + P;      --  JS: rowA.x + (rowB.x - rowA.x) * alpha
    begin
-      pragma Assert (if D >= 0.0 then R >= A and then R <= A + D
-                     else R <= A and then R >= A + D);
-      return R;
+      return A + (B - A) * Alpha;        --  JS: rowA.x + (rowB.x - rowA.x) * alpha
    end Lerp64_Raw;
 
    function Lerp64 (A, B : Coord64; Alpha : Alpha_Wide) return Coord64 is
@@ -181,14 +138,32 @@ is
       return Wrap_Delta (B - A);
    end Shortest_Delta;
 
+   function Blend_Angle_Deg_Raw (A, B : Angle_Deg; Alpha : Alpha_Wide) return Angle_Out is
+   begin
+      return A + Shortest_Delta (A, B) * Alpha;        --  old: a + delta * alpha
+   end Blend_Angle_Deg_Raw;
+
    function Blend_Angle_Deg (A, B : Angle_Deg; Alpha : Alpha_Wide) return Angle_Out is
       Delta_Angle : constant Delta_Deg := Shortest_Delta (A, B);
-      P : constant Diff64 := Scale64 (Delta_Angle, Alpha);
-      R : constant Long_Float := A + P;                --  a + delta * alpha
+      End_Angle   : constant Angle_Out := A + Delta_Angle;
    begin
-      pragma Assert (if Delta_Angle >= 0.0 then R >= A and then R <= A + Delta_Angle
-                     else R <= A and then R >= A + Delta_Angle);
-      return R;
+      if Alpha >= 1.0 then
+         return End_Angle;
+      else
+         declare
+            Lo : constant Angle_Out := Long_Float'Min (A, End_Angle);
+            Hi : constant Angle_Out := Long_Float'Max (A, End_Angle);
+            R  : constant Angle_Out := Blend_Angle_Deg_Raw (A, B, Alpha);
+         begin
+            if R < Lo then
+               return Lo;
+            elsif R > Hi then
+               return Hi;
+            else
+               return R;
+            end if;
+         end;
+      end if;
    end Blend_Angle_Deg;
 
 end Tick_Index.Blend;
