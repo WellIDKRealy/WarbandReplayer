@@ -1,0 +1,12 @@
+package body Sqlite_Header.Proofs
+  with SPARK_Mode => On
+is
+
+   procedure Lemma_Pages_Fit (Count : Long_Long_Integer; Page : Page_Bytes; Size : File_Size) is
+      Quotient : constant Long_Long_Integer := Size / Page;
+   begin
+      pragma Assert (Quotient * Page <= Size);
+      pragma Assert (Count * Page <= Quotient * Page);
+   end Lemma_Pages_Fit;
+
+end Sqlite_Header.Proofs;

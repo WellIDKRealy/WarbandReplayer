@@ -46,7 +46,7 @@ is
    end record;
 
    Initial : constant Swap_State :=
-     (Slots => (others => (Kind => Free, Seq => 0)), Last_Seq => 0);
+     (Slots => [others => (Kind => Free, Seq => 0)], Last_Seq => 0);
 
    type Status_Kind is
      (Ok,               --  done
@@ -64,10 +64,11 @@ is
    function Set_Slot (S : Swap_State; I : Slot_Id; Info : Slot_Info) return Swap_State is
      ((S with delta Slots => (S.Slots with delta I => Info)));
 
-   --  The invariant: exactly the states reachable from Initial.  (a) At most one Writing, one
-   --  Published and one In_Use slot.  (b) Free / Writing slots carry Seq 0.  (c) The Published slot
-   --  is the newest snapshot: Seq = Last_Seq.  (d) The In_Use slot has Seq in 1 .. Last_Seq and is
-   --  older than the Published slot, or is itself the newest when none is waiting.
+   --  The invariant: exactly the states a run from Initial can produce, whichever Free slot the
+   --  producer was given.  (a) At most one Writing, one Published and one In_Use slot.
+   --  (b) Free / Writing slots carry Seq 0.  (c) The Published slot is the newest snapshot:
+   --  Seq = Last_Seq.  (d) The In_Use slot has Seq in 1 .. Last_Seq and is older than the Published
+   --  slot, or is itself the newest when none is waiting.
    function Valid (S : Swap_State) return Boolean is
      ((for all I in Slot_Id =>
          (case S.Slots (I).Kind is
@@ -86,90 +87,90 @@ is
    --  the other two slots cannot both be occupied by the consumer and the waiting snapshot.
    procedure Producer_Begin (S : in out Swap_State; Status : out Status_Kind; Slot : out Slot_Id)
    with
-     Global => null,
-     Post   =>
-       (if Valid (S'Old) then Valid (S))
-       and then
-         (if not Valid (S'Old)
-          then Status = Corrupt_State and Slot = Slot_Id'First and S = S'Old
-          elsif Has_Slot (S'Old, Writing)
-          then Status = Already_Writing and Slot = Slot_Id'First and S = S'Old
-          else Status = Ok
-               and S'Old.Slots (Slot).Kind = Free
-               and (for all I in Slot_Id => (if I < Slot then S'Old.Slots (I).Kind /= Free))
-               and S = Set_Slot (S'Old, Slot, (Kind => Writing, Seq => 0)));
+     Global         => null,
+     Post           => (if Valid (S'Old) then Valid (S)),
+     Contract_Cases =>
+       (not Valid (S) =>
+          Status = Corrupt_State and Slot = Slot_Id'First and S = S'Old,
+        Valid (S) and then Has_Slot (S, Writing) =>
+          Status = Already_Writing and Slot = Slot_Id'First and S = S'Old,
+        Valid (S) and then not Has_Slot (S, Writing) =>
+          Status = Ok
+          and S'Old.Slots (Slot).Kind = Free
+          and (for all I in Slot_Id => (if I < Slot then S'Old.Slots (I).Kind /= Free))
+          and S = Set_Slot (S'Old, Slot, (Kind => Writing, Seq => 0)));
 
    --  Producer: the written slot becomes the newest Published snapshot, with sequence number
    --  Last_Seq + 1 (strictly increasing); the previously Published, unread one is superseded
    --  (Free).  The consumer's In_Use slot is untouched.
    procedure Producer_Publish (S : in out Swap_State; Status : out Status_Kind; Slot : out Slot_Id)
    with
-     Global => null,
-     Post   =>
-       (if Valid (S'Old) then Valid (S))
-       and then
-         (if not Valid (S'Old)
-          then Status = Corrupt_State and Slot = Slot_Id'First and S = S'Old
-          elsif not Has_Slot (S'Old, Writing)
-          then Status = Not_Writing and Slot = Slot_Id'First and S = S'Old
-          elsif S'Old.Last_Seq = Seq_Number'Last
-          then Status = Seq_Exhausted and Slot = Slot_Id'First and S = S'Old
-          else Status = Ok
-               and S'Old.Slots (Slot).Kind = Writing
-               and S.Last_Seq = S'Old.Last_Seq + 1
-               and S.Slots (Slot) = (Kind => Published, Seq => S.Last_Seq)
-               and (for all I in Slot_Id =>
-                      (if I /= Slot
-                       then S.Slots (I) = (if S'Old.Slots (I).Kind = Published
-                                           then Free_Info else S'Old.Slots (I)))));
+     Global         => null,
+     Post           => (if Valid (S'Old) then Valid (S)),
+     Contract_Cases =>
+       (not Valid (S) =>
+          Status = Corrupt_State and Slot = Slot_Id'First and S = S'Old,
+        Valid (S) and then not Has_Slot (S, Writing) =>
+          Status = Not_Writing and Slot = Slot_Id'First and S = S'Old,
+        Valid (S) and then Has_Slot (S, Writing) and then S.Last_Seq = Seq_Number'Last =>
+          Status = Seq_Exhausted and Slot = Slot_Id'First and S = S'Old,
+        Valid (S) and then Has_Slot (S, Writing) and then S.Last_Seq < Seq_Number'Last =>
+          Status = Ok
+          and S'Old.Slots (Slot).Kind = Writing
+          and S.Last_Seq = S'Old.Last_Seq + 1
+          and S.Slots (Slot) = (Kind => Published, Seq => S.Last_Seq)
+          and (for all I in Slot_Id =>
+                 (if I /= Slot
+                  then S.Slots (I) = (if S'Old.Slots (I).Kind = Published
+                                      then Free_Info else S'Old.Slots (I)))));
 
    --  Producer: give the written slot up without publishing it (it becomes Free).
    procedure Producer_Abort (S : in out Swap_State; Status : out Status_Kind; Slot : out Slot_Id)
    with
-     Global => null,
-     Post   =>
-       (if Valid (S'Old) then Valid (S))
-       and then
-         (if not Valid (S'Old)
-          then Status = Corrupt_State and Slot = Slot_Id'First and S = S'Old
-          elsif not Has_Slot (S'Old, Writing)
-          then Status = Not_Writing and Slot = Slot_Id'First and S = S'Old
-          else Status = Ok
-               and S'Old.Slots (Slot).Kind = Writing
-               and S = Set_Slot (S'Old, Slot, Free_Info));
+     Global         => null,
+     Post           => (if Valid (S'Old) then Valid (S)),
+     Contract_Cases =>
+       (not Valid (S) =>
+          Status = Corrupt_State and Slot = Slot_Id'First and S = S'Old,
+        Valid (S) and then not Has_Slot (S, Writing) =>
+          Status = Not_Writing and Slot = Slot_Id'First and S = S'Old,
+        Valid (S) and then Has_Slot (S, Writing) =>
+          Status = Ok
+          and S'Old.Slots (Slot).Kind = Writing
+          and S = Set_Slot (S'Old, Slot, Free_Info));
 
    --  Consumer: take the NEWEST Published snapshot (the one with Seq = Last_Seq, the largest ever
    --  published) and mark it In_Use; never a Free, Writing or older slot.  Nothing_New when none waits.
    procedure Consumer_Acquire (S : in out Swap_State; Status : out Status_Kind; Slot : out Slot_Id)
    with
-     Global => null,
-     Post   =>
-       (if Valid (S'Old) then Valid (S))
-       and then
-         (if not Valid (S'Old)
-          then Status = Corrupt_State and Slot = Slot_Id'First and S = S'Old
-          elsif Has_Slot (S'Old, In_Use)
-          then Status = Already_In_Use and Slot = Slot_Id'First and S = S'Old
-          elsif not Has_Slot (S'Old, Published)
-          then Status = Nothing_New and Slot = Slot_Id'First and S = S'Old
-          else Status = Ok
-               and S'Old.Slots (Slot).Kind = Published
-               and S'Old.Slots (Slot).Seq = S'Old.Last_Seq
-               and S = Set_Slot (S'Old, Slot, (Kind => In_Use, Seq => S'Old.Last_Seq)));
+     Global         => null,
+     Post           => (if Valid (S'Old) then Valid (S)),
+     Contract_Cases =>
+       (not Valid (S) =>
+          Status = Corrupt_State and Slot = Slot_Id'First and S = S'Old,
+        Valid (S) and then Has_Slot (S, In_Use) =>
+          Status = Already_In_Use and Slot = Slot_Id'First and S = S'Old,
+        Valid (S) and then not Has_Slot (S, In_Use) and then not Has_Slot (S, Published) =>
+          Status = Nothing_New and Slot = Slot_Id'First and S = S'Old,
+        Valid (S) and then not Has_Slot (S, In_Use) and then Has_Slot (S, Published) =>
+          Status = Ok
+          and S'Old.Slots (Slot).Kind = Published
+          and S'Old.Slots (Slot).Seq = S'Old.Last_Seq
+          and S = Set_Slot (S'Old, Slot, (Kind => In_Use, Seq => S'Old.Last_Seq)));
 
    --  Consumer: give the held slot back (it becomes Free).
    procedure Consumer_Release (S : in out Swap_State; Status : out Status_Kind; Slot : out Slot_Id)
    with
-     Global => null,
-     Post   =>
-       (if Valid (S'Old) then Valid (S))
-       and then
-         (if not Valid (S'Old)
-          then Status = Corrupt_State and Slot = Slot_Id'First and S = S'Old
-          elsif not Has_Slot (S'Old, In_Use)
-          then Status = Not_In_Use and Slot = Slot_Id'First and S = S'Old
-          else Status = Ok
-               and S'Old.Slots (Slot).Kind = In_Use
-               and S = Set_Slot (S'Old, Slot, Free_Info));
+     Global         => null,
+     Post           => (if Valid (S'Old) then Valid (S)),
+     Contract_Cases =>
+       (not Valid (S) =>
+          Status = Corrupt_State and Slot = Slot_Id'First and S = S'Old,
+        Valid (S) and then not Has_Slot (S, In_Use) =>
+          Status = Not_In_Use and Slot = Slot_Id'First and S = S'Old,
+        Valid (S) and then Has_Slot (S, In_Use) =>
+          Status = Ok
+          and S'Old.Slots (Slot).Kind = In_Use
+          and S = Set_Slot (S'Old, Slot, Free_Info));
 
 end Snapshot_Swap;
