@@ -1,0 +1,25 @@
+--  Native test project (NOT part of the proof project): differential + exhaustive tests of the SPARK
+--  sources in ../src.   gprbuild -P tests.gpr -XCONTRACTS=on|off
+--    CONTRACTS=on  : assertions enabled (-gnata): every pre/postcondition runs as a run-time check
+--    CONTRACTS=off : assertions disabled: fast, used for the big oracle runs
+project Tests is
+   type Contracts_Type is ("on", "off");
+   Contracts : Contracts_Type := external ("CONTRACTS", "off");
+
+   for Source_Dirs use ("src", "../src");
+   for Object_Dir use "obj_" & Contracts;
+   for Exec_Dir use "bin_" & Contracts;
+   for Create_Missing_Dirs use "True";
+   for Main use ("test_tick_index.adb");
+
+   package Compiler is
+      case Contracts is
+         when "on" =>
+            for Default_Switches ("Ada") use
+              ("-gnat2022", "-gnata", "-gnato", "-gnatwa", "-gnatVa", "-O1", "-ffp-contract=off");
+         when "off" =>
+            for Default_Switches ("Ada") use
+              ("-gnat2022", "-gnato", "-gnatwa", "-gnatVa", "-O2", "-ffp-contract=off");
+      end case;
+   end Compiler;
+end Tests;

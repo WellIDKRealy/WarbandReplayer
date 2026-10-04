@@ -1,0 +1,3 @@
+obj/
+tests/obj/
+tests/__pycache__/
