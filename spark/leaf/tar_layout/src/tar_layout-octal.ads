@@ -159,6 +159,13 @@ is
         Post => Is_Digit (Digit_Byte (V, N))
                 and then Count (Digit_Byte (V, N)) - 48 = Shift (V, N) mod 8;
 
+   --  Position J (from the left) of a field in the old layout is the digit worth 8**(Length-2-J).
+   procedure Lemma_Field_Digit (F : Byte_Array; V : Count; J : Count)
+   with Ghost,
+        Pre  => Octal_Field_Is (F, V) and then J <= F'Length - 2,
+        Post => F (F'First + J) = Digit_Byte (V, Natural (F'Length - 2 - J))
+                and then Is_Digit (F (F'First + J));
+
    --  The digits of a field in the old layout denote V.
    procedure Lemma_Val_Of_Field (F : Byte_Array; V : Count)
    with Ghost,

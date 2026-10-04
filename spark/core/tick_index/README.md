@@ -13,7 +13,7 @@ oracle and was not touched.
 |---|---|
 | `tick_index.gpr` | proof project (template `spark/templates/unit.gpr`) |
 | `src/tick_index.ads/.adb` | `Tick_Index`: types, `Is_Sorted`, `Last_At_Or_Before`, `Find_Tick_Index_For_Time`, `Match_Index_For_Time`, `Alpha_For`, `Locate` |
-| `src/tick_index-blend.ads/.adb` | `Tick_Index.Blend`: `Lerp_Raw`/`Lerp` (float32), `Lerp64_Raw`/`Lerp64` (double), `Fmod360`, `Wrap_Delta`, `Shortest_Delta`, `Blend_Angle_Deg` |
+| `src/tick_index-blend.ads/.adb` | `Tick_Index.Blend`: `Lerp_Raw`/`Lerp` (float32), `Lerp64_Raw`/`Lerp64` (double), `Fmod360`, `Wrap_Delta`, `Shortest_Delta`, `Blend_Angle_Deg_Raw`/`Blend_Angle_Deg` |
 | `src/tick_index-lemmas.ads/.adb` | `Tick_Index.Lemmas`: one ghost proof lemma (adjacent sortedness => all-pairs); `Ghost => Ignore`, never compiled into code |
 | `tests/` | native differential test program, oracle generator, `run_tests.sh` |
 | `PROOF.md` | final gnatprove summary, register items |
@@ -83,7 +83,7 @@ if (g_ticks[idxB].time > g_ticks[idxA].time) {
   The old clamp is realised by the two outer cases, so no division is evaluated where its quotient could leave
   [0, 1] (the old code relied on IEEE inf / out-of-range float conversion there).
 * alpha can be exactly 1.0 *before* timeB (the float conversion rounds up when `X` is within about 6E-8 of
-  `Time_B`): 12 of ~420k real-data queries.  This is the old behaviour and is kept.
+  `Time_B`): 12 of ~415k real-data queries.  This is the old behaviour and is kept.
 
 ### `matchIndexForTime` (main.js:2504) -> `Match_Index_For_Time`
 
@@ -95,18 +95,18 @@ contains X; otherwise the interval at `Result` contains X and no earlier interva
 
 `x = x + (bx - x) * alpha` with one float rounding per operator (float32 in C, double in JS).
 
-* `Lerp_Raw` / `Lerp64_Raw`: the **verbatim** old formula.  Proved: result `= A + (B - A) * Alpha`;
-  exactly `A` when `Alpha = 0` or `A = B`; never outside the bracket `[A, A + (B - A)]` spanned by its own two
-  float operations (monotone rounding, via the helper lemmas `Scale32/Scale64`).  It is *not* provable (because it is
-  false) that it stays between the endpoints or is exact at alpha = 1 - e.g. `A = 1.0, B = 1.0E-8, Alpha = 1.0`
-  gives `0.0`.
+* `Lerp_Raw` / `Lerp64_Raw`: the **verbatim** old formula.  Proved: result `= A + (B - A) * Alpha` (no overflow);
+  exactly `A` when `Alpha = 0` or `A = B`.  It is *not* provable (because it is false) that it stays between the
+  endpoints or is exact at alpha = 1 - e.g. `A = 1.0, B = 1.0E-8, Alpha = 1.0` gives `0.0`.  (That it never leaves the
+  bracket `[A, A + (B - A)]` of its own two operations is true by IEEE monotone rounding, but the SMT solvers cannot
+  discharge the float32 product bound in 60 s (cvc5: 92 s) and not at all for binary64, so it is not claimed.)
 * `Lerp` / `Lerp64`: what the new engine should call.  Proved: result in `[min (A, B), max (A, B)]`; `Alpha = 0 =>
   A`; `Alpha = 1 => B`; `Alpha < 1 => Clamp (Lerp_Raw (A, B, Alpha), min, max)` - bit-identical to the old engine
-  whenever the old value was inside the endpoints.  In 86k oracle cases the old value never overshot; it differed
-  from the new value only at `Alpha = 1` (252 of the 44k float32 cases, 82 of the 42k double cases, all in the
-  hand-picked extreme-magnitude corner set).
+  whenever the old value was inside the endpoints.  In the oracle cases the old value never overshot; it differed
+  from the new value only at `Alpha = 1` (252 of the float32 cases, 82 of the double cases, all in the hand-picked
+  extreme-magnitude corner set).
 
-### `blendAngleDeg` (main.js:795-798) -> `Fmod360`, `Wrap_Delta`, `Shortest_Delta`, `Blend_Angle_Deg`
+### `blendAngleDeg` (main.js:795-798) -> `Fmod360`, `Wrap_Delta`, `Shortest_Delta`, `Blend_Angle_Deg_Raw`, `Blend_Angle_Deg`
 
 ```js
 let delta = ((b - a + 180) % 360 + 360) % 360 - 180;   return a + delta * alpha;
@@ -119,10 +119,13 @@ let delta = ((b - a + 180) % 360 + 360) % 360 - 180;   return a + delta * alpha;
 * `Wrap_Delta (D)` = `((D + 180) % 360 + 360) % 360 - 180`.  Proved: result in `[-180, 180]` and, in the four windows
   around zero (`-540 <= D <= 540`, 1.0E-6 margins around the half turns), the result is the representative of `D`
   modulo 360 within 1.0E-12 (the formula's own rounding noise is ~1E-13).
-* `Shortest_Delta (A, B) = Wrap_Delta (B - A)`; `Blend_Angle_Deg (A, B, Alpha) = A + Shortest_Delta (A, B) * Alpha`
-  (formula pinned); `Alpha = 0 => A`; `Alpha = 1 => A + delta`; **proven bound**: the result never leaves the
-  arc between `A` and `A + delta`, hence `A - 180 <= Result <= A + 180` (the blend travels at most half a turn,
-  never the long way round; no 359deg -> 0deg spin).
+* `Shortest_Delta (A, B) = Wrap_Delta (B - A)` (the `delta` of the old function).
+* `Blend_Angle_Deg_Raw (A, B, Alpha)`: the verbatim `a + delta * alpha` (formula pinned; `Alpha = 0 => A`;
+  `Alpha = 1 => A + delta`).
+* `Blend_Angle_Deg`: what the new engine should call.  **Proven bound**: the result lies on the short arc between `A`
+  and `A + delta`, hence `A - 180 <= Result <= A + 180` (the blend travels at most half a turn, never the long way
+  round: no 359deg -> 0deg spin); `Alpha = 0 => A`; `Alpha = 1 => A + delta`; `Alpha < 1 => Clamp64 (raw, arc ends)` -
+  bit-identical to the old function whenever the old value was on the arc (always, in 65k oracle cases).
 
 ## Intentional differences from the old code
 

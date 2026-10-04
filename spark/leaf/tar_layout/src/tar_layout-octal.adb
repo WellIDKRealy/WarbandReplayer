@@ -79,27 +79,24 @@ is
       null;
    end Lemma_Digit_Byte;
 
+   procedure Lemma_Field_Digit (F : Byte_Array; V : Count; J : Count) is
+   begin
+      Lemma_Digit_Byte (V, Natural (F'Length - 2 - J));
+   end Lemma_Field_Digit;
+
    procedure Lemma_Val_Of_Field (F : Byte_Array; V : Count) is
       D : constant Natural := Natural (F'Length) - 1;
       K : Natural := 0;
    begin
       Lemma_Shift_Zero (V, D);
-      pragma Assert
-        (for all J in Count range 0 .. Count (D) - 1 =>
-           F (F'First + J) = Digit_Byte (V, D - 1 - Natural (J)));
-      for J in Count range 0 .. Count (D) - 1 loop
-         pragma Loop_Invariant
-           (for all I in Count range 0 .. J - 1 => Is_Digit (F (F'First + I)));
-         Lemma_Digit_Byte (V, D - 1 - Natural (J));
-         pragma Assert (F (F'First + J) = Digit_Byte (V, D - 1 - Natural (J)));
-         pragma Assert (Is_Digit (Digit_Byte (V, D - 1 - Natural (J))));
-         pragma Assert (Is_Digit (F (F'First + J)));
-      end loop;
       while K < D loop
          pragma Loop_Invariant (K <= D);
+         pragma Loop_Invariant
+           (for all I in Count range 0 .. Count (K) - 1 => Is_Digit (F (F'First + I)));
          pragma Loop_Invariant (Val (F, F'First, Count (K)) = Shift (V, D - K));
-         Lemma_Shift_Succ (V, D - K - 1);
+         Lemma_Field_Digit (F, V, Count (K));
          Lemma_Digit_Byte (V, D - 1 - K);
+         Lemma_Shift_Succ (V, D - K - 1);
          K := K + 1;
       end loop;
    end Lemma_Val_Of_Field;
