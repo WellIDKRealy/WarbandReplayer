@@ -32,7 +32,7 @@ so nothing besides the items marked PROVED-AND-CHECKED may be called "proven" in
 | Gate-0 spike: tick lookup | `spark/spikes/tick_lookup` | PROVED-AND-CHECKED: 27 checks, 0 unproved, mutation-style break tested during development |
 | `Limits` package | `spark/leaf/limits` | PROVED-AND-CHECKED: 2 checks, 0 unproved; two mutations break it |
 | `boundary_segmentation` | `spark/core/` | author reports PROVED: 467 checks, 0 unproved, 0 assumptions; ghost spec = literal transcription of `sql/default_boundary_detection.sql`; tests vs 31 real cases + 2400 synthetic (real SQL) + 13.1M exhaustive; 12/12 mutations killed. **Independent verification (mutation/differential/audit/robustness), limits alignment, simplicity audit NOT yet done** |
-| `snapshot_swap` | `spark/core/` | author reports PROVED: 67 checks, 0 unproved; 3-slot latest-wins protocol; exhaustive 12.2M-step model check; 97 ns per hand-off cycle. **Independent verification NOT yet done** |
+| `snapshot_swap` | `spark/core/` | RE-VERIFIED: 67 checks, 0 unproved, 0 assumptions (re-proved), tests pass, **6/6 body mutants rejected** (see its PROOF.md); 3-slot latest-wins protocol; exhaustive 12.2M-step model check; 97 ns per hand-off cycle. Still pending: independent oracle/audit, robustness/simplicity review, limits alignment |
 | `tick_index` (+ `-blend`, `-lemmas`) | `spark/core/` | WIP: author was still working (float lerp/blend proofs are the hard part). Status unknown: re-run `prove.sh` |
 | `tar_layout` (+ `-octal`) | `spark/leaf/` | WIP, partial |
 | `camera_projection`, `loader_lifecycle`, `sqlite_header`, `recorder_schema` | `spark/core/` | WIP, authors had just started; files are partial |

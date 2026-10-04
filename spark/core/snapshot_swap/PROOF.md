@@ -157,3 +157,14 @@ most of the cost, and is what makes the operations total.
   slot" of the contract. Loop invariants are written `J < I`, not `Slot_Id'First .. I - 1`, so they cannot go out of range at I = 0.
 * Slot_Count is a constant (3). The code and contracts are written over `Slot_Id` loops and quantifiers, but the progress lemma
   needs at least 3 slots, and the tests and the model are for 3.
+
+## Independent re-verification (second session, by re-running everything)
+- `spark/tools/prove.sh spark/core/snapshot_swap`: exit 0, **67 checks, 0 unproved, 0 pragma Assume**.
+- `tests/run_tests.sh`: ALL TESTS PASSED (1.9 s).
+- **Body mutation check: 6 of 6 mutants rejected by gnatprove** (the body has only 6 mutable operator sites outside contracts/ghost code):
+  `<`->`<=` (line 12), `/=`->`=` (12), `and then`->`or else` (12: "contract case might fail"), `=`->`/=` (18),
+  `=`->`/=` (48: "overflow check might fail ... S.Last_Seq + 1"), `+ 1`->`+ 2` (55: "overflow check might fail"). Three of the six first hit a 240 s
+  timeout and were re-run with a 900 s limit to obtain definite failures (630 s, 254 s, 255 s).
+- Scope/limits of this check: it mutates the BODY only (the contracts in the `.ads` are the specification, so mutating them is not a test of the proof).
+  NOT yet done for this unit: an independently written oracle and audit, the robustness/simplicity/speed review, and the limits-alignment pass
+  (docs/limits.md). Until those are done the unit is "re-verified", not fully "verified".
