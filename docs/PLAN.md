@@ -116,7 +116,7 @@ a correct in-process lock table) only if a stall is measured.
 ## Proof policy and the proof-boundary register
 Every unit: SPARK contracts first (Silver: no run-time errors; Gold: functional postconditions that PIN behaviour); `spark/tools/prove.sh` exits 0
 (0 unproved, 0 unregistered `pragma Assume`); a scripted MUTATION of the body must make gnatprove FAIL (the spec is not vacuous); native differential
-tests against the old-tree oracle on all 31 real files + randomised/corrupted inputs; suites < 10 s. Things that cannot be proven — each needs the
+tests against the old-tree oracle on all 31 real files + randomised/corrupted inputs; suites < 10 s. **Limits are first-class** (docs/limits.md + the proven `spark/leaf/limits` package): every numeric bound comes from `Limits`, and each unit's contracts pin behaviour at limit-1, limit and limit+1 with an explicit `Limit_Exceeded` beyond it, for the full range of the raw input type (never wraparound, truncation or UB). Things that cannot be proven — each needs the
 owner's explicit permission to be tested instead:
  R1 SQLite internals (C, stays by decree; includes the session extension) — Ada binding contracts are trusted assumptions; mitigated by differential
     tests vs the old engine and `integrity_check` on produced files.
@@ -158,10 +158,21 @@ owner's explicit permission to be tested instead:
    owner's "local work to rebase later" lives) happens only after confirming with the owner at that moment. Old hashes change; clones must reset.
 
 ## Current state and next actions
-Done: branch at `b83c380` + pushed commits (docs, tooling, WIP snapshots, corrected charter); proof tooling; real data + goldens; GNAT-LLVM build launched; batch-1
+Done: branch at `b83c380` + pushed commits (docs, tooling, WIP snapshots, corrected charter, limits catalogue + proven Limits package); proof tooling; real data + goldens; synthetic 1/1/4 GB fixtures; old-engine baselines (fails above ~1 GB regardless of content); new-pipeline timings (native, real 1.1 GB: open battle median 0.10 s, extract-all 17.9 s) and wasm32 ~2.0x native; GNAT-LLVM build launched but no compiler found (blocked on log access); batch-1
 workflow running (2 concurrent agents on 4 CPUs; ~2 h per author; verifications queue behind all authors).
-Next: (1) read batch-1 results, fix/redo failed units, remove `eviction_policy`; (2) run robustness/simplicity/speed audit lenses on every unit; (3) batch 2;
-(4) synthetic fixtures + old-engine baselines (when CPU is free of provers); (5) Gate 0 spikes once the build is confirmed; (6) continue down the phases.
+Why it looked idle: I serialised work out of CPU caution. Proof agents are model-latency-bound, not CPU-bound, and the workflow concurrency cap is per workflow, so
+several streams run in parallel (<= ~4 agents total plus the build and short prover bursts).
+START IMMEDIATELY (all independent of batch 1):
+ (a) **Batch-2 proof workflow now**, concurrent with batch 1 (same factory: author -> prove -> mutation/differential/audit verifiers -> repair -> commit),
+     units: SQLite file-header/page-count validator, recorder-schema validator, data-sanity/plausibility validator, tar+xz bundle validator, sha256, write-back
+     SQL statement builder (uses the tokenizer), camera/projection (float), frame-snapshot swap protocol, loader/lifecycle + per-battle status state machines,
+     workspace atomic-publish protocol, change-set history log, mutex/ready-flag state machines, mem/str shim. Every unit gets the Guarantees/simplicity rule.
+ (b) **Synthetic 1 GB / 4 GB fixtures** (`testdata/make_synthetic_fixture.py` extended; real schema, controllable battle count/size) — a short CPU/disk burst.
+ (c) **Gate 0 spike attempt** using the GNAT-LLVM toolchain (tick-lookup -> wasm32 object -> `wasm-ld` -> node; then the shared-memory atomics spike). Its
+     success or failure tells me the build's state without reading its log; if it is not built I report and ask.
+ (d) **Old-engine baselines** (time/RSS on the 1.1 GB file, golden frames via the Playwright harness) when no heavy prover run is mid-flight.
+AS THEY FINISH: read batch-1 results, fix/redo failed units, remove `eviction_policy`; run robustness/simplicity/speed audit lenses on every unit; run the **limits alignment pass** (replace ad-hoc bounds by `Limits`, prove behaviour at limit-1/limit/limit+1, `Limit_Exceeded` beyond; add the build-time check that SQLite's `sqlite3_limit()` values and the wasm memory configuration equal the constants); then the
+Phase-3 threading spike and the phases after it.
 
 ## Verification (end to end)
 `gnatprove` 0 unproved on every unit (CI gate); mutation check per unit; differential run old vs new on all real files + synthetic 1/4 GB (match table, frames,
