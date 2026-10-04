@@ -12,7 +12,7 @@ Rows marked **(debug)** are only visible with `?debug=1` / `localStorage wb_debu
 - [ ] Upload overlay, "Load Replay Database" (`.sqlite`) — `main.html:333-345`, `main.js:5205`, `startReplayLoad main.js:2692`
 - [ ] "Load Battle Export (.tar.xz)" — `main.html:340`, `main.js:5211`, `startBattleFileLoad :2730`, `parseTar :12`
 - [ ] Loading overlay with progress bar and status text — `main.html:351-358`, `main.js:5078`, `:5110`
-- [ ] Parallel map-bounds readers, `?readerCount=` override, `deviceMemory` clamp — `main.js:5097-5101`
+- [ ] Worker-thread count chosen from cores/`deviceMemory` with an override flag (old `?readerCount=`) — `main.js:5097-5101`; (old map-bounds reader scans are replaced by per-battle SQL aggregates at extraction)
 - [ ] `index.html` redirects to `main.html`
 - [ ] Cross-origin isolation shim for static hosting — `coi-shim.js`; dev server COOP/COEP — `serve.py:17-38`
 - [ ] URL/localStorage flags: `?debug=1`, `wb_debug` (`main.js:52`), `?primingBudgetMiB=N` (`:2339`)
@@ -21,7 +21,7 @@ Rows marked **(debug)** are only visible with `?debug=1` / `localStorage wb_debu
 - [ ] Timeline bar with per-match coloured blocks, click to jump ("Jump to Match #n") — `main.js:2073-2245`
 - [ ] Play/Pause button; Space toggles; auto-pause at end — `main.js:5255-5262`, `:5331-5336`
 - [ ] Playback speed 0.5, 1, 1.5, 2, 4, 8 — `main.js:2146-2161`
-- [ ] Per-match prefetch/prime indicators (dim / faint / bright), fade on eviction — `main.js:2649-2681`
+- [ ] Per-battle readiness indicators on the timeline (old: dim / faint / bright; new: not-opened / extracting / ready / damaged) — `main.js:2649-2681`
 - [ ] Scrub slider, seek, slider follows playback — `main.js:2375`, `:2385`
 - [ ] Match info "MATCH #n | Scene | Factions", "Time: +x.xxs", "Out of match boundaries" — `main.js:2385-2412`
 - [ ] Decoupled render loop, at most one frame request in flight — `main.js:5322-5356`
@@ -71,11 +71,11 @@ Rows marked **(debug)** are only visible with `?debug=1` / `localStorage wb_debu
 - [ ] SQL Docs panel — `main.html:222`
 - [ ] SQL variables (public query API): `CURRENT_TICK`, `CURRENT_TICK_B`, `CURRENT_TIME`, `CURRENT_BATTLE`, `CURRENT_BATTLE_TICK_START/END`, `CURRENT_BATTLE_ROWID_LO/HI`, `CURSOR_X/Y` — `replay_worker.c:1527-1620`
 - [ ] System Logs panel — `main.html:57`, `main.js:1986`
-- [ ] VFS Trace panel: index visible, get VFS traces, reset traces, lock counters, heap info — `main.html:70`, `main.js:5035-5075`
+- [ ] VFS Trace panel: index visible, VFS read/write traces, reset traces, lock/mutex counters, heap (arena) info — `main.html:70`, `main.js:5035-5075`
 
 ## Engine behaviours with user-visible effect
 - [ ] SQL-defined battle boundary detection (merge window 15 ticks, min span 10, tail >= 5, skip first 5 ticks) — `sql/default_boundary_detection.sql`, `replay_worker.c:1419-1487`
-- [ ] Per-battle index priming and prefetch ahead of the cursor with memory budget; never evicts the live battle; Firefox no-concurrent-OPFS path — `replay_worker.c:396-677`, `main.js:2338`, `:2516-2640`
+- [ ] Battles are prepared ahead of the cursor on idle threads (only if needed to meet the open-battle budget), the live battle is never discarded, and Firefox's single-sync-handle limit is respected — `replay_worker.c:396-677`, `main.js:2338`, `:2516-2640` (mechanism replaced by per-battle files)
 - [ ] Battle summary prewarm — `replay_export.c:649`, `main.js:2620`
 - [ ] Checkpoint revert rebuilds derived data — `sql_terminal.c:188`, `replay_worker.c:1489`
 - [ ] Error recovery: errors during playback clear in-flight gates instead of wedging — `main.js:2955-2985`
