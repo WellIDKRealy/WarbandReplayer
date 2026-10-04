@@ -1,0 +1,18 @@
+--  Template for a proof unit: copy to spark/<group>/<unit>/<unit>.gpr and edit the project name.
+--  Layout: src/ (SPARK sources), tests/ (native differential tests, NOT part of the proof project).
+--  Prove:   spark/tools/prove.sh spark/<group>/<unit>
+project Unit is
+   for Source_Dirs use ("src");
+   for Object_Dir use "obj";
+   for Create_Missing_Dirs use "True";
+
+   package Compiler is
+      --  Target constraints (GNAT-LLVM/wasm32): no tasking, no nested subprograms, no non-local
+      --  exception propagation. Keep units zero-footprint (no Ada.Text_IO, no containers).
+      for Default_Switches ("Ada") use ("-gnat2022", "-gnata", "-gnatwa", "-O1");
+   end Compiler;
+
+   package Prove is
+      for Proof_Switches ("Ada") use ("--level=4", "--report=all", "--timeout=60");
+   end Prove;
+end Unit;
