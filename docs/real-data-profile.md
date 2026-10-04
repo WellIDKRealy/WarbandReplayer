@@ -37,3 +37,11 @@ Counts only — the data itself contains other players' names and chat and must 
 - **Open one battle** (bisect rowid range, copy its rows into its own file, index, bounds, derive roster/corpses): median 0.098 s,
   p95 0.25 s, max 0.41 s (largest battle 374,315 agent rows) — budget 1.5 s.
 - **Extract all 158 battles on ONE thread: 17.9 s** — budget 60 s. All per-battle replay files together: 1.30 GB; all derived battle files: 4.4 MB.
+
+### Old engine vs file size (same schema; real file and synthetic files from `testdata/make_large_fixture.py`)
+| File | Result |
+|---|---|
+| 202 MB real | ready in 39.7 s, 16 battles shown |
+| 694 MB synthetic (88 battles) | ready only after **131 s**, 1.96 GB peak browser memory, 16 of 88 battles shown |
+| 1.11 GB real (158 battles) | **fails**: "database disk image is malformed" |
+| 1.26 GB synthetic (158 battles) | **fails** with the same error — so the cause is file size, not content (cutoff between 0.69 and 1.1 GB, probably ~1 GiB) |
