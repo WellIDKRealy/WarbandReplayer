@@ -19,36 +19,36 @@ is
       Real_Seen : Boolean := False;
    begin
       for I in Declared'Range loop
-         if Matches_At (Declared, I, "int") then
+         if Matches_At (Declared, I, Kw_Int) then
             return Integer_Affinity;
          end if;
-         if Matches_At (Declared, I, "char")
-           or else Matches_At (Declared, I, "clob")
-           or else Matches_At (Declared, I, "text")
+         if Matches_At (Declared, I, Kw_Char)
+           or else Matches_At (Declared, I, Kw_Clob)
+           or else Matches_At (Declared, I, Kw_Text)
          then
             Text_Seen := True;
          end if;
-         if Matches_At (Declared, I, "blob") then
+         if Matches_At (Declared, I, Kw_Blob) then
             Blob_Seen := True;
          end if;
-         if Matches_At (Declared, I, "real")
-           or else Matches_At (Declared, I, "floa")
-           or else Matches_At (Declared, I, "doub")
+         if Matches_At (Declared, I, Kw_Real)
+           or else Matches_At (Declared, I, Kw_Floa)
+           or else Matches_At (Declared, I, Kw_Doub)
          then
             Real_Seen := True;
          end if;
          pragma Loop_Invariant
-           (not (for some J in Declared'First .. I => Matches_At (Declared, J, "int")));
+           (not (for some J in Declared'First .. I => Matches_At (Declared, J, Kw_Int)));
          pragma Loop_Invariant
            (Text_Seen = (for some J in Declared'First .. I =>
-                           Matches_At (Declared, J, "char") or else Matches_At (Declared, J, "clob")
-                           or else Matches_At (Declared, J, "text")));
+                           Matches_At (Declared, J, Kw_Char) or else Matches_At (Declared, J, Kw_Clob)
+                           or else Matches_At (Declared, J, Kw_Text)));
          pragma Loop_Invariant
-           (Blob_Seen = (for some J in Declared'First .. I => Matches_At (Declared, J, "blob")));
+           (Blob_Seen = (for some J in Declared'First .. I => Matches_At (Declared, J, Kw_Blob)));
          pragma Loop_Invariant
            (Real_Seen = (for some J in Declared'First .. I =>
-                           Matches_At (Declared, J, "real") or else Matches_At (Declared, J, "floa")
-                           or else Matches_At (Declared, J, "doub")));
+                           Matches_At (Declared, J, Kw_Real) or else Matches_At (Declared, J, Kw_Floa)
+                           or else Matches_At (Declared, J, Kw_Doub)));
       end loop;
       if Text_Seen then
          return Text_Affinity;

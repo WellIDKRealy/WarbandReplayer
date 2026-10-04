@@ -1,0 +1,118 @@
+{
+  "file": "replayLog_2026-09-08_22-04-40.sqlite",
+  "bytes": 202543104,
+  "loadavg": 1.81591796875,
+  "ready": true,
+  "seconds_to_ready": 39.7,
+  "loading_text_sequence": [
+    [
+      0.1,
+      "STARTING WORKER POOL..."
+    ],
+    [
+      0.4,
+      "LOADING... 2%"
+    ],
+    [
+      0.6,
+      "LOADING... 6%"
+    ],
+    [
+      0.9,
+      "LOADING... 10%"
+    ],
+    [
+      1.1,
+      "LOADING... 17%"
+    ],
+    [
+      1.4,
+      "LOADING... 19%"
+    ],
+    [
+      1.7,
+      "LOADING... 25%"
+    ],
+    [
+      1.9,
+      "LOADING... 29%"
+    ],
+    [
+      2.2,
+      "LOADING... 33%"
+    ],
+    [
+      2.4,
+      "LOADING... 38%"
+    ],
+    [
+      2.7,
+      "LOADING... 45%"
+    ],
+    [
+      2.9,
+      "LOADING... 50%"
+    ],
+    [
+      3.2,
+      "LOADING... 55%"
+    ],
+    [
+      3.4,
+      "LOADING... 60%"
+    ],
+    [
+      3.7,
+      "LOADING... 65%"
+    ],
+    [
+      4.0,
+      "LOADING... 66%"
+    ],
+    [
+      4.2,
+      "LOADING... 68%"
+    ],
+    [
+      4.5,
+      "LOADING... 75%"
+    ],
+    [
+      4.7,
+      "LOADING... 83%"
+    ],
+    [
+      5.0,
+      "LOADING... 89%"
+    ],
+    [
+      5.3,
+      "LOADING... 94%"
+    ],
+    [
+      5.5,
+      "LOADING... 100%"
+    ],
+    [
+      6.0,
+      "COMPUTING MAP BOUNDS (PARALLEL)... 0/4 READERS DONE"
+    ],
+    [
+      26.7,
+      "COMPUTING MAP BOUNDS (PARALLEL)... 50% (2/4 READERS DONE)"
+    ],
+    [
+      26.9,
+      "COMPUTING MAP BOUNDS (PARALLEL)... 100% (4/4 READERS DONE)"
+    ],
+    [
+      39.7,
+      "Computing map bounds (parallel)... 100% (4/4 readers done)"
+    ]
+  ],
+  "alerts": [],
+  "page_errors": [],
+  "battles_on_timeline": 16,
+  "fps_software_gl": 7.490717752252077,
+  "peak_browser_rss_mb": 0
+}

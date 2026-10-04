@@ -1,0 +1,3 @@
+--  Contracts build: check every pre/postcondition and assertion, but not the loop invariants (they are
+--  quadratic when executed; the prover has discharged them, and the postconditions are what matter here).
+pragma Assertion_Policy (Pre => Check, Post => Check, Loop_Invariant => Ignore, Assert => Check);

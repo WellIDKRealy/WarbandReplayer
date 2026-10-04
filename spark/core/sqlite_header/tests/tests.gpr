@@ -1,0 +1,25 @@
+--  Native differential tests and benchmark for Sqlite_Header (not part of the proof project).
+--    gprbuild -P tests.gpr -XMODE=fast        run-time checks on, contracts not executed (full workload)
+--    gprbuild -P tests.gpr -XMODE=contracts   -gnata: every postcondition (and the ghost specification) executed
+--    gprbuild -P tests.gpr -XMODE=nochecks    -gnatp: the configuration proven code is built with (benchmark)
+project Tests is
+   type Mode_Type is ("fast", "contracts", "nochecks");
+   Mode : Mode_Type := external ("MODE", "fast");
+
+   for Source_Dirs use ("../src", ".");
+   for Main use ("test_sqlite_header.adb", "bench_sqlite_header.adb");
+   for Object_Dir use "obj/" & Mode;
+   for Exec_Dir use "obj/" & Mode;
+   for Create_Missing_Dirs use "True";
+
+   package Compiler is
+      case Mode is
+         when "fast" =>
+            for Default_Switches ("Ada") use ("-gnat2022", "-gnato", "-gnatVa", "-gnatwa", "-gnatwJ", "-O2");
+         when "contracts" =>
+            for Default_Switches ("Ada") use ("-gnat2022", "-gnata", "-gnato", "-gnatVa", "-gnatwa", "-gnatwJ", "-O1");
+         when "nochecks" =>
+            for Default_Switches ("Ada") use ("-gnat2022", "-gnatp", "-gnatwa", "-gnatwJ", "-O2");
+      end case;
+   end Compiler;
+end Tests;

@@ -1,0 +1,174 @@
+{
+  "file": "synth_1g_many.sqlite",
+  "bytes": 1255829504,
+  "loadavg": 3.82666015625,
+  "ready": false,
+  "seconds_to_ready": 20.8,
+  "loading_text_sequence": [
+    [
+      10.1,
+      "LOADING... 45%"
+    ],
+    [
+      10.3,
+      "LOADING... 46%"
+    ],
+    [
+      10.6,
+      "LOADING... 48%"
+    ],
+    [
+      10.8,
+      "LOADING... 49%"
+    ],
+    [
+      11.1,
+      "LOADING... 51%"
+    ],
+    [
+      11.3,
+      "LOADING... 52%"
+    ],
+    [
+      11.6,
+      "LOADING... 53%"
+    ],
+    [
+      11.8,
+      "LOADING... 55%"
+    ],
+    [
+      12.1,
+      "LOADING... 56%"
+    ],
+    [
+      12.4,
+      "LOADING... 58%"
+    ],
+    [
+      12.6,
+      "LOADING... 59%"
+    ],
+    [
+      12.9,
+      "LOADING... 60%"
+    ],
+    [
+      13.1,
+      "LOADING... 62%"
+    ],
+    [
+      13.4,
+      "LOADING... 63%"
+    ],
+    [
+      13.6,
+      "LOADING... 64%"
+    ],
+    [
+      13.9,
+      "LOADING... 66%"
+    ],
+    [
+      14.1,
+      "LOADING... 67%"
+    ],
+    [
+      14.4,
+      "LOADING... 68%"
+    ],
+    [
+      14.7,
+      "LOADING... 70%"
+    ],
+    [
+      14.9,
+      "LOADING... 71%"
+    ],
+    [
+      15.2,
+      "LOADING... 72%"
+    ],
+    [
+      15.4,
+      "LOADING... 73%"
+    ],
+    [
+      15.7,
+      "LOADING... 75%"
+    ],
+    [
+      15.9,
+      "LOADING... 76%"
+    ],
+    [
+      16.2,
+      "LOADING... 78%"
+    ],
+    [
+      16.4,
+      "LOADING... 79%"
+    ],
+    [
+      16.7,
+      "LOADING... 81%"
+    ],
+    [
+      17.0,
+      "LOADING... 83%"
+    ],
+    [
+      17.2,
+      "LOADING... 84%"
+    ],
+    [
+      17.5,
+      "LOADING... 86%"
+    ],
+    [
+      17.8,
+      "LOADING... 87%"
+    ],
+    [
+      18.1,
+      "LOADING... 88%"
+    ],
+    [
+      18.4,
+      "LOADING... 89%"
+    ],
+    [
+      19.2,
+      "LOADING... 91%"
+    ],
+    [
+      19.5,
+      "LOADING... 93%"
+    ],
+    [
+      19.7,
+      "LOADING... 94%"
+    ],
+    [
+      20.0,
+      "LOADING... 95%"
+    ],
+    [
+      20.3,
+      "LOADING... 97%"
+    ],
+    [
+      20.5,
+      "LOADING... 99%"
+    ],
+    [
+      20.8,
+      "LOADING... 100%"
+    ]
+  ],
+  "alerts": [
+    "Failed to load replay: database disk image is malformed"
+  ],
+  "page_errors": [],
+  "peak_browser_rss_mb": 1598
+}

@@ -9,4 +9,9 @@ is
       pragma Assert (Count * Page <= Quotient * Page);
    end Lemma_Pages_Fit;
 
+   procedure Lemma_Ok_Means_Sane (Header : Header_Bytes; Length : Header_Length; Size : File_Size) is
+   begin
+      null;   --  every conjunct of the postcondition is a negated branch condition of Validate's
+   end Lemma_Ok_Means_Sane;
+
 end Sqlite_Header.Proofs;

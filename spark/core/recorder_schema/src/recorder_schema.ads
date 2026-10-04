@@ -106,6 +106,16 @@ is
    function Contains (S : String; Word : String) return Boolean is
      (for some I in S'Range => Matches_At (S, I, Word));
 
+   --  The words of the five rules (lower case; the rules ignore ASCII case).
+   Kw_Int  : constant String := "int";
+   Kw_Char : constant String := "char";
+   Kw_Clob : constant String := "clob";
+   Kw_Text : constant String := "text";
+   Kw_Blob : constant String := "blob";
+   Kw_Real : constant String := "real";
+   Kw_Floa : constant String := "floa";
+   Kw_Doub : constant String := "doub";
+
    --  The five rules in order: contains "INT" -> INTEGER; "CHAR" / "CLOB" / "TEXT" -> TEXT;
    --  "BLOB" or no declared type at all -> BLOB; "REAL" / "FLOA" / "DOUB" -> REAL; else NUMERIC.
    --  Total: any bytes, any length (an embedded NUL is an ordinary byte).
@@ -113,12 +123,12 @@ is
    with
      Post =>
        Affinity_Of'Result =
-         (if Contains (Declared, "int") then Integer_Affinity
-          elsif Contains (Declared, "char") or else Contains (Declared, "clob")
-                or else Contains (Declared, "text") then Text_Affinity
-          elsif Declared'Length = 0 or else Contains (Declared, "blob") then Blob_Affinity
-          elsif Contains (Declared, "real") or else Contains (Declared, "floa")
-                or else Contains (Declared, "doub") then Real_Affinity
+         (if Contains (Declared, Kw_Int) then Integer_Affinity
+          elsif Contains (Declared, Kw_Char) or else Contains (Declared, Kw_Clob)
+                or else Contains (Declared, Kw_Text) then Text_Affinity
+          elsif Declared'Length = 0 or else Contains (Declared, Kw_Blob) then Blob_Affinity
+          elsif Contains (Declared, Kw_Real) or else Contains (Declared, Kw_Floa)
+                or else Contains (Declared, Kw_Doub) then Real_Affinity
           else Numeric_Affinity);
 
    --  Affinity of a stored declared type (only its stored bytes: see Text).

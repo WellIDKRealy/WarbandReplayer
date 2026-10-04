@@ -18,7 +18,7 @@ Each line below is a proved contract (gnatprove 14.1, level 4, 0 unproved; see `
 | Old behaviour (oracle) | none: new unit (the old `main.js` loop simply drew "the most recently received snapshot", with no protocol) |
 | Proof status | `PROOF.md`: 0 unproved, 0 `pragma Assume`, no `SPARK_Mode (Off)`, no `Annotate` justification |
 | Sources | `src/snapshot_swap.ads/.adb` (Pure, no state, no elaboration code), `src/snapshot_swap-proofs.ads/.adb` (two ghost lemmas) |
-| Tests | `tests/run_tests.sh` (about 6 s): all operation sequences up to length 10 against a naive Python model |
+| Tests | `tests/run_tests.sh` (2 s warm, up to 7 s cold on a loaded machine): all operation sequences up to length 10 against a naive Python model |
 
 ## How to use it
 
@@ -97,7 +97,8 @@ None: this is a new unit. (The old loop in `main.js` drew the last snapshot that
 * **Directed scenarios** (a full life of the protocol, sequence-number saturation, six corrupt states) written out by hand.
 * **Random walk** of 5 million operations against an independent shadow model: exclusivity, strictly increasing acquired numbers, newest-wins.
 * The `-gnata` build executes every contract (including `Valid` and the `Contract_Cases`) on a smaller workload.
-* `tests/bench.adb`: the native micro-benchmark (numbers in `PROOF.md`).
+* `tests/bench.adb`: the native micro-benchmark (numbers in `PROOF.md`); run it with
+  `gprbuild -P tests/tests.gpr -XCONTRACTS=off bench.adb && tests/bin_off/bench`.
 
 ## Layout
 
