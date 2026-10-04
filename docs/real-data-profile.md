@@ -45,3 +45,9 @@ Counts only — the data itself contains other players' names and chat and must 
 | 694 MB synthetic (88 battles) | ready only after **131 s**, 1.96 GB peak browser memory, 16 of 88 battles shown |
 | 1.11 GB real (158 battles) | **fails**: "database disk image is malformed" |
 | 1.26 GB synthetic (158 battles) | **fails** with the same error — so the cause is file size, not content (cutoff between 0.69 and 1.1 GB, probably ~1 GiB) |
+
+## wasm32 vs native, same code and SQLite (`testdata/wasm_bench`, real 30 MB file, 3 battles / 36 repeated battles)
+- Native 147 ms per battle, **wasm32-wasi 298-300 ms per battle: about 2.0x slower**. So the native numbers above double for wasm:
+  open one battle ~0.2 s median (~0.8 s max), extract-all of the 158 real battles on one thread ~36 s — still inside the 1.5 s / 60 s budgets.
+- Larger inputs crashed Node 22's V8 in this container (segfault, not a wasm trap) when several hundred MB of wasm memory were held across repeated
+  open/close; real-browser measurements are required for CI (see `docs/limits.md`).

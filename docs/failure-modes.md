@@ -71,3 +71,15 @@ for malformed input; native differential tests feed it the same corruption corpu
 - **Damage isolation:** a damaged battle is marked "damaged (rows lo..hi, reason)" and stays visible in the timeline; every
   other battle remains playable. One bad page never takes down the whole replay.
 - Real corpus has no naturally corrupted file (all 39 pass `quick_check`), so every FAULT test uses injected corruption.
+
+## H. Limits (docs/limits.md): every limit crossing is a typed error, proven at limit-1, limit and limit+1
+- [ ] Source file larger than the database size limit, or whose size is not an exact JS Number -> `Too_Large`
+- [ ] Header claims more pages than SQLite allows / invalid page size -> typed header error (not a crash in SQLite later)
+- [ ] SQL text longer than `Max_Sql_Length`; a value longer than `Max_Value_Length`; more than `Max_Columns` columns or `Max_Variables` variables
+- [ ] Identifier longer than `Max_Identifier_Bytes`; checkpoint/script name longer than `Max_Name_Bytes`
+- [ ] Buffer request above `Max_Buffer_Bytes`; `memory.grow` failure; arena exhaustion -> `Out_Of_Memory` (never a crash)
+- [ ] Thread-count override outside 1..8 -> clamped, with a visible notice
+- [ ] History / checkpoint / battle-index capacity reached -> explicit `Full` / `Battle_Index_Full`, never silent truncation
+- [ ] More render/terminal rows than the budget -> explicit "truncated at N rows" state
+- [ ] Query over its time budget -> `Query_Too_Slow` (interrupted, state intact)
+- [ ] Large wasm memory behaves differently per engine (Node 22 in this container segfaulted around several hundred MB held across repeated open/close): per-instance arena budget + CI on real browsers
