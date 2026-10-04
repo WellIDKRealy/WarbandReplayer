@@ -19,3 +19,9 @@ Counts only — the data itself contains other players' names and chat and must 
   1.1 GB file 142 battles (90%) are invisible.
 - The boundary query touches only `ticks` and `events`: 0.15 s on the 81k-tick file, no `agent_states` scan.
 - Shortest accepted spans are 12-13 ticks; longest 2,586 ticks.
+
+## Integrity of the real corpus
+- All 39 files: valid SQLite magic, header page count == file size / page size (4096), `PRAGMA quick_check` = ok.
+  **No naturally corrupted file exists in the corpus** — corruption test cases must be injected (see `docs/failure-modes.md`).
+- The 8 "empty shell" files (48 KB) are structurally valid databases with the 9 tables and 0 rows.
+- `PRAGMA quick_check` on the 1.1 GB file takes ~73 s, so a full integrity check cannot be a load-time gate.
