@@ -26,6 +26,7 @@ import psutil
 from playwright.sync_api import sync_playwright
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.dont_write_bytecode = True  # do not leave __pycache__ in the repo root
 sys.path.insert(0, str(ROOT))
 import serve  # the old dev server's COOP/COEP handler (its own main() binds IPv6 only; some containers have no IPv6)
 
