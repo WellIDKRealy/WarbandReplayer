@@ -25,3 +25,15 @@ Counts only — the data itself contains other players' names and chat and must 
   **No naturally corrupted file exists in the corpus** — corruption test cases must be injected (see `docs/failure-modes.md`).
 - The 8 "empty shell" files (48 KB) are structurally valid databases with the 9 tables and 0 rows.
 - `PRAGMA quick_check` on the 1.1 GB file takes ~73 s, so a full integrity check cannot be a load-time gate.
+
+## Old engine baseline (committed build, headless Chromium, software GL; `testdata/baseline_old_engine.py`)
+- 202 MB file: ready after 39.7 s (the map-bounds phase alone ~34 s), timeline shows **16 battles** (the cap), 7.5 fps on software GL.
+- **1.1 GB file: fails to load** — after 27 s and 1.58 GB browser RSS the page alerts "Failed to load replay: database disk image is
+  malformed", although the same file passes SQLite's `quick_check` and opens normally in Python. A size-related defect of the old engine
+  (the new design reads the source in place and never copies it into browser storage).
+
+## New pipeline, measured natively on the real 1.1 GB file (`testdata/measure_extraction.py`, load average ~4, native SQLite = lower bound for wasm)
+- Boundary detection: 0.15 s for all 158 battles (touches only `ticks`/`events`).
+- **Open one battle** (bisect rowid range, copy its rows into its own file, index, bounds, derive roster/corpses): median 0.098 s,
+  p95 0.25 s, max 0.41 s (largest battle 374,315 agent rows) — budget 1.5 s.
+- **Extract all 158 battles on ONE thread: 17.9 s** — budget 60 s. All per-battle replay files together: 1.30 GB; all derived battle files: 4.4 MB.
