@@ -25,7 +25,7 @@ LZMA-SRC = lzma-sdk/LzFind.c lzma-sdk/LzmaEnc.c lzma-sdk/Lzma2Enc.c lzma-sdk/Xz.
            lzma-sdk/XzCrc64.c lzma-sdk/XzCrc64Opt.c lzma-sdk/7zCrc.c lzma-sdk/7zCrcOpt.c \
            lzma-sdk/Sha256.c lzma-sdk/CpuArch.c
 
-MAIN-EXPORTS = set_screen_dimensions set_map_bounds get_vs_main_ptr get_fs_main_ptr get_vs_grid_ptr get_fs_grid_ptr init_engine init_gl_programs ensure_agent_capacity update_frame_data render_frame apply_zoom pan_camera set_key_state ensure_highlight_capacity update_highlight_data get_cam_x get_cam_y set_view_shift
+MAIN-EXPORTS = set_screen_dimensions set_map_bounds get_vs_main_ptr get_fs_main_ptr get_vs_grid_ptr get_fs_grid_ptr init_engine init_gl_programs ensure_render_slot_capacity update_render_slot_data render_frame apply_zoom pan_camera set_key_state get_cam_x get_cam_y get_cam_zoom set_view_shift
 BENCHMARK-EXPORTS = main
 COMPRESS-EXPORTS = compress_begin compress_get_input_chunk_ptr compress_feed_chunk compress_finish \
                    decompress_finish \
@@ -51,8 +51,13 @@ WORKER-EXPORTS = thread_main \
                  replay_get_match_scene_no replay_get_match_faction_ptr \
                  replay_get_total_start_time replay_get_total_end_time \
                  replay_advance_to_time replay_seek_to_time \
-                 replay_get_frame_buffer_ptr replay_get_frame_count \
-                 replay_get_active_match_index replay_get_relative_time replay_get_current_tick_id \
+                 replay_get_render_slot_count replay_get_render_buffer_ptr replay_get_render_buffer_count replay_get_render_shape \
+                 replay_get_render_query_text_buf_ptr replay_render_query_configure replay_render_query_set_count \
+                 replay_render_query_get_last_error replay_render_query_get_last_error_offset \
+                 replay_get_default_render_query_count replay_get_default_render_query_sql \
+                 replay_get_default_render_query_interpolate replay_get_default_render_query_shape \
+                 replay_get_sample_nato_symbol_sql \
+                 replay_get_active_match_index replay_get_relative_time replay_get_current_tick_id replay_get_last_alpha \
                  replay_reader_compute_bounds replay_combine_bounds \
                  replay_get_map_min_x replay_get_map_max_x replay_get_map_min_y replay_get_map_max_y \
                  replay_ensure_battle_ready replay_prefetch_battle replay_debug_index_visible \
@@ -67,15 +72,17 @@ WORKER-EXPORTS = thread_main \
                  replay_get_filename_buf_ptr replay_set_filename_len replay_set_export_time_unix \
                  replay_get_source_sha256_hex replay_get_source_filename replay_get_source_size_bytes \
                  replay_export_battle replay_export_get_tar_ptr replay_export_get_tar_len \
-                 replay_export_get_last_error replay_finish_load_battle_file \
+                 replay_export_get_last_error replay_export_get_last_error_offset replay_finish_load_battle_file \
                  sql_terminal_get_query_buf_ptr sql_terminal_run sql_terminal_column_count \
                  sql_terminal_column_name sql_terminal_step sql_terminal_column_is_null \
-                 sql_terminal_column_text sql_terminal_get_last_error \
+                 sql_terminal_column_text sql_terminal_get_last_error sql_terminal_get_last_error_offset \
                  sql_checkpoint_save sql_checkpoint_revert sql_checkpoint_get_last_error \
                  replay_set_cursor_world_pos replay_get_data_generation \
                  replay_get_default_replaydb_sql replay_get_default_battledb_sql \
                  replay_get_generator_script_buf_ptr replay_run_generator_script replay_reset_generator_script \
-                 replay_ensure_db_view
+                 replay_ensure_db_view \
+                 replay_get_nonbattle_span_count replay_get_nonbattle_span_start_tick_id replay_get_nonbattle_span_end_tick_id \
+                 replay_prewarm_battle_summary replay_get_last_prewarm_evicted_match
 # Phase 6: 96MiB - 8MiB loader heap + 8*2MiB reader heaps (16MiB) + 4MiB
 # prefetch heap + 4KiB Region C + ~40.6MB stack/TLS pools = ~68.6MiB of
 # wasm_layout.h's own addressed regions, plus headroom for the module's
@@ -110,7 +117,18 @@ MAIN-FLAGS = $(CFLAGS) $(LDFLAGS) $(LIBS-SRC) $(shell echo $(MAIN-EXPORTS) | xar
 BENCHMARK-FLAGS = -DSQLITE_OS_OTHER=1 -DSQLITE_THREADSAFE=0 -DSQLITE_OMIT_LOAD_EXTENSION \
                   $(CFLAGS) $(LDFLAGS) -I./sqlite3 $(LIBS-SRC) \
                   $(shell echo $(BENCHMARK-EXPORTS) | xargs -n 1 printf '-Wl,--export=%s ')
-WORKER-FLAGS = -DWASM_THREADS -DWASM_VFS_LOCK_TRACE -DSQLITE_OS_OTHER=1 -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION \
+# SQLITE_MAX_ATTACHED=32 (SQLite's own compiled-in default is 10, its
+# documented hard ceiling is 125): "r" + "b" + one permanent bcN battle.db
+# cache slot per resident battle (replay_export.c's bc_ensure_attached,
+# MAX_MATCHES=16, never DETACHed - see that file's own comment on why)
+# means a real multi-battle file can need up to 16+2=18 simultaneously
+# attached databases over a session, comfortably over the default 10 - a
+# real, hand-hit failure confirmed directly: "too many attached databases"
+# on ATTACH once enough battles had been prewarmed, which then meant "b"
+# itself could never re-attach after a checkpoint revert detached it (no
+# free attach slot left), silently leaving every default rendering query
+# with an empty "b" schema. 32 leaves headroom above the 18 actually needed.
+WORKER-FLAGS = -DWASM_THREADS -DWASM_VFS_LOCK_TRACE -DSQLITE_OS_OTHER=1 -DSQLITE_THREADSAFE=1 -DSQLITE_OMIT_LOAD_EXTENSION -DSQLITE_MAX_ATTACHED=32 \
                $(CFLAGS) $(LDFLAGS) $(WORKER-MEMORY-FLAGS) $(WORKER-BOOTSTRAP-EXPORTS) $(LIBS-SRC) \
                $(shell echo $(WORKER-EXPORTS) | xargs -n 1 printf '-Wl,--export=%s ')
 # compress.wasm: NOT threaded (no -DWASM_THREADS - plain, already-elastic
@@ -149,14 +167,23 @@ benchmark.wasm: $(LIBS-SRC) $(GOYSLOPLESS-HEADERS) $(SQLITE-HEADERS) sqlite3/sql
 	$(CC) $(BENCHMARK-FLAGS) -I./ubench -o benchmark.wasm sqlite3/sqlite3.c sqlite3/sqlite3_vfs_mem.c benchmark.c
 	wasm-opt -Os --asyncify benchmark.wasm -o benchmark.wasm
 
-# Canonical SQL -> compiled-in C string + its own sha256 (see the script's
-# own docstring for why this is generated rather than hand-copied: it's what
-# keeps the C engine, testdata/ground_truth.py, and battle.db's
+# SQL -> compiled-in C string + its own sha256, one convention for every
+# pipeline-stage/default-rendering-query .sql file under sql/ (see the
+# script's own docstring for why this is generated rather than hand-copied:
+# it's what keeps the C engine, testdata/ground_truth.py, and battle.db's
 # _table_provenance hashes from drifting out of sync with each other).
-sql/canonical_roster_corpse_sql.h: sql/canonical_roster_corpse.sql scripts/gen_canonical_sql_header.py
-	python3 scripts/gen_canonical_sql_header.py sql/canonical_roster_corpse.sql sql/canonical_roster_corpse_sql.h CANONICAL_ROSTER_CORPSE
+# PREFIX is mechanically derived from the filename (default_render_chat.sql
+# -> DEFAULT_RENDER_CHAT_SQL/_SQL_SHA256) so "banal upgrade" really is just
+# "edit the .sql file, rebuild" - no per-file Makefile rule to also update.
+SQL-SOURCES = sql/canonical_roster_corpse.sql sql/canonical_roster_history.sql sql/canonical_corpses.sql \
+              sql/default_boundary_detection.sql \
+              sql/default_render_corpses.sql sql/default_render_living_agents.sql \
+              sql/default_render_chat.sql sql/sample_render_nato_symbols.sql
+SQL-HEADERS = $(SQL-SOURCES:.sql=_sql.h)
+sql/%_sql.h: sql/%.sql scripts/gen_canonical_sql_header.py
+	python3 scripts/gen_canonical_sql_header.py sql/$*.sql sql/$*_sql.h $(shell echo $* | tr a-z A-Z)
 
-replay_worker.wasm: $(LIBS-SRC) $(GOYSLOPLESS-HEADERS) $(SQLITE-HEADERS) sqlite3/sqlite3.c sqlite3/sqlite3_vfs_mem.c sqlite3/sqlite3_mutex_wasm.c replay_worker.c replay_export.c sql_terminal.c replay_internal.h sql/canonical_roster_corpse_sql.h
+replay_worker.wasm: $(LIBS-SRC) $(GOYSLOPLESS-HEADERS) $(SQLITE-HEADERS) sqlite3/sqlite3.c sqlite3/sqlite3_vfs_mem.c sqlite3/sqlite3_mutex_wasm.c replay_worker.c replay_export.c sql_terminal.c replay_internal.h $(SQL-HEADERS)
 	$(CC) $(WORKER-FLAGS) -I./sqlite3 -o replay_worker.wasm sqlite3/sqlite3.c sqlite3/sqlite3_vfs_mem.c sqlite3/sqlite3_mutex_wasm.c replay_worker.c replay_export.c sql_terminal.c
 
 compress.wasm: $(LIBS-SRC) $(GOYSLOPLESS-HEADERS) $(LZMA-HEADERS) $(LZMA-SRC) compress_worker.c

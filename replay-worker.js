@@ -520,7 +520,14 @@ function runSqlGeneric(ex, sql, msgPrefix, requestId) {
 
   const rc = ex.sql_terminal_run(queryBytes.length);
   if (rc !== 0) {
-    postMessage({ type: msgPrefix + "Error", requestId, message: readCstr(ex.sql_terminal_get_last_error()) });
+    postMessage({
+      type: msgPrefix + "Error", requestId,
+      message: readCstr(ex.sql_terminal_get_last_error()),
+      // Byte offset into `sql` (the exact text the caller already has) where
+      // the error's token starts, or -1 if this error doesn't reference one -
+      // main.js turns it into a line/column (sqlOffsetToLineCol).
+      offset: ex.sql_terminal_get_last_error_offset(),
+    });
     return;
   }
 
@@ -534,7 +541,11 @@ function runSqlGeneric(ex, sql, msgPrefix, requestId) {
   for (;;) {
     const stepRc = ex.sql_terminal_step();
     if (stepRc < 0) {
-      postMessage({ type: msgPrefix + "Error", requestId, message: readCstr(ex.sql_terminal_get_last_error()) });
+      postMessage({
+        type: msgPrefix + "Error", requestId,
+        message: readCstr(ex.sql_terminal_get_last_error()),
+        offset: ex.sql_terminal_get_last_error_offset(),
+      });
       return;
     }
     if (stepRc === 0) break;
@@ -572,8 +583,13 @@ function runSchemaQuery(ex, data) {
 // replay_ensure_db_view()/replay_run_generator_script() convention.
 function runEnsureDbView(ex, data) {
   const rc = ex.replay_ensure_db_view(data.viewKind);
-  if (rc < 0) postMessage({ type: "dbViewError", viewKind: data.viewKind, message: readCstr(ex.replay_export_get_last_error()) });
-  else postMessage({ type: "dbViewReady", viewKind: data.viewKind, rebuilt: rc === 1 });
+  if (rc < 0) {
+    postMessage({
+      type: "dbViewError", viewKind: data.viewKind,
+      message: readCstr(ex.replay_export_get_last_error()),
+      offset: ex.replay_export_get_last_error_offset(),
+    });
+  } else postMessage({ type: "dbViewReady", viewKind: data.viewKind, rebuilt: rc === 1 });
 }
 
 function runGeneratorScript(ex, data) {
@@ -582,14 +598,28 @@ function runGeneratorScript(ex, data) {
   const bufPtr = ex.replay_get_generator_script_buf_ptr();
   mem8.set(bytes, bufPtr);
   const rc = ex.replay_run_generator_script(data.viewKind, bytes.length);
-  if (rc < 0) postMessage({ type: "dbViewError", viewKind: data.viewKind, message: readCstr(ex.replay_export_get_last_error()) });
-  else postMessage({ type: "dbViewReady", viewKind: data.viewKind, rebuilt: true });
+  if (rc < 0) {
+    postMessage({
+      type: "dbViewError", viewKind: data.viewKind,
+      message: readCstr(ex.replay_export_get_last_error()),
+      // Offset into data.sql (the exact generator-script text main.js still
+      // has) - the whole reason this is threaded through at all is so the
+      // schema-explorer/pop-out generator editors' new line-number gutters
+      // can point straight at the failing line.
+      offset: ex.replay_export_get_last_error_offset(),
+    });
+  } else postMessage({ type: "dbViewReady", viewKind: data.viewKind, rebuilt: true });
 }
 
 function runResetGeneratorScript(ex, data) {
   const rc = ex.replay_reset_generator_script(data.viewKind);
-  if (rc < 0) postMessage({ type: "dbViewError", viewKind: data.viewKind, message: readCstr(ex.replay_export_get_last_error()) });
-  else postMessage({ type: "dbViewReady", viewKind: data.viewKind, rebuilt: true });
+  if (rc < 0) {
+    postMessage({
+      type: "dbViewError", viewKind: data.viewKind,
+      message: readCstr(ex.replay_export_get_last_error()),
+      offset: ex.replay_export_get_last_error_offset(),
+    });
+  } else postMessage({ type: "dbViewReady", viewKind: data.viewKind, rebuilt: true });
 }
 
 function runGetDefaultGeneratorSql(ex, data) {
@@ -597,15 +627,91 @@ function runGetDefaultGeneratorSql(ex, data) {
   postMessage({ type: "defaultGeneratorSql", viewKind: data.viewKind, sql: readCstr(ptr) });
 }
 
+// Reads back the compiled-in default rendering queries (see replay_worker.c's
+// seed_default_render_queries/replay_get_default_render_query_* - the same
+// source that engine already seeds itself with on every load) so main.js's
+// Rendering Queries panel can populate its initial editable list, and "Reset
+// to Defaults", from ONE definition of "the defaults" instead of a second
+// hand-copied JS literal that could drift from it.
+function runGetSampleNatoSymbolSql(ex) {
+  postMessage({ type: "sampleNatoSymbolSql", sql: readCstr(ex.replay_get_sample_nato_symbol_sql()) });
+}
+
+function runGetDefaultRenderQueries(ex) {
+  const count = ex.replay_get_default_render_query_count();
+  const queries = [];
+  for (let i = 0; i < count; i++) {
+    queries.push({
+      sql: readCstr(ex.replay_get_default_render_query_sql(i)),
+      interpolate: !!ex.replay_get_default_render_query_interpolate(i),
+      shape: ex.replay_get_default_render_query_shape(i),
+    });
+  }
+  postMessage({ type: "defaultRenderQueries", queries });
+}
+
+// Resubmits the FULL ordered dots-kind sublist of main.js's canonical
+// rendering-query list into consecutive C slots 0..N-1 - see
+// replay_worker.c's own header comment on this "always resubmit the whole
+// list" model (add/remove/reorder/edit/enable/disable are all just this one
+// call, never an incremental list-surgery primitive). data.queries is
+// [{sql, interpolate, shape, enabled}, ...] in the user's own list order;
+// @KIND=chat entries are never included here - see main.js's
+// pushRenderQueriesToEngine, the only caller.
+// Matches replay_worker.c's RENDER_CACHE_TICK/LIVE/NONE #defines exactly -
+// 0/1 kept stable from when this was a plain tick/live boolean, see that
+// enum's own comment.
+const RENDER_CACHE_MODE = { tick: 0, live: 1, none: 2 };
+function runConfigureRenderQueries(ex, data) {
+  const mem8 = new Uint8Array(sharedMemory.buffer);
+  const bufPtr = ex.replay_get_render_query_text_buf_ptr();
+  const errors = [];
+  data.queries.forEach((q, i) => {
+    const bytes = new TextEncoder().encode(q.sql);
+    mem8.set(bytes, bufPtr);
+    ex.replay_render_query_configure(i, bytes.length, q.interpolate ? 1 : 0, q.shape | 0, q.enabled ? 1 : 0, RENDER_CACHE_MODE[q.cache] ?? 0);
+    const msg = readCstr(ex.replay_render_query_get_last_error(i));
+    if (msg) errors.push({ index: i, message: msg, offset: ex.replay_render_query_get_last_error_offset(i) });
+  });
+  ex.replay_render_query_set_count(data.queries.length);
+  postMessage({ type: "renderQueriesConfigured", errors });
+}
+
 function runCheckpointSave(ex) {
   const id = ex.sql_checkpoint_save();
   if (id < 0) postMessage({ type: "checkpointError", message: readCstr(ex.sql_checkpoint_get_last_error()) });
   else postMessage({ type: "checkpointSaved", id });
 }
+// A revert can undo edits to anything - agent positions, tick times, match-
+// boundary events - so sql_checkpoint_revert (sql_terminal.c) already
+// rebuilds every derived replay-engine cache (tick index, match list,
+// per-battle ready state) against the now-current data before returning.
+// This posts the SAME shape runLoader's own "loaded" message does (matches/
+// totalStart/totalEnd) so main.js can resync its own copy of that state and
+// refresh the timeline/camera exactly like a fresh load would, instead of
+// silently drifting from what the engine now actually has.
 function runCheckpointRevert(ex, data) {
   const rc = ex.sql_checkpoint_revert(data.id);
-  if (rc !== 0) postMessage({ type: "checkpointError", message: readCstr(ex.sql_checkpoint_get_last_error()) });
-  else postMessage({ type: "checkpointReverted", id: data.id });
+  if (rc !== 0) { postMessage({ type: "checkpointError", message: readCstr(ex.sql_checkpoint_get_last_error()) }); return; }
+
+  const matchCount = ex.replay_get_match_count();
+  const matches = [];
+  for (let i = 0; i < matchCount; i++) {
+    matches.push({
+      startTime: ex.replay_get_match_start_time(i),
+      endTime: ex.replay_get_match_end_time(i),
+      sceneNo: ex.replay_get_match_scene_no(i),
+      faction: readCstr(ex.replay_get_match_faction_ptr(i)),
+      startTickId: ex.replay_get_match_start_tick_id(i),
+      endTickId: ex.replay_get_match_end_tick_id(i),
+    });
+  }
+  postMessage({
+    type: "checkpointReverted", id: data.id,
+    matchCount, matches,
+    totalStart: ex.replay_get_total_start_time(),
+    totalEnd: ex.replay_get_total_end_time(),
+  });
 }
 
 // temporary diagnostic - see replay_worker.c's replay_debug_index_visible
@@ -624,28 +730,48 @@ function runGetLockCounters(ex) {
   postMessage({ type: "lockCounters", sharedCount: ex.wasm_vfs_debug_shared_count(), exclusiveKind: ex.wasm_vfs_debug_exclusive_kind() });
 }
 
+// Phase 4: one [x,y,r,g,b]-per-point buffer per rendering-query slot
+// (replay_worker.c's g_render_slots), replacing the old single
+// [x,y,team]-per-agent buffer - see that file's own header comment on the
+// rendering-query engine. Slot order IS draw order (corpses before living
+// agents), reproducing the old hardcoded emission order as a property of
+// the query list instead of hardcoded C statement order.
 function runFrame(ex, data) {
   if (data.seek) ex.replay_seek_to_time(data.time);
   else ex.replay_advance_to_time(data.time);
 
-  const count = ex.replay_get_frame_count();
-  const ptr = ex.replay_get_frame_buffer_ptr();
-  // Copy out of shared memory into a plain, transferable buffer for postMessage.
-  const floatView = new Float32Array(sharedMemory.buffer, ptr, count * 3);
-  const out = new Float32Array(count * 3);
-  out.set(floatView);
+  const slotCount = ex.replay_get_render_slot_count();
+  const renderSlots = [];
+  const transferList = [];
+  for (let s = 0; s < slotCount; s++) {
+    const count = ex.replay_get_render_buffer_count(s);
+    const ptr = ex.replay_get_render_buffer_ptr(s);
+    const shape = ex.replay_get_render_shape(s);
+    // Copy out of shared memory into a plain, transferable buffer for postMessage.
+    const floatView = new Float32Array(sharedMemory.buffer, ptr, count * 5);
+    const out = new Float32Array(count * 5);
+    out.set(floatView);
+    renderSlots.push({ buffer: out, count, shape });
+    transferList.push(out.buffer);
+  }
 
   postMessage(
     {
       type: "frame",
-      buffer: out,
-      count,
+      renderSlots,
       activeMatchIndex: ex.replay_get_active_match_index(),
       relativeTime: ex.replay_get_relative_time(),
       // Chat is not delivered here at all - main.js runs a real SQL query
       // (gated by this) through the normal SQL Terminal path instead of a
       // frame-coupled push feed (see main.js's refreshChatFromQuery for why).
       currentTickId: ex.replay_get_current_tick_id(),
+      // Phase 6: the same tickA/tickB blend fraction @KIND=dots uses
+      // server-side (replay_worker.c's blend_render_slot) - exposed so
+      // main.js's nato_symbol dom-overlay (a JS-only kind, never reaching
+      // this engine's RenderQuerySlot machinery at all) can blend its own
+      // tickA/tickB row pairs every RAF without re-deriving this from a
+      // client-side copy of the tick-time table.
+      alpha: ex.replay_get_last_alpha(),
       // replay_seek_to_time/replay_advance_to_time above may have called
       // fetch_positions() -> replay_ensure_battle_ready(), which can evict a
       // farther-away battle to make room under a tight budget - this mask
@@ -654,7 +780,7 @@ function runFrame(ex, data) {
       // though nothing posted a dedicated "evicted" event for it.
       readyMask: ex.replay_get_battle_ready_mask(),
     },
-    [out.buffer]
+    transferList
   );
 }
 
@@ -723,6 +849,19 @@ function runPrimeBattle(ex, data) {
   }
 }
 
+// replay_prewarm_battle_summary's return convention is the OPPOSITE sense
+// of replay_try_prime_battle's above (1 = cached/success here, not
+// declined) - see that function's own comment in replay_export.c.
+function runPrewarmSummary(ex, data) {
+  const rc = ex.replay_prewarm_battle_summary(data.matchIdx, data.currentMatchIdx);
+  if (rc === 1) {
+    const evictedMatchIdx = ex.replay_get_last_prewarm_evicted_match(); // -1 = none
+    postMessage({ type: "summaryPrewarmed", matchIdx: data.matchIdx, evictedMatchIdx });
+  } else {
+    postMessage({ type: "summaryPrewarmDeclined", matchIdx: data.matchIdx });
+  }
+}
+
 // One-shot setup call, sent once right after 'loaded' (see main.js) - sets
 // the soft memory ceiling replay_ensure_battle_ready()/replay_try_prime_battle()
 // in replay_worker.c weigh against before building a new battle's index.
@@ -773,6 +912,9 @@ onmessage = async (e) => {
         break;
       case "primeBattle":
         runPrimeBattle(ex, data);
+        break;
+      case "prewarmSummary":
+        runPrewarmSummary(ex, data);
         break;
       case "setPrimingBudget":
         runSetPrimingBudget(ex, data);
@@ -832,6 +974,15 @@ onmessage = async (e) => {
         break;
       case "getDefaultGeneratorSql":
         runGetDefaultGeneratorSql(ex, data);
+        break;
+      case "getDefaultRenderQueries":
+        runGetDefaultRenderQueries(ex);
+        break;
+      case "getSampleNatoSymbolSql":
+        runGetSampleNatoSymbolSql(ex);
+        break;
+      case "configureRenderQueries":
+        runConfigureRenderQueries(ex, data);
         break;
       default:
         postMessage({ type: "error", message: "unknown message type: " + data.type });

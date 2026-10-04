@@ -11,8 +11,9 @@ project) this repo grew out of; the replay viewer (`main.html`) is the actual ap
 ## Architecture
 
 - **`main.wasm`** (`main.c`) - the renderer. WebGL drawing, camera/pan/zoom, and nothing else. It
-  never touches the database; it just receives an already-computed position/team snapshot into
-  `agent_buffer` each frame.
+  never touches the database; it just receives one already-computed `RenderPointBuffer` per enabled
+  `@KIND dots` rendering query each frame (main.js's `renderQueries` - see `sql_terminal.c`'s bullet
+  below).
 - **`replay_worker.wasm`** (`replay_worker.c` + the `sqlite3/` sources) - the entire replay engine:
   the SQLite VFS, all SQL, the incremental roster/cursor algorithm, match segmentation, and the chat
   cache. Instantiated only inside Web Workers, never on the main thread, and only ever multiple
@@ -113,9 +114,14 @@ transparent. See the comment block at the top of `coi-shim.js` for how it works.
   `scan_matches()` in favor of the single row `replay_export.c` wrote into `replay_meta` at export time.
 - `sql_terminal.c` - the `?debug=1` SQL terminal: arbitrary read/write SQL against whatever's
   currently loaded, row results streamed back in bounded batches, plus in-session
-  `SAVEPOINT`/`ROLLBACK TO` checkpoints (never persisted - gone once the tab closes). Query results
-  aliased exactly `x`/`y` can be pushed onto the map as highlighted rings via `main.c`'s
-  `highlight_buffer` (mirrors `agent_buffer`'s pattern, third draw pass in `render_frame`).
+  `SAVEPOINT`/`ROLLBACK TO` checkpoints (never persisted - gone once the tab closes).
+- Rendering itself is driven entirely by the "Rendering Queries" panel (`main.js`'s `renderQueries` /
+  `replay_worker.c`'s `RenderQuerySlot` engine) - an ordered, user-editable list of SQL queries, each
+  tagged `@KIND dots|chat|nato_symbol`. `dots` queries (`x, y, color_r/g/b`) drive `main.c`'s generic
+  `RenderPointBuffer[]`/`render_frame` GL draw loop; `chat` queries feed the chat panel directly;
+  `nato_symbol` queries (`x, y, unit_type, ...`) drive a JS-only SVG overlay (`#map-symbol-layer`) with
+  no WASM buffer involved. List order is draw order. Export/Import round-trips the whole list as a JSON
+  bundle.
 - `cglm/`, `ubench/` - git submodules (3D math, benchmarking).
 - `benchmark.c` / `benchmark.html` - the benchmark suite (see below).
 - `lua/main.lua` - the Warband-side recorder script that produces the `.sqlite` replay logs this

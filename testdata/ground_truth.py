@@ -81,11 +81,25 @@ def scan_matches(conn, ticks):
         if not merged or idx - merged[-1] > 15:
             merged.append(idx)
 
+    # No MAX_MATCHES cap inside the merge/segment loop itself, then a clean
+    # truncation of the final list to MAX_MATCHES - matches
+    # replay_worker.c's scan_matches_via_sql() (sql/default_boundary_detection.sql),
+    # NOT the original hardcoded scan_matches()'s cap-mid-loop behavior this
+    # function used to mirror. That original behavior was a real bug, not
+    # intentional design: capping the loop early (checked BEFORE evaluating
+    # each candidate) meant merged boundaries past the 15th accepted match
+    # were never even considered, so the trailing tail-segment step silently
+    # absorbed all of them into one oversized final "match" instead of
+    # truncating cleanly. Confirmed on the one real fixture where this
+    # actually differs (replayLog_2026-08-01_21-12-29.sqlite, 20 real
+    # matches): the old behavior produced a match #15 spanning 8240..10885
+    # (2645 ticks - dwarfing every real match, which run a few hundred ticks
+    # each); the corrected behavior here produces the true 16th match,
+    # 8240..8675, matching what replay_worker.c now actually computes. See
+    # that file's own comment on scan_matches_via_sql for the full account.
     matches = []
     start_idx = 0
     for idx in merged:
-        if len(matches) >= MAX_MATCHES - 1:
-            break
         end_idx = idx
         if end_idx - start_idx >= 10:
             matches.append({
@@ -93,12 +107,12 @@ def scan_matches(conn, ticks):
                 'start_time': ticks[start_idx][1], 'end_time': ticks[end_idx][1],
             })
             start_idx = end_idx + 1
-    if len(ticks) - 1 - start_idx >= 5 and len(matches) < MAX_MATCHES:
+    if len(ticks) - 1 - start_idx >= 5:
         matches.append({
             'start_tick_id': ticks[start_idx][0], 'end_tick_id': ticks[-1][0],
             'start_time': ticks[start_idx][1], 'end_time': ticks[-1][1],
         })
-    return matches
+    return matches[:MAX_MATCHES]
 
 
 def replay_roster_and_corpses(conn, from_tick, to_tick):

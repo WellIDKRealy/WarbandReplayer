@@ -128,18 +128,37 @@ window.__testResult = { done: false };
     let sampleFails = 0;
     const failures = [];
     const TOL = 0.01; // position float tolerance
+    const COLOR_TOL = 0.02; // color float tolerance (exact literals in the default render queries, should match closely)
+
+    // Phase 4: the 'frame' message carries one [x,y,color_r,color_g,color_b]
+    // buffer per rendering-query slot (renderSlots[0] = corpses,
+    // renderSlots[1] = living agents - see replay_worker.c's
+    // g_render_slots/replay-worker.js's runFrame) instead of the old single
+    // [x,y,team]-per-point buffer. ground_truth.py still speaks in terms of
+    // real roster team values (-1/0/1), not rendering colors, so this
+    // reverse-maps a living-agent row's color back to the team value that
+    // produced it (sql/default_render_living_agents.sql's own CASE
+    // expression, the same literals) to compare against s.agents[k].team
+    // unchanged. Corpses are count-only in ground_truth.py (no per-corpse
+    // team expectation), so renderSlots[0].count is directly corpseCount.
+    function colorToLivingTeam(r, g, b) {
+      if (Math.abs(r - 0.95) < COLOR_TOL && Math.abs(g - 0.25) < COLOR_TOL && Math.abs(b - 0.25) < COLOR_TOL) return 0;
+      if (Math.abs(r - 0.25) < COLOR_TOL && Math.abs(g - 0.45) < COLOR_TOL && Math.abs(b - 0.95) < COLOR_TOL) return 1;
+      return -1;
+    }
 
     for (const s of gt.samples) {
       const fp = waitFor(loader, d => d.type === 'frame');
       loader.postMessage({ type: 'frame', time: s.time, seek: true });
       const f = await fp;
 
+      const corpseSlot = f.renderSlots[0], livingSlot = f.renderSlots[1];
+      const corpseCount = corpseSlot.count;
       const livingBuf = [];
-      let corpseCount = 0;
-      for (let k = 0; k < f.count; k++) {
-        const x = f.buffer[k * 3 + 0], y = f.buffer[k * 3 + 1], team = f.buffer[k * 3 + 2];
-        if (team === 2 || team === 3 || team === 4) corpseCount++;
-        else livingBuf.push({ x, y, team });
+      for (let k = 0; k < livingSlot.count; k++) {
+        const x = livingSlot.buffer[k * 5 + 0], y = livingSlot.buffer[k * 5 + 1];
+        const team = colorToLivingTeam(livingSlot.buffer[k * 5 + 2], livingSlot.buffer[k * 5 + 3], livingSlot.buffer[k * 5 + 4]);
+        livingBuf.push({ x, y, team });
       }
       const actualChatCount = f.activeMatchIndex >= 0
         ? await queryChatCount(loadResult.matches[f.activeMatchIndex].startTickId)

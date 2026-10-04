@@ -20,6 +20,13 @@
     <body>
 	<canvas id="canvas"></canvas>
 	<div id="center-crosshair"></div>
+	<!-- Phase 6: NATO APP-6 symbol kind (@KIND nato_symbol) - a dom-overlay
+	     surface, never touching main.wasm's GL point buffers at all (see
+	     main.js's RENDER_KINDS/updateNatoSymbolLayer). One <g> child per
+	     live symbol row, positioned via a world->screen projection replicated
+	     in JS (main.js's worldToScreen) so per-RAF transform updates need no
+	     WASM round-trip. -->
+	<svg id="map-symbol-layer"></svg>
 
 	<!-- Chat/System Logs/VFS Trace/SQL Terminal are all draggable (by their
 	     .panel-header - see main.js's makeDraggable()) and independently
@@ -33,6 +40,7 @@
 		<span>[Chat Replay]</span>
 		<span class="panel-header-controls">
 		    <span class="toggle-icon">-</span>
+		    <span class="panel-maximize-btn" title="Maximize window"></span>
 		    <span class="panel-close-btn" title="Close window">&times;</span>
 		</span>
 	    </div>
@@ -46,32 +54,35 @@
 	     hamburger menu's Panels checkboxes (main.js's setPanelVisible) -
 	     System Logs/VFS Trace default OFF even in debug mode, SQL Terminal
 	     defaults ON - rather than all three always appearing together. -->
-	<div id="log-box" class="ui-panel minimized" style="display:none;" data-panel-type="log-box">
+	<div id="log-box" class="ui-panel" style="display:none;" data-panel-type="log-box">
 	    <div class="panel-header">
 		<span>[System Logs]</span>
 		<span class="panel-header-controls">
 		    <span class="toggle-icon">-</span>
+		    <span class="panel-maximize-btn" title="Maximize window"></span>
 		    <span class="panel-close-btn" title="Close window">&times;</span>
 		</span>
 	    </div>
 	    <div class="panel-content log-content">
-		Replay engine offline. Upload database.
+		No log messages yet.
 	    </div>
 	</div>
-	<div id="debug-panel" class="ui-panel minimized" style="display:none;" data-panel-type="debug-panel">
+	<div id="debug-panel" class="ui-panel" style="display:none;" data-panel-type="debug-panel">
 	    <div class="panel-header">
 		<span>[Debug: VFS Trace]</span>
 		<span class="panel-header-controls">
 		    <span class="toggle-icon">-</span>
+		    <span class="panel-maximize-btn" title="Maximize window"></span>
 		    <span class="panel-close-btn" title="Close window">&times;</span>
 		</span>
 	    </div>
 	    <div class="panel-content">
-		<div>
-		    match idx: <input class="debug-match-idx" type="number" value="0" min="0" style="width:40px;">
+		<!-- One flex-wrap row, not two fixed <div> groups - same
+		     "widening the panel lets these consolidate onto fewer rows"
+		     principle the SQL Terminal's own button-row already documents. -->
+		<div class="button-row">
+		    <span>match idx: <input class="debug-match-idx" type="number" value="0" min="0" style="width:40px;"></span>
 		    <button onclick="debugCheckIndexVisible(this)">index visible?</button>
-		</div>
-		<div>
 		    <button onclick="debugGetVfsTraces(this)">get VFS traces</button>
 		    <button onclick="debugResetVfsTraces(this)">reset traces</button>
 		    <button onclick="debugGetLockCounters(this)">lock counters</button>
@@ -80,11 +91,12 @@
 		<pre class="debug-output"></pre>
 	    </div>
 	</div>
-	<div id="sql-terminal-panel" class="ui-panel minimized" style="display:none;" data-panel-type="sql-terminal-panel">
+	<div id="sql-terminal-panel" class="ui-panel" style="display:none;" data-panel-type="sql-terminal-panel">
 	    <div class="panel-header">
 		<span>[SQL Terminal]</span>
 		<span class="panel-header-controls">
 		    <span class="toggle-icon">-</span>
+		    <span class="panel-maximize-btn" title="Maximize window"></span>
 		    <span class="panel-close-btn" title="Close window">&times;</span>
 		</span>
 	    </div>
@@ -119,11 +131,9 @@
 		     onto fewer rows instead of staying stuck exactly where they started. -->
 		<div class="button-row">
 		    <button onclick="sqlTerminalRun(this)">Run</button>
-		    <button onclick="sqlTerminalCheckpointSave(this)">Save checkpoint</button>
-		    <select class="sql-terminal-checkpoints"></select>
-		    <button onclick="sqlTerminalCheckpointRevert(this)">Revert to</button>
-		    <button onclick="sqlTerminalHighlightOnMap(this)">Highlight on map</button>
-		    <button onclick="sqlTerminalClearHighlights(this)">Clear highlights</button>
+		    <button onclick="checkpointSave(this)" title="Save the current database state as a new checkpoint">Save checkpoint</button>
+		    <select class="sql-terminal-checkpoints" onchange="setCurrentCheckpoint(this.value)"></select>
+		    <button onclick="checkpointRevert(this)" title="Revert the database to the selected checkpoint - also rebuilds the replay's own timeline/positions/chat from the reverted data">Revert to</button>
 		    <!-- Hidden by default (main.js's runSqlIntoResultsTable) - only
 		         shown once a Run produces write-back-eligible results (a
 		         plain single-table SELECT, see queryWriteBackTable), same as
@@ -138,15 +148,25 @@
 	    </div>
 	</div>
 
-	<div id="schema-explorer-panel" class="ui-panel minimized" style="display:none;" data-panel-type="schema-explorer-panel">
+	<div id="schema-explorer-panel" class="ui-panel" style="display:none;" data-panel-type="schema-explorer-panel">
 	    <div class="panel-header">
 		<span>[Schema Explorer]</span>
 		<span class="panel-header-controls">
 		    <span class="toggle-icon">-</span>
+		    <span class="panel-maximize-btn" title="Maximize window"></span>
 		    <span class="panel-close-btn" title="Close window">&times;</span>
 		</span>
 	    </div>
 	    <div class="panel-content">
+		<!-- One flex-wrap row, not several fixed <div> groups - same
+		     "widening the panel lets these consolidate onto fewer rows"
+		     principle the SQL Terminal's own button-row already documents
+		     (main.html, sql-terminal-panel). Checkpoints are one global,
+		     connection-wide concept (real SQLite SAVEPOINTs - see
+		     sql_terminal.c) shared with every SQL Terminal window's own
+		     identical controls, not separate per-panel state - picking one
+		     here picks it everywhere (main.js's setCurrentCheckpoint). #0
+		     always exists (the database's own initial, as-loaded state). -->
 		<div class="button-row">
 		    <select class="schema-explorer-filter" onchange="refreshSchemaExplorer(this)">
 			<option value="all">All databases</option>
@@ -155,7 +175,11 @@
 			<option value="b">Battle DB</option>
 		    </select>
 		    <button onclick="refreshSchemaExplorer(this)">Refresh</button>
+		    <button onclick="checkpointSave(this)" title="Save the current database state as a new checkpoint">Save checkpoint</button>
+		    <select class="schema-explorer-checkpoints" onchange="setCurrentCheckpoint(this.value)"></select>
+		    <button onclick="checkpointRevert(this)" title="Revert the database to the selected checkpoint - also rebuilds the replay's own timeline/positions/chat from the reverted data">Revert to</button>
 		</div>
+		<div class="schema-explorer-checkpoint-status"></div>
 		<!-- Loading/error state lives here, NOT in the tree itself - a
 		     refresh that finds the tree already populated leaves it exactly
 		     as it was (main.js's updateSchemaExplorerTree patches it in
@@ -168,11 +192,39 @@
 	    </div>
 	</div>
 
-	<div id="sql-docs-panel" class="ui-panel minimized" style="display:none;" data-panel-type="sql-docs-panel">
+	<div id="render-queries-panel" class="ui-panel" style="display:none;" data-panel-type="render-queries-panel">
+	    <div class="panel-header">
+		<span>[Rendering Queries]</span>
+		<span class="panel-header-controls">
+		    <span class="toggle-icon">-</span>
+		    <span class="panel-maximize-btn" title="Maximize window"></span>
+		    <span class="panel-close-btn" title="Close window">&times;</span>
+		</span>
+	    </div>
+	    <div class="panel-content">
+		<!-- Ordered, user-editable list of SQL queries driving everything
+		     rendered/shown - dots (draw order = list order) and chat
+		     (@KIND=chat entries, run by main.js's refreshChatFromQuery
+		     directly, never reaching the C render-query engine at all).
+		     One card per query, built/refreshed entirely by main.js
+		     (refreshAllRenderQueryPanels/buildRenderQueryCard) - this
+		     list stays empty in the static markup. -->
+		<div class="button-row">
+		    <button onclick="addRenderQuery()">Add Query</button>
+		    <button onclick="resetRenderQueriesToDefaults()" title="Discard all edits and restore the original 3-query default list">Reset to Defaults</button>
+		    <button onclick="exportRenderQueriesSql()" title="Download the current query list as a JSON bundle">Export SQL Set</button>
+		    <button onclick="document.getElementById('render-queries-import-input').click()" title="Load a previously-exported JSON bundle, replacing the current list">Import SQL Set</button>
+		</div>
+		<div class="render-queries-list"></div>
+	    </div>
+	</div>
+
+	<div id="sql-docs-panel" class="ui-panel" style="display:none;" data-panel-type="sql-docs-panel">
 	    <div class="panel-header">
 		<span>[SQL Docs]</span>
 		<span class="panel-header-controls">
 		    <span class="toggle-icon">-</span>
+		    <span class="panel-maximize-btn" title="Maximize window"></span>
 		    <span class="panel-close-btn" title="Close window">&times;</span>
 		</span>
 	    </div>
@@ -269,6 +321,11 @@
 			<span style="flex:1 1 auto;">SQL Docs</span>
 			<button type="button" class="menu-open-new-btn" onclick="openNewPanelInstance('sql-docs-panel')" title="Open another SQL Docs window">+</button>
 		    </label>
+		    <label class="menu-checkbox-item">
+			<input type="checkbox" id="panel-toggle-render-queries-panel" onchange="setPanelVisible('render-queries-panel', this.checked)">
+			<span style="flex:1 1 auto;">Rendering Queries</span>
+			<button type="button" class="menu-open-new-btn" onclick="openNewPanelInstance('render-queries-panel')" title="Open another Rendering Queries window">+</button>
+		    </label>
 		</div>
 	    </div>
 	</div>
@@ -284,6 +341,12 @@
 		<button class="file-btn" onclick="document.getElementById('battle-file-input').click()">Load Battle Export (.tar.xz)</button>
 	    </div>
 	</div>
+
+	<!-- Rendering Queries panel's Import SQL Set button - same hidden-
+	     input+change-listener pattern as file-input/battle-file-input above,
+	     just for a small JSON bundle (main.js's importRenderQueriesSqlFile)
+	     instead of a replay/battle database. -->
+	<input type="file" id="render-queries-import-input" accept=".json" style="display:none;">
 
 	<div id="loading-overlay" class="overlay" style="display: none;">
 	    <div class="card">

@@ -72,49 +72,58 @@ float view_shift_x = 0.0f, view_shift_y = 0.0f;
 float map_min_x = -100.0f, map_max_x = 100.0f;
 float map_min_y = -100.0f, map_max_y = 100.0f;
 
-// Shared Wasm Memory: Array layout [x, y, team, x, y, team...]. Growable,
-// not a fixed cap - a battle's living units are naturally bounded (the
-// game engine only has ~1025 agent slots), but corpses accumulate for the
-// whole battle with no ceiling, so this needs to be able to grow past
-// whatever an initial guess would be.
-float *agent_buffer = 0;
-int agent_buffer_capacity = 0;
-int active_agent_count = 0;
+// Phase 4: SQL-driven rendering-query engine's own point buffers, one per
+// enabled rendering-query slot (replay_worker.c's g_render_slots -
+// replay_worker.wasm is a SEPARATE wasm module/memory from this one, so
+// main.js copies each slot's [x,y,r,g,b]-per-point data across every
+// frame). Replaces the old single agent_buffer + hardcoded team-color
+// switch in render_frame() below: color now travels WITH each point
+// (read straight from the buffer) instead of being computed from a `team`
+// float via a fixed 5-way branch, and "how many buffers, how many points
+// in each" is a property of however many rendering-query slots are
+// currently enabled, not a single fixed agent count. Slot draw order is
+// list order - see render_frame() below, "drawn strictly in list order".
+//
+// Growable per slot, not a fixed cap - a battle's living units are
+// naturally bounded (the game engine only has ~1025 agent slots), but
+// corpses accumulate for the whole battle with no ceiling, so any given
+// slot needs to be able to grow past whatever an initial guess would be.
+#define MAX_RENDER_SLOTS 8
+typedef struct RenderPointBuffer {
+    float *data;      // [x, y, color_r, color_g, color_b] per point, 5 floats/point
+    int capacity;
+    int count;
+    int shape;         // 0 = dot (filled triangle fan), 1 = ring (line loop) - see render_frame()
+} RenderPointBuffer;
+static RenderPointBuffer render_slots[MAX_RENDER_SLOTS];
+static int active_render_slot_count = 0;
 
-// Called from JS before writing this frame's data in: grows the buffer if
-// needed and returns the (possibly new) pointer. JS always re-fetches the
-// pointer via this call rather than caching it, since a realloc can move it.
-float* ensure_agent_capacity(int n) {
-    if (n > agent_buffer_capacity) {
-        int new_cap = agent_buffer_capacity ? agent_buffer_capacity * 2 : 2048;
+// Called from JS before writing a slot's frame data in: grows that slot's
+// buffer if needed and returns the (possibly new) pointer. JS always
+// re-fetches the pointer via this call rather than caching it, since a
+// realloc can move it.
+float* ensure_render_slot_capacity(int slotIdx, int n) {
+    if (slotIdx < 0 || slotIdx >= MAX_RENDER_SLOTS) return 0;
+    RenderPointBuffer *b = &render_slots[slotIdx];
+    if (n > b->capacity) {
+        int new_cap = b->capacity ? b->capacity * 2 : 256;
         while (new_cap < n) new_cap *= 2;
-        float *nb = (float*)realloc(agent_buffer, sizeof(float) * 3 * (size_t)new_cap);
-        if (nb) { agent_buffer = nb; agent_buffer_capacity = new_cap; }
+        float *nb = (float*)realloc(b->data, sizeof(float) * 5 * (size_t)new_cap);
+        if (nb) { b->data = nb; b->capacity = new_cap; }
     }
-    return agent_buffer;
+    return b->data;
 }
-void update_frame_data(int count) { active_agent_count = count; }
-
-// Phase 5: SQL-terminal query-result highlighting. Same growable-buffer
-// pattern as agent_buffer above, but (x, y) pairs only - a highlight is a
-// generic point from an arbitrary query result, not a living/dead agent
-// with a team. Data path: the terminal requires the query to alias its
-// coordinate columns exactly "x"/"y" (main.js's sqlTerminalHighlightOnMap)
-// rather than guessing column names, so this side stays simple/predictable.
-float *highlight_buffer = 0;
-int highlight_buffer_capacity = 0;
-int active_highlight_count = 0;
-
-float* ensure_highlight_capacity(int n) {
-    if (n > highlight_buffer_capacity) {
-        int new_cap = highlight_buffer_capacity ? highlight_buffer_capacity * 2 : 256;
-        while (new_cap < n) new_cap *= 2;
-        float *nb = (float*)realloc(highlight_buffer, sizeof(float) * 2 * (size_t)new_cap);
-        if (nb) { highlight_buffer = nb; highlight_buffer_capacity = new_cap; }
-    }
-    return highlight_buffer;
+// Called once per slot per frame, after ensure_render_slot_capacity's data
+// has been written - records how many points are actually valid this frame
+// and this slot's shape, and (via slotIdx+1) how many slots are active in
+// total, so render_frame() below knows how far to iterate without a
+// separate "set slot count" call every frame.
+void update_render_slot_data(int slotIdx, int n, int shape) {
+    if (slotIdx < 0 || slotIdx >= MAX_RENDER_SLOTS) return;
+    render_slots[slotIdx].count = n;
+    render_slots[slotIdx].shape = shape;
+    if (slotIdx + 1 > active_render_slot_count) active_render_slot_count = slotIdx + 1;
 }
-void update_highlight_data(int count) { active_highlight_count = count; }
 
 void set_map_bounds(float min_x, float max_x, float min_y, float max_y) {
     map_min_x = min_x; map_max_x = max_x;
@@ -160,6 +169,12 @@ void set_screen_dimensions(int w, int h) { screen_width = w; screen_height = h; 
  * (cam_x, cam_y) - no inverse-projection math needed. */
 float get_cam_x(void) { return cam_x; }
 float get_cam_y(void) { return cam_y; }
+/* Phase 6: lets main.js's world->screen projection for the nato_symbol
+ * dom-overlay kind (map-symbol-layer) replicate render_frame's own
+ * ortho/view math exactly, without a WASM round-trip per symbol per RAF -
+ * see this section's own header comment on why that math is cheap enough to
+ * duplicate in JS rather than reading back projected screen coordinates. */
+float get_cam_zoom(void) { return cam_zoom; }
 
 /* Sets the render-only visual shift (view_shift_x/y above) - used by main.js
  * to make the currently active battle's own position bounds LOOK centered
@@ -328,69 +343,43 @@ void render_frame(float dt_seconds) {
     gl_vertex_attrib_pointer(attr_position_main, 3, GL_FLOAT, 0, 12, 0);
     gl_draw_arrays(GL_LINE_LOOP, 0, 4);
 
-    // 3. Render Human Players as Circle Fans
+    // 3. Render every enabled rendering-query slot's points, strictly in
+    // list order (slot 0 first) - this IS the draw order, replacing the old
+    // hardcoded "corpses then living agents" C statement order with a
+    // property of however many/whichever rendering queries are enabled and
+    // in what order. Color travels with each point (read straight from the
+    // buffer) instead of being computed from a team float via a fixed
+    // branch - see ensure_render_slot_capacity's own comment above.
     gl_bind_buffer(GL_ARRAY_BUFFER, vbo_circle);
     gl_vertex_attrib_pointer(attr_position_main, 3, GL_FLOAT, 0, 12, 0);
 
-    for (int i = 0; i < active_agent_count; i++) {
-        // view_shift here, not in the shared vp above - see that comment.
-        float ax = agent_buffer[i * 3 + 0] + view_shift_x;
-        float ay = agent_buffer[i * 3 + 1] + view_shift_y;
-        float team = agent_buffer[i * 3 + 2];
+    for (int s = 0; s < active_render_slot_count; s++) {
+        RenderPointBuffer *buf = &render_slots[s];
+        int is_ring = (buf->shape == 1);
+        float scale = is_ring ? (BALL_RADIUS * 1.6f) : BALL_RADIUS;
+        int draw_first = is_ring ? 1 : 0; // skip the fan-center vertex for a ring, same as the highlight-ring code below
+        int draw_count = is_ring ? (CIRCLE_SEGS + 1) : (CIRCLE_SEGS + 2);
+        int mode = is_ring ? GL_LINE_LOOP : GL_TRIANGLE_FAN;
 
-        mat4 model = GLM_MAT4_IDENTITY_INIT;
-        vec3 translate = {ax, ay, 0.0f};
-        glm_translate(model, translate);
-        glm_scale_uni(model, BALL_RADIUS);
-
-        mat4 mvp;
-        glm_mat4_mul(vp, model, mvp);
-        gl_uniform_matrix4fv(loc_mvp, (float*)mvp);
-
-        // Assign colors based on Team: Team 0 (Red), Team 1 (Blue), Spectators/Unassigned (Gray)
-        if (team == 0.0f) {
-            gl_uniform3f(loc_uColor, 0.95f, 0.25f, 0.25f);
-        } else if (team == 1.0f) {
-            gl_uniform3f(loc_uColor, 0.25f, 0.45f, 0.95f);
-        } else if (team == 2.0f) {
-            gl_uniform3f(loc_uColor, 0.45f, 0.1f, 0.1f); // Darker Red (Casualty)
-        } else if (team == 3.0f) {
-            gl_uniform3f(loc_uColor, 0.1f, 0.15f, 0.45f); // Darker Blue (Casualty)
-        } else {
-            gl_uniform3f(loc_uColor, 0.6f, 0.6f, 0.6f);
-        }
-
-        gl_draw_arrays(GL_TRIANGLE_FAN, 0, CIRCLE_SEGS + 2);
-    }
-
-    // 4. Render SQL-terminal highlight points as bright rings, drawn last so
-    // they layer visually on top of both living agents and corpses - a
-    // marker for arbitrary query results, independent of the team-colored
-    // agent rendering above. Reuses the same circle vbo as a LINE_LOOP
-    // starting at index 1 (skipping the fan-center vertex at index 0), so it
-    // reads as a ring around the point rather than a filled dot.
-    if (active_highlight_count > 0) {
-        gl_bind_buffer(GL_ARRAY_BUFFER, vbo_circle);
-        gl_vertex_attrib_pointer(attr_position_main, 3, GL_FLOAT, 0, 12, 0);
-        gl_uniform3f(loc_uColor, 1.0f, 0.9f, 0.1f);
-
-        for (int i = 0; i < active_highlight_count; i++) {
-            // Shifted along with the agents above, for the same reason -
-            // a highlight ring marks a query result relative to a specific
-            // agent's position, so it needs to move with it on screen.
-            float hx = highlight_buffer[i * 2 + 0] + view_shift_x;
-            float hy = highlight_buffer[i * 2 + 1] + view_shift_y;
+        for (int i = 0; i < buf->count; i++) {
+            // view_shift here, not in the shared vp above - see that comment.
+            float px = buf->data[i * 5 + 0] + view_shift_x;
+            float py = buf->data[i * 5 + 1] + view_shift_y;
+            float r = buf->data[i * 5 + 2];
+            float g = buf->data[i * 5 + 3];
+            float b = buf->data[i * 5 + 4];
 
             mat4 model = GLM_MAT4_IDENTITY_INIT;
-            vec3 translate = {hx, hy, 0.0f};
+            vec3 translate = {px, py, 0.0f};
             glm_translate(model, translate);
-            glm_scale_uni(model, BALL_RADIUS * 1.6f);
+            glm_scale_uni(model, scale);
 
             mat4 mvp;
             glm_mat4_mul(vp, model, mvp);
             gl_uniform_matrix4fv(loc_mvp, (float*)mvp);
+            gl_uniform3f(loc_uColor, r, g, b);
 
-            gl_draw_arrays(GL_LINE_LOOP, 1, CIRCLE_SEGS + 1);
+            gl_draw_arrays(mode, draw_first, draw_count);
         }
     }
 }

@@ -15,6 +15,11 @@
 #include "wasm_thread.h"
 #include "wasm_layout.h"
 #include "sql/canonical_roster_corpse_sql.h"
+#include "sql/default_boundary_detection_sql.h"
+#include "sql/default_render_corpses_sql.h"
+#include "sql/default_render_living_agents_sql.h"
+#include "sql/default_render_chat_sql.h"
+#include "sql/sample_render_nato_symbols_sql.h"
 #include "replay_internal.h"
 #include "sha256.h"
 #include <stdatomic.h>
@@ -27,7 +32,10 @@ extern void js_log_string(const char *msg);
 
 /* ---- constants -------------------------------------------------------- */
 #define MAX_AGENT_SLOTS    1025  /* lua/main.lua: for agent = 0, 1024 do - a real engine limit on simultaneous living units */
-#define MAX_MATCHES        16    /* up to 15 real battles per file, +1 headroom */
+/* MAX_MATCHES itself lives in replay_internal.h now - replay_export.c's
+ * roster/corpse summary cache (g_rc_cache) is sized off it too, and a
+ * locally-duplicated constant would risk silently drifting out of sync. */
+#define MAX_NONBATTLE_SPANS 16   /* see NonBattleSpan below - same headroom reasoning as MAX_MATCHES */
 #define LOAD_CHUNK_SIZE    (1024 * 1024)
 
 static char g_last_error[256];
@@ -129,6 +137,19 @@ static int g_tick_count = 0;
 static MatchInfo g_matches[MAX_MATCHES];
 static int g_match_count = 0;
 static unsigned char g_battle_ready[MAX_MATCHES]; /* has this battle's agent_states rowid slice been resolved? */
+
+/* A "skippable, not a battle" span - the boundary-detection SQL's is_battle=0
+ * rows (see sql/default_boundary_detection.sql and scan_matches_via_sql
+ * below). The default query never emits any (it faithfully reproduces the
+ * legacy C heuristic's behavior of silently absorbing a too-short span into
+ * whichever battle follows it) - this exists for a CUSTOM boundary-detection
+ * query that wants to mark, say, a lobby/warmup period explicitly instead. */
+typedef struct NonBattleSpan { sqlite3_int64 start_tick_id, end_tick_id; } NonBattleSpan;
+static NonBattleSpan g_nonbattle_spans[MAX_NONBATTLE_SPANS];
+static int g_nonbattle_span_count = 0;
+int replay_get_nonbattle_span_count(void) { return g_nonbattle_span_count; }
+double replay_get_nonbattle_span_start_tick_id(int idx) { return (idx >= 0 && idx < g_nonbattle_span_count) ? (double)g_nonbattle_spans[idx].start_tick_id : 0.0; }
+double replay_get_nonbattle_span_end_tick_id(int idx) { return (idx >= 0 && idx < g_nonbattle_span_count) ? (double)g_nonbattle_spans[idx].end_tick_id : 0.0; }
 
 MatchInfo *replay_internal_get_match(int matchIdx) {
     return (matchIdx >= 0 && matchIdx < g_match_count) ? &g_matches[matchIdx] : 0;
@@ -277,12 +298,33 @@ static int agent_states_rowid_span_on(sqlite3 *db, sqlite3_int64 *out_min, sqlit
     return ok;
 }
 
-/* tick_id of the first agent_states row with id >= probe (rowid seek, O(log n)) */
+/* tick_id of the first agent_states row with id >= probe (rowid seek, O(log n)).
+ * Confirmed via direct testing (a standalone native repro against this
+ * exact sqlite3.c amalgamation): leaving idlookup sitting in SQLITE_ROW
+ * (its LIMIT 1 means exactly one step() ever returns ROW, so a naive
+ * "if (step()==ROW) return ..." without a trailing reset leaves the
+ * statement ACTIVE/mid-VDBE between calls) makes SQLite refuse ANY
+ * schema-changing statement (CREATE/DROP TABLE) ANYWHERE ELSE on this same
+ * connection - including on totally unrelated attached schemas like "b"/
+ * "bcN" - with SQLITE_LOCKED ("database table is locked"), for as long as
+ * idlookup stays active. This is the real root cause a whole session's
+ * worth of "database table is locked"/"table already exists" symptoms in
+ * attach_battledb_view's schema_copy_all_tables trace back to: this
+ * function (via lower_bound_rowid_on/upper_bound_rowid_on's binary search,
+ * called from ensure_bounds_known/replay_ensure_battle_ready whenever a
+ * battle's rowid bounds get resolved) leaves g_stmt_id_lookup active right
+ * up until the next real tick_id_at_or_after_rowid_on call resets it - a
+ * window that can span an intervening attach_battledb_view call for a
+ * different battle. Always reset after reading the (at most one) row so
+ * this statement is idle, not mid-VDBE, whenever it isn't actively being
+ * stepped. */
 static sqlite3_int64 tick_id_at_or_after_rowid_on(sqlite3_stmt *idlookup, sqlite3_int64 probe) {
     sqlite3_reset(idlookup);
     sqlite3_bind_int64(idlookup, 1, probe);
-    if (sqlite3_step(idlookup) == SQLITE_ROW) return sqlite3_column_int64(idlookup, 0);
-    return -1; /* probe is past the last row */
+    sqlite3_int64 result = -1; /* probe is past the last row */
+    if (sqlite3_step(idlookup) == SQLITE_ROW) result = sqlite3_column_int64(idlookup, 0);
+    sqlite3_reset(idlookup);
+    return result;
 }
 
 /* smallest rowid whose tick_id >= target_tick (rmax+1 if none) */
@@ -465,6 +507,37 @@ static void ensure_bounds_known(int matchIdx) {
     g_bounds_known[matchIdx] = 1;
 }
 
+/* Shared memory-budget predicate - see replay_internal.h's own comment on
+ * why replay_export.c's roster/corpse summary cache shares this exact check
+ * rather than tracking a second, separate budget. */
+int replay_is_over_priming_budget(void) {
+    return g_priming_budget_bytes > 0 && replay_get_playback_heap_bytes() >= g_priming_budget_bytes;
+}
+
+/* Deliberately NOT chunked, despite this rework's plan originally scoping a
+ * "chunk this CREATE INDEX into sub-ranges" phase to bound worst-case
+ * per-RAF stall - benchmarked directly first (a temporary debug export
+ * wrapping exactly this call in performance.now(), evict+rebuild via the
+ * real production path, not an approximation) and found unnecessary:
+ * single-shot CREATE INDEX for this project's largest real fixture's
+ * biggest individual battles (250K-330K agent_states rows) measured 1-14ms
+ * end to end, repeatedly - comfortably under one 60fps frame budget
+ * (16.7ms), nowhere near the multi-second stalls the lag concern this
+ * rework addresses was based on. Chunking would have required a much
+ * larger, riskier change too: splitting this single WHERE id BETWEEN lo AND
+ * hi index into N sub-range indexes would make fetch_positions()'s existing
+ * full-range query (which needs the SAME literal [lo,hi] bounds as one
+ * index to stay index-eligible at all - see this function's own bisection
+ * comment above) stop matching any single index, silently falling back to a
+ * full table scan on this project's hottest per-frame path - real risk for
+ * zero measured benefit. The actual expensive, worth-hiding-from-the-
+ * synchronous-path operation turned out to be the canonical roster/corpse
+ * WITH RECURSIVE derivation (multiple real seconds on this same fixture,
+ * confirmed via manual testing) - already addressed by the roster/corpse
+ * summary cache (replay_export.c's g_rc_cache /
+ * replay_prewarm_battle_summary) added earlier in this rework, which moves
+ * that cost off the synchronous path the same way this function already
+ * does for the (measured-cheap) agent_states index. */
 int replay_ensure_battle_ready(int matchIdx) {
     if (matchIdx < 0 || matchIdx >= g_match_count) return 0;
     if (g_battle_ready[matchIdx]) return 0;
@@ -476,7 +549,7 @@ int replay_ensure_battle_ready(int matchIdx) {
      * first. Purely best-effort - falls through to the unconditional build
      * below either way. This is "evict things... if needed to play the
      * battle" from the feature request. */
-    if (g_priming_budget_bytes > 0 && replay_get_playback_heap_bytes() >= g_priming_budget_bytes) {
+    if (replay_is_over_priming_budget()) {
         int victim = pick_farthest_primed_battle(matchIdx);
         if (victim >= 0) replay_evict_battle(victim);
     }
@@ -521,7 +594,7 @@ int replay_try_prime_battle(int matchIdx, int currentMatchIdx) {
     if (matchIdx < 0 || matchIdx >= g_match_count) return -1;
     if (g_battle_ready[matchIdx]) return 0;
 
-    if (g_priming_budget_bytes > 0 && replay_get_playback_heap_bytes() >= g_priming_budget_bytes) {
+    if (replay_is_over_priming_budget()) {
         int victim = pick_farthest_primed_battle(currentMatchIdx);
         double target_dt, victim_dt;
         if (currentMatchIdx >= 0 && currentMatchIdx < g_match_count) {
@@ -659,31 +732,451 @@ static void resync_roster_to(sqlite3_int64 target_tick_id) {
     g_roster_synced_tick_id = target_tick_id;
 }
 
-/* ---- frame buffer (JS/wasm shared layout: [x,y,team, x,y,team, ...]) ----
- * Growable, not fixed-size: living units are capped at MAX_AGENT_SLOTS by
- * the game engine itself (a real limit, not one imposed here), but corpses
- * accumulate for the whole battle (see corpse_list_add above) and have no
- * such ceiling - a long, bloody battle can end up with far more corpses
- * than living slots. JS re-reads replay_get_frame_buffer_ptr() every frame
- * regardless, so a pointer that moves after a realloc is always safe. */
-static float *g_frame_buffer = 0;
-static int g_frame_buffer_capacity = 0;
-static int g_frame_count = 0;
-static double g_relative_time = 0.0;
-static sqlite3_int64 g_current_tick_id = -1; /* tickA of the most recent build_frame_at_time() call - backs CURRENT_TICK() (the SQL variable function) and replay_get_current_tick_id() */
+/* ---- rendering-query engine (SQL-driven, replaces the old hardcoded
+ * g_frame_buffer emission) ---------------------------------------------
+ *
+ * Phase 4 of the SQL-rendering rework: rendering reads from two compiled-in
+ * default queries (sql/default_render_corpses.sql,
+ * default_render_living_agents.sql) instead of the hardcoded corpse/living
+ * emission loops this replaces - now reading main.agent_states directly
+ * (joined against "b"'s own arbitrary, user-editable roster_history/corpses
+ * tables for team/kind - see export_create_battledb_schema's own comment),
+ * not a fixed C-populated staging table. A future phase makes this list
+ * user-editable (the @KIND/@CACHE/@INTERPOLATE directives those two files
+ * already carry as comments); this phase only has to prove the
+ * query-driven path itself works, pixel-identical to the old hardcoded
+ * one, for exactly these two.
+ *
+ * Two-stage per slot: the SQL side (ensure_render_query_rows) only re-runs
+ * when tickA_id actually changes, producing tickA-and-optionally-tickB
+ * rows; the blend side (blend_render_slot) runs every RAF (cheap - a plain
+ * per-row lerp, no SQL), mirroring exactly what the OLD hardcoded
+ * interpolation math already did, just generalized from "the agent_states
+ * table" to "whichever rows this slot's query returned".
+ *
+ * Interpolation (@INTERPOLATE on, e.g. living_agents) is resolved by
+ * running the query TWICE - once as-is (tickA), once with every
+ * CURRENT_TICK() call textually replaced by CURRENT_TICK_B() (tickB) - and
+ * LEFT JOINing the two on the query's own `row_key` column. The same
+ * textual-substitution technique main.js already uses client-side for
+ * nato_symbol's own tickB variant (buildNatoSymbolTickBQuery - see
+ * sqlfn_current_tick_b's own comment), applied here on the C side instead
+ * since @KIND=dots stays entirely server-side. This replaces an earlier
+ * design (a LEFT JOIN against a dedicated rb.frame_state_b table) that
+ * only worked because frame_state_a/b were themselves fixed, C-populated
+ * tables - now that "b"'s schema is arbitrary and user-editable (see
+ * replay_export.c's export_create_battledb_schema), there is no fixed
+ * table shape left to join against; re-running the user's own query text
+ * with the tick swapped is the general tool that works for ANY query. */
+/* Phase 5: a real, dynamic, JS-editable list (up to MAX_RENDER_QUERIES) -
+ * replacing Phase 4's fixed 2-slot corpses/living_agents pair. JS owns the
+ * canonical ordered list (including @KIND=chat entries, which never reach
+ * this engine at all - chat keeps using refreshChatFromQuery/
+ * renderChatMessages, see main.js) and is the ONLY thing that parses
+ * @KIND/@CACHE/@INTERPOLATE directive comments; this engine is handed
+ * already-decided execution parameters (interpolate, shape) per slot rather
+ * than parsing directives itself, and JS always resubmits the FULL ordered
+ * dots-kind sublist (via replay_render_query_configure per slot +
+ * replay_render_query_set_count to trim any now-unused trailing slots)
+ * whenever the list changes at all - add/remove/reorder/edit/enable/disable
+ * are all just "resubmit", never an incremental list-surgery primitive.
+ * Small, infrequent list, so this is cheap and avoids an entire class of
+ * index-shifting bugs a real insert/remove/move API would risk. */
+#define MAX_RENDER_QUERIES 16
+#define RENDER_QUERY_LAST_ERROR_SIZE 256
 
-static void ensure_frame_buffer_capacity(int n) {
-    if (n <= g_frame_buffer_capacity) return;
-    int new_cap = g_frame_buffer_capacity ? g_frame_buffer_capacity * 2 : 2048;
-    while (new_cap < n) new_cap *= 2;
-    float *nb = (float *)realloc(g_frame_buffer, sizeof(float) * 3 * (size_t)new_cap);
-    if (!nb) return; /* OOM: keep the old buffer/capacity, build_frame_at_time's out-count will just clamp to it */
-    g_frame_buffer = nb;
-    g_frame_buffer_capacity = new_cap;
+typedef struct RenderRow {
+    float x, y, r, g, b;
+    float bx, by;         /* tickB position, only meaningful if has_b */
+    unsigned char has_b;
+} RenderRow;
+
+/* @CACHE modes, in increasing order of staleness-tolerance. RENDER_CACHE_TICK
+ * (default) rebuilds whenever tickA_id changes - once per real tick, not
+ * every RAF. RENDER_CACHE_LIVE bypasses that gate entirely, re-running every
+ * single build_frame_at_time call - the explicit, UI-labeled perf-tradeoff
+ * escape hatch for a query that reads something that changes every frame
+ * without a tick changing (e.g. CURSOR_X()/CURSOR_Y()). RENDER_CACHE_NONE is
+ * the opposite extreme: build once per active battle and never again
+ * automatically, regardless of how many ticks pass - for a query whose
+ * result is genuinely battle-wide rather than per-tick (a whole-battle
+ * heatmap, a fixed start/end marker, anything scoped by
+ * CURRENT_BATTLE_TICK_START()/END() rather than CURRENT_TICK()), where
+ * re-deriving it on every tick change would just be wasted work recomputing
+ * the identical answer. Values match the numbering replay_render_query_configure's
+ * own `cache` parameter already used before RENDER_CACHE_NONE existed (0/1
+ * were a plain tick/live boolean) - kept stable so old callers passing 0 or 1
+ * keep meaning exactly what they always meant. */
+#define RENDER_CACHE_TICK 0
+#define RENDER_CACHE_LIVE 1
+#define RENDER_CACHE_NONE 2
+
+typedef struct RenderQuerySlot {
+    char *sql;             /* malloc'd; NULL = slot unused */
+    int interpolate;
+    int shape;
+    int enabled;
+    int cache_mode;         /* RENDER_CACHE_TICK/LIVE/NONE - see that enum's own comment */
+    sqlite3_int64 built_for_tick_id; /* cache key - see this section's own header comment. -1 = never built (or force-rebuild requested) */
+    int built_for_match;    /* RENDER_CACHE_NONE's own second cache key - which battle the current rows were built for */
+    RenderRow *rows;
+    int rows_capacity, rows_count;
+    float *out_buf;   /* [x,y,r,g,b] per point, blended - what JS actually reads */
+    int out_capacity, out_count;
+    char last_error[RENDER_QUERY_LAST_ERROR_SIZE];
+    int last_error_offset; /* -1 = none, see sqlite3_error_offset()-based offsets elsewhere in this codebase */
+} RenderQuerySlot;
+static RenderQuerySlot g_render_slots[MAX_RENDER_QUERIES];
+static int g_render_query_count = 0; /* how many of slots 0..count-1 are configured (may include disabled ones) */
+
+static int render_slot_valid(int slotIdx) { return slotIdx >= 0 && slotIdx < g_render_query_count; }
+
+int replay_get_render_slot_count(void) { return g_render_query_count; }
+float *replay_get_render_buffer_ptr(int slotIdx) {
+    return render_slot_valid(slotIdx) ? g_render_slots[slotIdx].out_buf : 0;
+}
+int replay_get_render_buffer_count(int slotIdx) {
+    return (render_slot_valid(slotIdx) && g_render_slots[slotIdx].enabled) ? g_render_slots[slotIdx].out_count : 0;
+}
+int replay_get_render_shape(int slotIdx) {
+    return render_slot_valid(slotIdx) ? g_render_slots[slotIdx].shape : 0;
+}
+const char *replay_render_query_get_last_error(int slotIdx) {
+    return render_slot_valid(slotIdx) ? g_render_slots[slotIdx].last_error : "";
+}
+int replay_render_query_get_last_error_offset(int slotIdx) {
+    return render_slot_valid(slotIdx) ? g_render_slots[slotIdx].last_error_offset : -1;
 }
 
-float *replay_get_frame_buffer_ptr(void) { return g_frame_buffer; }
-int replay_get_frame_count(void) { return g_frame_count; }
+/* Every rendering query ends with a trailing ';' by normal SQL-file/editor
+ * convention - fine on its own, but fatal once wrapped as a parenthesized
+ * subquery below ("FROM (...;) q" is a syntax error, a semicolon can't
+ * appear inside a parenthesized expression). Returns the length to use with
+ * %.*s so the wrap below never includes it. Confirmed directly during Phase
+ * 4 development: without this trim, prepare failed silently on every
+ * interpolated query, making living agents render as permanently empty. */
+static int sql_len_without_trailing_semicolon(const char *sql) {
+    int len = (int)strlen(sql);
+    while (len > 0 && (sql[len-1] == ' ' || sql[len-1] == '\n' || sql[len-1] == '\r' || sql[len-1] == '\t')) len--;
+    if (len > 0 && sql[len-1] == ';') len--;
+    return len;
+}
+
+/* Small self-contained copy of replay_export.c's identical helper - kept
+ * separate rather than sharing plumbing across the module boundary for
+ * something this size (same convention that file's own small helpers,
+ * e.g. sha256_hex_of, already follow). */
+static char *str_replace_all(const char *src, const char *find, const char *repl) {
+    size_t find_len = strlen(find), repl_len = strlen(repl), src_len = strlen(src);
+    size_t count = 0;
+    for (const char *p = src; (p = strstr(p, find)) != 0; p += find_len) count++;
+    size_t extra = (repl_len > find_len) ? (repl_len - find_len) : 0;
+    char *out = (char *)malloc(src_len + count * extra + 1);
+    if (!out) return 0;
+    char *w = out;
+    const char *r = src;
+    const char *hit;
+    while ((hit = strstr(r, find)) != 0) {
+        size_t chunk = (size_t)(hit - r);
+        memcpy(w, r, chunk); w += chunk;
+        memcpy(w, repl, repl_len); w += repl_len;
+        r = hit + find_len;
+    }
+    strcpy(w, r);
+    return out;
+}
+
+/* Builds the actual text to prepare for slotIdx - the tickA/tickB
+ * self-join (see this section's own header comment on why a textual
+ * CURRENT_TICK()->CURRENT_TICK_B() rewrite, not a join against a fixed
+ * table) if s->interpolate, else the slot's own text unchanged.
+ *
+ * RENDER_CACHE_NONE always skips the REAL tickB join, even with
+ * @INTERPOLATE on: blend_render_slot's per-row lerp uses g_last_alpha,
+ * which is recomputed fresh every RAF from the CURRENT tickA/tickB pair -
+ * but a RENDER_CACHE_NONE slot's rows were captured once, from whatever
+ * tickA/tickB pair happened to be current at build time, and never rebuilt
+ * since. Confirmed directly: blending those long-stale bx/by values
+ * against a freshly-computed, unrelated alpha doesn't hold still (the
+ * whole point of "none") or track the real tick (the whole point of
+ * interpolation) - it just drifts by a small, essentially arbitrary amount
+ * every frame, silently wrong either way you'd want to read it.
+ * Interpolation is a tick-to-tick blending concept; RENDER_CACHE_NONE's
+ * rows are deliberately NOT tied to a tick, so there is no meaningful
+ * tickB to interpolate toward - showing tickA's own value un-blended is
+ * the only interpretation that stays actually correct.
+ *
+ * Still wraps with the SAME 8-column shape the real interpolated case
+ * produces (just with fb.x/y/row_key hardcoded rather than a genuine
+ * tickB subquery + join) rather than returning s->sql bare: the query's
+ * own text still has a leading `row_key` column (required for the ordinary
+ * interpolated case's join condition) that the outer wrapper strips down
+ * to the plain x/y/color columns ensure_render_query_rows expects at fixed
+ * indices - returning the raw, un-wrapped text here would leave row_key
+ * sitting in column 0, silently shifting every column after it by one.
+ * Caller must sqlite3_free() a non-null result. */
+static char *build_query_text_for_slot(RenderQuerySlot *s) {
+    if (!s->sql) return 0;
+    if (!s->interpolate) return sqlite3_mprintf("%s", s->sql);
+    int base_len = sql_len_without_trailing_semicolon(s->sql);
+    char *tickA_text = sqlite3_mprintf("%.*s", base_len, s->sql);
+    if (!tickA_text) return 0;
+    if (s->cache_mode == RENDER_CACHE_NONE) {
+        char *wrapped = sqlite3_mprintf(
+            "SELECT q.x, q.y, q.color_r, q.color_g, q.color_b, 0.0, 0.0, 0 FROM (%s) q",
+            tickA_text);
+        sqlite3_free(tickA_text);
+        return wrapped;
+    }
+    char *tickB_text = str_replace_all(tickA_text, "CURRENT_TICK()", "CURRENT_TICK_B()");
+    if (!tickB_text) { sqlite3_free(tickA_text); return 0; }
+    char *wrapped = sqlite3_mprintf(
+        "SELECT q.x, q.y, q.color_r, q.color_g, q.color_b, fb.x, fb.y, (fb.row_key IS NOT NULL) "
+        "FROM (%s) q LEFT JOIN (%s) fb ON fb.row_key = q.row_key",
+        tickA_text, tickB_text);
+    sqlite3_free(tickA_text);
+    free(tickB_text);
+    return wrapped;
+}
+
+static void render_query_set_error(RenderQuerySlot *s, const char *msg, int offset) {
+    int i = 0;
+    if (msg) while (msg[i] && i < RENDER_QUERY_LAST_ERROR_SIZE - 1) { s->last_error[i] = msg[i]; i++; }
+    s->last_error[i] = 0;
+    s->last_error_offset = offset;
+}
+static void render_query_clear_error(RenderQuerySlot *s) { s->last_error[0] = 0; s->last_error_offset = -1; }
+
+/* Re-runs slotIdx's query only when tickA_id has actually changed since last
+ * built - the expensive half, gated for the same reason build_frame_at_time's
+ * own replay_ensure_db_view(2) call is (build_frame_at_time runs every RAF,
+ * not just on real tick changes). "b" is guaranteed attached and populated
+ * for the active battle by the time this runs - it's only ever called after
+ * that same replay_ensure_db_view(2) call in build_frame_at_time below. */
+static void ensure_render_query_rows(int slotIdx, sqlite3_int64 tickA_id) {
+    RenderQuerySlot *s = &g_render_slots[slotIdx];
+    if (!s->enabled || !s->sql) { s->rows_count = 0; return; }
+    if (s->cache_mode == RENDER_CACHE_NONE) {
+        if (s->built_for_tick_id != -1 && s->built_for_match == g_active_match_index) return;
+    } else if (s->cache_mode == RENDER_CACHE_TICK && s->built_for_tick_id == tickA_id) {
+        return;
+    }
+    s->built_for_tick_id = tickA_id;
+    s->built_for_match = g_active_match_index;
+    s->rows_count = 0;
+
+    char *wrapped = build_query_text_for_slot(s);
+    if (!wrapped) return;
+    sqlite3_stmt *stmt = 0;
+    int rc = sqlite3_prepare_v2(g_db, wrapped, -1, &stmt, 0);
+    if (rc != SQLITE_OK) {
+        render_query_set_error(s, sqlite3_errmsg(g_db), sqlite3_error_offset(g_db));
+        sqlite3_free(wrapped);
+        return;
+    }
+    sqlite3_free(wrapped);
+
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (s->rows_count >= s->rows_capacity) {
+            int new_cap = s->rows_capacity ? s->rows_capacity * 2 : 256;
+            RenderRow *nr = (RenderRow *)realloc(s->rows, sizeof(RenderRow) * (size_t)new_cap);
+            if (!nr) break;
+            s->rows = nr;
+            s->rows_capacity = new_cap;
+        }
+        RenderRow *row = &s->rows[s->rows_count++];
+        row->x = (float)sqlite3_column_double(stmt, 0);
+        row->y = (float)sqlite3_column_double(stmt, 1);
+        row->r = (float)sqlite3_column_double(stmt, 2);
+        row->g = (float)sqlite3_column_double(stmt, 3);
+        row->b = (float)sqlite3_column_double(stmt, 4);
+        // build_query_text_for_slot always wraps to this same 8-column
+        // shape whenever s->interpolate is set (RENDER_CACHE_NONE included -
+        // it hardcodes columns 5/6/7 to 0.0/0.0/0 rather than skipping the
+        // wrap, see that function's own comment on why), so this check only
+        // needs to mirror s->interpolate itself.
+        if (s->interpolate) {
+            row->has_b = (unsigned char)sqlite3_column_int(stmt, 7);
+            row->bx = (float)sqlite3_column_double(stmt, 5);
+            row->by = (float)sqlite3_column_double(stmt, 6);
+        } else {
+            row->has_b = 0;
+        }
+    }
+    if (rc == SQLITE_DONE) render_query_clear_error(s);
+    else render_query_set_error(s, sqlite3_errmsg(g_db), sqlite3_error_offset(g_db));
+    sqlite3_finalize(stmt);
+}
+
+/* Cheap per-row lerp into the output buffer JS actually reads - runs every
+ * RAF (via build_frame_at_time), never touches SQL. Mirrors the OLD
+ * hardcoded living-agent interpolation math exactly:
+ * x + (bx - x) * alpha, only applied when a tickB match exists. */
+static void blend_render_slot(int slotIdx, float alpha) {
+    RenderQuerySlot *s = &g_render_slots[slotIdx];
+    if (s->rows_count > s->out_capacity) {
+        int new_cap = s->out_capacity ? s->out_capacity * 2 : 256;
+        while (new_cap < s->rows_count) new_cap *= 2;
+        float *nb = (float *)realloc(s->out_buf, sizeof(float) * 5 * (size_t)new_cap);
+        if (nb) { s->out_buf = nb; s->out_capacity = new_cap; }
+    }
+    int out = 0;
+    for (int i = 0; i < s->rows_count && out < s->out_capacity; i++) {
+        RenderRow *row = &s->rows[i];
+        float x = row->x, y = row->y;
+        if (row->has_b) {
+            x = x + (row->bx - x) * alpha;
+            y = y + (row->by - y) * alpha;
+        }
+        s->out_buf[out * 5 + 0] = x;
+        s->out_buf[out * 5 + 1] = y;
+        s->out_buf[out * 5 + 2] = row->r;
+        s->out_buf[out * 5 + 3] = row->g;
+        s->out_buf[out * 5 + 4] = row->b;
+        out++;
+    }
+    s->out_count = out;
+}
+
+/* ---- Phase 5: JS-driven configuration of the render-query list --------- */
+
+#define RENDER_QUERY_TEXT_BUF_SIZE 16384
+static char g_render_query_text_buf[RENDER_QUERY_TEXT_BUF_SIZE];
+unsigned char *replay_get_render_query_text_buf_ptr(void) { return (unsigned char *)g_render_query_text_buf; }
+
+/* Sets slot[slotIdx]'s SQL text (from the shared buffer above, len bytes)
+ * and execution parameters, validating the text immediately (a real
+ * sqlite3_prepare_v2 - discarded right after, ensure_render_query_rows
+ * prepares its own fresh statement on the next actual frame either way) so
+ * the UI gets real error/offset feedback the moment a query is edited,
+ * matching the same sqlite3_error_offset()-based reporting already used for
+ * generator scripts/the SQL terminal elsewhere in this codebase. Always
+ * forces a rebuild on the next frame regardless of validation outcome (a
+ * failing query still needs its cached "empty" state applied - see
+ * ensure_render_query_rows's own enabled/sql-null short-circuit). Grows
+ * g_render_query_count if slotIdx is the next new slot; JS is responsible
+ * for calling replay_render_query_set_count afterward if the list actually
+ * got shorter (a slot being reconfigured never implies the list shrank). */
+int replay_render_query_configure(int slotIdx, int len, int interpolate, int shape, int enabled, int cacheMode) {
+    if (slotIdx < 0 || slotIdx >= MAX_RENDER_QUERIES) return -1;
+    if (len < 0) len = 0;
+    if (len > RENDER_QUERY_TEXT_BUF_SIZE - 1) len = RENDER_QUERY_TEXT_BUF_SIZE - 1;
+    g_render_query_text_buf[len] = 0;
+
+    RenderQuerySlot *s = &g_render_slots[slotIdx];
+    free(s->sql);
+    size_t slen = strlen(g_render_query_text_buf);
+    s->sql = (char *)malloc(slen + 1);
+    if (!s->sql) { render_query_set_error(s, "out of memory", -1); return -2; }
+    memcpy(s->sql, g_render_query_text_buf, slen + 1);
+    s->interpolate = interpolate;
+    s->shape = shape;
+    s->enabled = enabled;
+    s->cache_mode = cacheMode;
+    s->built_for_tick_id = -1; /* force rebuild on next frame regardless of tick */
+    s->built_for_match = -1;
+    s->rows_count = 0;
+    s->out_count = 0; /* clear stale output immediately, don't wait for the next frame's rebuild */
+    if (slotIdx + 1 > g_render_query_count) g_render_query_count = slotIdx + 1;
+
+    char *wrapped = build_query_text_for_slot(s);
+    if (wrapped) {
+        sqlite3_stmt *stmt = 0;
+        if (sqlite3_prepare_v2(g_db, wrapped, -1, &stmt, 0) != SQLITE_OK) {
+            render_query_set_error(s, sqlite3_errmsg(g_db), sqlite3_error_offset(g_db));
+        } else {
+            render_query_clear_error(s);
+        }
+        sqlite3_finalize(stmt);
+        sqlite3_free(wrapped);
+    }
+    return 0;
+}
+
+/* Trims any trailing slots a shorter list left stale (e.g. the user deleted
+ * the last query in the list) - frees their SQL/rows/output. JS always
+ * resubmits the full list in order via replay_render_query_configure first,
+ * then calls this with the new true count; slots below newCount are left
+ * completely untouched (their own next replay_render_query_configure call,
+ * if any, handles them). */
+void replay_render_query_set_count(int newCount) {
+    if (newCount < 0) newCount = 0;
+    if (newCount > MAX_RENDER_QUERIES) newCount = MAX_RENDER_QUERIES;
+    for (int i = newCount; i < g_render_query_count; i++) {
+        RenderQuerySlot *s = &g_render_slots[i];
+        free(s->sql); s->sql = 0;
+        free(s->rows); s->rows = 0; s->rows_capacity = 0; s->rows_count = 0;
+        free(s->out_buf); s->out_buf = 0; s->out_capacity = 0; s->out_count = 0;
+        s->built_for_tick_id = -1;
+        s->enabled = 0;
+        render_query_clear_error(s);
+    }
+    g_render_query_count = newCount;
+}
+
+/* Compiled-in defaults, exposed read-only so main.js can populate its
+ * Rendering Queries panel (initial list AND "Reset to Defaults") from the
+ * exact same source seed_default_render_queries() below uses - one
+ * definition of "the defaults" (sql/default_render_*.sql, compiled in via
+ * scripts/gen_canonical_sql_header.py), never a second hand-copied JS
+ * literal that could drift from it. Index 0 = corpses, 1 = living_agents
+ * (matches seed_default_render_queries()'s own slot assignment - both
+ * actually pushed to this C engine); index 2 = chat, included here too even
+ * though it's a JS-only kind that never reaches this engine at all (see
+ * this file's own header comment on the render-query section) - main.js's
+ * initDefaultRenderQueries builds its whole 3-entry list from ONE call to
+ * this getter family, so chat's default text belongs here for the same
+ * "one definition of the defaults" reason the other two are. */
+int replay_get_default_render_query_count(void) { return 3; }
+const char *replay_get_default_render_query_sql(int idx) {
+    if (idx == 0) return DEFAULT_RENDER_CORPSES_SQL;
+    if (idx == 1) return DEFAULT_RENDER_LIVING_AGENTS_SQL;
+    if (idx == 2) return DEFAULT_RENDER_CHAT_SQL;
+    return "";
+}
+int replay_get_default_render_query_interpolate(int idx) { return idx == 1; }
+int replay_get_default_render_query_shape(int idx) { (void)idx; return 0; }
+
+/* The @KIND nato_symbol sample/template (sql/sample_render_nato_symbols.sql) -
+ * deliberately a SEPARATE getter from the defaults above, not a 4th default
+ * index: it's not part of the initial list a fresh load seeds (a user who
+ * never opens the Rendering Queries panel sees zero visual change - see that
+ * .sql file's own header comment), only offered as a pre-filled template
+ * when the panel's Kind control is switched to nato_symbol on an otherwise-
+ * untouched new query (main.js's updateRenderQueryField). */
+const char *replay_get_sample_nato_symbol_sql(void) { return SAMPLE_RENDER_NATO_SYMBOLS_SQL; }
+
+/* Seeds slots 0/1 with the compiled-in default queries (corpses,
+ * living_agents) via the exact same replay_render_query_configure() path JS
+ * uses, so a fresh load renders correctly even before main.js's Rendering
+ * Queries panel ever pushes anything of its own. Called once per load, from
+ * replay_finish_load/replay_finish_load_battle_file - never from
+ * build_frame_at_time, so a user who clears the list to zero queries stays
+ * cleared for the rest of the session, exactly like generator-script
+ * customization already persists until an explicit reset elsewhere in this
+ * codebase. A harmless trial-prepare failure here ("b" isn't attached yet
+ * on a brand new load - replay_ensure_db_view(2) only runs inside
+ * build_frame_at_time, on the first real tick change) self-heals on the
+ * very first real frame, same as any other configure-before-first-frame
+ * call would. */
+static void seed_default_render_queries(void) {
+    size_t corpses_len = strlen(DEFAULT_RENDER_CORPSES_SQL);
+    memcpy(g_render_query_text_buf, DEFAULT_RENDER_CORPSES_SQL,
+           corpses_len < RENDER_QUERY_TEXT_BUF_SIZE ? corpses_len + 1 : RENDER_QUERY_TEXT_BUF_SIZE);
+    replay_render_query_configure(0, (int)corpses_len, /*interpolate=*/0, /*shape=*/0, /*enabled=*/1, /*cacheMode=*/RENDER_CACHE_TICK);
+
+    size_t living_len = strlen(DEFAULT_RENDER_LIVING_AGENTS_SQL);
+    memcpy(g_render_query_text_buf, DEFAULT_RENDER_LIVING_AGENTS_SQL,
+           living_len < RENDER_QUERY_TEXT_BUF_SIZE ? living_len + 1 : RENDER_QUERY_TEXT_BUF_SIZE);
+    replay_render_query_configure(1, (int)living_len, /*interpolate=*/1, /*shape=*/0, /*enabled=*/1, /*cacheMode=*/RENDER_CACHE_TICK);
+
+    replay_render_query_set_count(2);
+}
+
+static double g_relative_time = 0.0;
+static sqlite3_int64 g_current_tick_id = -1; /* tickA of the most recent build_frame_at_time() call - backs CURRENT_TICK() (the SQL variable function) and replay_get_current_tick_id() */
+static sqlite3_int64 g_current_tick_b_id = -1; /* tickB of the most recent build_frame_at_time() call - backs CURRENT_TICK_B(), read both by main.js's own nato_symbol tickB query (a JS-only kind - see sqlfn_current_tick_b's own comment) and by build_query_text_for_slot's C-side textual rewrite for @KIND=dots interpolation - the same technique, used on both sides of the JS/C boundary for the two different render surfaces */
+
 int replay_get_active_match_index(void) { return g_active_match_index; }
 double replay_get_relative_time(void) { return g_relative_time; }
 /* Exposed so main.js can gate chat re-querying on "did the tick actually
@@ -724,26 +1217,23 @@ static float fetch_positions(sqlite3_int64 tick_id, float *out_x, float *out_y, 
 static float g_pos_a_x[MAX_AGENT_SLOTS], g_pos_a_y[MAX_AGENT_SLOTS];
 static float g_pos_b_x[MAX_AGENT_SLOTS], g_pos_b_y[MAX_AGENT_SLOTS];
 static unsigned char g_pos_a_present[MAX_AGENT_SLOTS], g_pos_b_present[MAX_AGENT_SLOTS];
-/* Full roster snapshot at tickA - same reasoning as corpse_count_at_a above,
- * for the same root cause: the tickB lookahead resync below can overwrite
- * is_human/team/active for any agent_id that gets a NEW spawn event exactly
- * at tickB (e.g. a human's slot reused for a bot in the next match, right at
- * a match-boundary tick). The display loop must classify each agent using
- * its tickA state - what's actually being shown - not tickB's. Found the
- * same way as the corpse bug: ground_truth.py + verify_against_truth.html
- * caught a real file where agent_id 718 was a valid human unit at tickA but
- * got excluded because it respawned as a bot at tickB, right at a
- * match-boundary faction_switch. spawn_event_id is snapshotted separately
- * (not folded into this struct) because it's used differently: compared
- * against g_roster's CURRENT (post-tickB) value on purpose, to detect
- * whether a respawn happened in the A-B interpolation window at all. */
-static unsigned char g_snap_a_active[MAX_AGENT_SLOTS];
-static unsigned char g_snap_a_is_human[MAX_AGENT_SLOTS];
-static signed char g_snap_a_team[MAX_AGENT_SLOTS];
-static sqlite3_int64 g_snap_a_spawn[MAX_AGENT_SLOTS];
+
+/* Phase 6: the same tickA/tickB blend fraction blend_render_slot() already
+ * uses for @KIND=dots, exposed read-only so main.js's nato_symbol dom-overlay
+ * (which never reaches this C engine at all - a JS-only kind, see this
+ * section's own header comment) can blend ITS OWN tickA/tickB row pairs
+ * every RAF with the exact same fraction, instead of re-deriving it from the
+ * tick-time table client-side (which main.js doesn't otherwise need to keep
+ * around at all). */
+static float g_last_alpha = 0.0f;
+float replay_get_last_alpha(void) { return g_last_alpha; }
+
+/* Gates build_frame_at_time's replay_ensure_db_view(2) call to real tick
+ * changes only - see that call site's own comment. */
+static sqlite3_int64 g_battledb_synced_tick_id = -1;
 
 static void build_frame_at_time(double t) {
-    if (g_tick_count == 0) { g_frame_count = 0; return; }
+    if (g_tick_count == 0) { for (int s = 0; s < g_render_query_count; s++) g_render_slots[s].out_count = 0; return; }
     int idxA = find_tick_index_for_time(t);
     int idxB = (idxA + 1 < g_tick_count) ? idxA + 1 : idxA;
     sqlite3_int64 tickA_id = g_ticks[idxA].id;
@@ -755,33 +1245,9 @@ static void build_frame_at_time(double t) {
         if (alpha < 0.0f) alpha = 0.0f;
         if (alpha > 1.0f) alpha = 1.0f;
     }
+    g_last_alpha = alpha;
 
     resync_roster_to(tickA_id);
-    /* Corpses are cumulative GLOBAL state (unlike positions, which get their
-     * own separate a/b snapshots below) - the lookahead resync to tickB just
-     * below exists purely to fetch tickB's positions for interpolation, but
-     * it also advances the roster/corpse state through tickB's kill events.
-     * Snapshotting the count here, before that lookahead runs, is what keeps
-     * this frame's displayed corpses scoped to tickA (what's actually being
-     * shown) instead of leaking in tickB's (one tick in the future). Found
-     * via ground_truth.py + verify_against_truth.html: corpse counts were
-     * consistently over by however many kills landed in exactly tickB. Living
-     * units don't need this same guard - they're already gated on
-     * g_pos_a_present, which a tickB-only spawn naturally fails. The
-     * underlying g_corpses[]/g_corpse_count keep growing past this snapshot
-     * (correct - next frame's incremental resync picks up right where this
-     * left off), only what gets EMITTED this frame is capped. */
-    int corpse_count_at_a = g_corpse_count;
-
-    memset(g_snap_a_spawn, 0xFF, sizeof(g_snap_a_spawn)); /* -1 = "no snapshot" */
-    memset(g_snap_a_active, 0, sizeof(g_snap_a_active));
-    for (int i = 0; i < MAX_AGENT_SLOTS; i++) {
-        if (!g_roster[i].active) continue;
-        g_snap_a_spawn[i] = g_roster[i].spawn_event_id;
-        g_snap_a_active[i] = 1;
-        g_snap_a_is_human[i] = g_roster[i].is_human;
-        g_snap_a_team[i] = g_roster[i].team;
-    }
 
     memset(g_pos_a_present, 0, sizeof(g_pos_a_present));
     memset(g_pos_b_present, 0, sizeof(g_pos_b_present));
@@ -790,35 +1256,36 @@ static void build_frame_at_time(double t) {
     resync_roster_to(tickB_id); /* cheap: incremental from tickA, already synced */
     fetch_positions(tickB_id, g_pos_b_x, g_pos_b_y, g_pos_b_present);
 
-    ensure_frame_buffer_capacity(g_corpse_count + MAX_AGENT_SLOTS); /* corpses (unbounded) + every living slot, worst case */
-
-    int out = 0;
-    /* corpses first so they're drawn first - main.c's renderer paints in
-     * buffer order with no depth test, so whatever's pushed first ends up
-     * underneath. Living units come after so they're always on top of any
-     * corpse standing on the same spot. */
-    for (int i = 0; i < corpse_count_at_a; i++) {
-        g_frame_buffer[out * 3 + 0] = g_corpses[i].x;
-        g_frame_buffer[out * 3 + 1] = g_corpses[i].y;
-        g_frame_buffer[out * 3 + 2] = (g_corpses[i].team == 0) ? 2.0f : (g_corpses[i].team == 1) ? 3.0f : 4.0f;
-        out++;
+    // Ensures "b" (the arbitrary, user-editable Battle DB schema - see
+    // replay_export.c's export_create_battledb_schema and
+    // canonical_roster_history.sql/canonical_corpses.sql's own comments) is
+    // attached and populated for the active battle before the render
+    // queries below run - self-healing, same role sync_frame_state_tables
+    // used to play for the now-removed rb schema. Gated on tickA_id
+    // actually changing, NOT called every RAF: build_frame_at_time runs on
+    // every RAF-driven 'frame' request (interpolation alpha needs fresh
+    // eval every frame), and replay_ensure_db_view's own cache-key check
+    // hashes the current derive SQL text on every call - real, avoidable
+    // per-frame cost if this ran unconditionally. Ignored return value:
+    // "b" not ready this frame just means the render queries below read 0
+    // rows (main.agent_states itself is untouched either way) - self-heals
+    // the next real tick change, exactly like the old sync always did.
+    if (tickA_id != g_battledb_synced_tick_id) {
+        g_battledb_synced_tick_id = tickA_id;
+        replay_ensure_db_view(2);
     }
-    for (int agent_id = 0; agent_id < MAX_AGENT_SLOTS; agent_id++) {
-        if (!g_snap_a_active[agent_id] || !g_snap_a_is_human[agent_id]) continue;
-        if (!g_pos_a_present[agent_id]) continue;
+    g_current_tick_id = tickA_id; /* backs CURRENT_TICK() and replay_get_current_tick_id() - set before the render queries below in case a future custom query references it */
+    g_current_tick_b_id = tickB_id; /* backs CURRENT_TICK_B() - see this section's own header comment above g_last_alpha */
 
-        float x = g_pos_a_x[agent_id], y = g_pos_a_y[agent_id];
-        if (g_pos_b_present[agent_id] && g_snap_a_spawn[agent_id] == g_roster[agent_id].spawn_event_id) {
-            x = x + (g_pos_b_x[agent_id] - x) * alpha;
-            y = y + (g_pos_b_y[agent_id] - y) * alpha;
-        }
-        g_frame_buffer[out * 3 + 0] = x;
-        g_frame_buffer[out * 3 + 1] = y;
-        g_frame_buffer[out * 3 + 2] = (float)g_snap_a_team[agent_id]; /* -1, 0, or 1 - tickA's team, not tickB's */
-        out++;
+    /* SQL-driven, JS-configured rendering-query list - see this section's
+     * own header comment above (ensure_render_query_rows/blend_render_slot/
+     * replay_render_query_configure). Slot order IS draw order - list order
+     * is draw order, by construction (main.js resubmits slots 0..N-1 in the
+     * user's own list order every time it changes). */
+    for (int s = 0; s < g_render_query_count; s++) {
+        ensure_render_query_rows(s, tickA_id);
+        blend_render_slot(s, alpha);
     }
-    g_frame_count = out;
-    g_current_tick_id = tickA_id; /* backs CURRENT_TICK() and replay_get_current_tick_id() */
 
     g_relative_time = 0.0;
     if (g_active_match_index >= 0) g_relative_time = t - g_matches[g_active_match_index].start_time;
@@ -870,6 +1337,21 @@ static int load_tick_index(void) {
     return 0;
 }
 
+/* binary search for a tick_id's position in g_ticks[] - used by
+ * replay_finish_load_battle_file() to resolve a MatchInfo's start/end times
+ * from the tick_ids replay_meta stores (see below); the boundary-detection
+ * path (scan_matches_via_sql) gets its own times straight from the SQL
+ * result set instead, see sql/default_boundary_detection.sql. */
+static int tick_index_for_id(sqlite3_int64 tick_id) {
+    int lo = 0, hi = g_tick_count - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (g_ticks[mid].id == tick_id) return mid;
+        if (g_ticks[mid].id < tick_id) lo = mid + 1; else hi = mid - 1;
+    }
+    return lo < g_tick_count ? lo : g_tick_count - 1;
+}
+
 /* mirrors main.js's getMatchStateAtTick: latest map_switch/faction_switch
  * at or before a given tick. */
 static void resolve_match_meta(sqlite3_int64 tick_id, int *scene_no, char *faction_text, int faction_text_size) {
@@ -903,69 +1385,130 @@ static void resolve_match_meta(sqlite3_int64 tick_id, int *scene_no, char *facti
     }
 }
 
-/* port of main.js's processDatabaseAndCompileMatches boundary segmentation:
- * scan map/score/faction_switch events, merge boundaries within 15 ticks of
- * each other, skip the first 5 ticks (initial state markers), require a
- * >=10 tick gap for a match, >=5 ticks for the tail segment. */
-static int tick_index_for_id(sqlite3_int64 tick_id) {
-    int lo = 0, hi = g_tick_count - 1;
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        if (g_ticks[mid].id == tick_id) return mid;
-        if (g_ticks[mid].id < tick_id) lo = mid + 1; else hi = mid - 1;
-    }
-    return lo < g_tick_count ? lo : g_tick_count - 1;
-}
+/* SQL-driven battle-boundary detection - runs the user-modifiable
+ * DEFAULT_BOUNDARY_DETECTION_SQL (sql/default_boundary_detection.sql, a
+ * faithful port of this project's original hardcoded C heuristic, itself a
+ * port of main.js's now-removed processDatabaseAndCompileMatches - or
+ * whatever custom text has replaced it, see the boundary-detection
+ * generator-script slot, mirroring replay_export.c's r/b DbViewState
+ * pattern) and populates g_matches[]/g_nonbattle_spans[] from its result
+ * rows instead of walking boundary_indices[]/merged[] in C.
+ *
+ * Verified against every fixture under testdata/replays_batch/ before this
+ * replaced the real call sites: a standalone Python port of the original C
+ * heuristic diffed against the raw SQL text (all 24 fixtures matched), then
+ * end-to-end through this exact function in a real browser session
+ * (23/24 byte-identical to the legacy g_matches[] the old algorithm
+ * produced). The one exception, replayLog_2026-08-01_21-12-29.sqlite (20
+ * real detected battles), is a DELIBERATE divergence, not a bug: see
+ * sql/default_boundary_detection.sql's own comment on the MAX_MATCHES cap -
+ * the legacy algorithm's cap check stopped it from even considering
+ * boundaries past the 15th accepted match, so its tail-segment step merged
+ * everything after that into one oversized final match (2645 ticks vs. a
+ * normal few hundred). This function truncates to the true first
+ * MAX_MATCHES real matches in chronological order instead. See the
+ * boundary-detection section of ui_behavior_tests.js for the standing
+ * regression coverage of both the normal-case parity and this documented
+ * exception. */
+typedef struct BoundarySpanRow {
+    sqlite3_int64 start_tick_id, end_tick_id;
+    double start_time, end_time;
+    int is_battle;
+} BoundarySpanRow;
 
-static int scan_matches(void) {
+static int scan_matches_via_sql(void) {
     sqlite3_stmt *stmt = 0;
-    if (sqlite3_prepare_v2(g_db,
-        "SELECT DISTINCT e.tick_id FROM events e "
-        "WHERE e.event_type IN ('map_switch','score_switch','faction_switch') ORDER BY e.tick_id ASC",
-        -1, &stmt, 0) != SQLITE_OK) return -1;
+    const char *sql = DEFAULT_BOUNDARY_DETECTION_SQL;
+    if (sqlite3_prepare_v2(g_db, sql, -1, &stmt, 0) != SQLITE_OK) { set_error(sqlite3_errmsg(g_db)); return -1; }
 
-    int boundary_indices[256];
-    int boundary_count = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW && boundary_count < 256) {
-        sqlite3_int64 tick_id = sqlite3_column_int64(stmt, 0);
-        boundary_indices[boundary_count++] = tick_index_for_id(tick_id);
-    }
-    sqlite3_finalize(stmt);
-
-    int merged[256], merged_count = 0;
-    for (int i = 0; i < boundary_count; i++) {
-        int idx = boundary_indices[i];
-        if (idx < 5) continue;
-        if (merged_count == 0 || idx - merged[merged_count - 1] > 15) {
-            merged[merged_count++] = idx;
+    /* Phase 1: fully drain and finalize this statement into a plain array
+     * BEFORE calling resolve_match_meta below - resolve_match_meta prepares
+     * its own statements against g_db, and this query is a multi-CTE
+     * WITH RECURSIVE (temp b-trees for the fold state) that must not have
+     * other statements interleaved mid-step. Confirmed directly: calling
+     * resolve_match_meta from inside this loop (interleaved with sqlite3_step
+     * on `stmt`) made sqlite3_step intermittently fail on 2 of 24 real
+     * fixtures - the original C heuristic this replaced avoided this same
+     * trap by finalizing its own boundary-tick statement before its
+     * merge/segmentation loop ran; this mirrors that same
+     * collect-then-process shape. */
+    BoundarySpanRow rows[MAX_MATCHES + MAX_NONBATTLE_SPANS];
+    int row_count = 0;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (row_count < (int)(sizeof(rows) / sizeof(rows[0]))) {
+            BoundarySpanRow *r = &rows[row_count++];
+            r->start_tick_id = sqlite3_column_int64(stmt, 0);
+            r->end_tick_id = sqlite3_column_int64(stmt, 1);
+            r->start_time = sqlite3_column_double(stmt, 2);
+            r->end_time = sqlite3_column_double(stmt, 3);
+            r->is_battle = sqlite3_column_int(stmt, 4);
         }
     }
+    if (rc != SQLITE_DONE) set_error(sqlite3_errmsg(g_db));
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return -1;
 
+    /* Phase 2: stmt is gone now - safe to call resolve_match_meta (its own
+     * independent prepare/step/finalize cycles) per accepted match. */
     g_match_count = 0;
-    int start_idx = 0;
-    for (int i = 0; i < merged_count && g_match_count < MAX_MATCHES - 1; i++) {
-        int end_idx = merged[i];
-        if (end_idx - start_idx >= 10) {
+    g_nonbattle_span_count = 0;
+    for (int i = 0; i < row_count; i++) {
+        BoundarySpanRow *r = &rows[i];
+        if (r->is_battle) {
+            if (g_match_count >= MAX_MATCHES) continue; /* see this function's own header comment on the one fixture this cap affects */
             MatchInfo *m = &g_matches[g_match_count];
-            m->start_tick_id = g_ticks[start_idx].id;
-            m->end_tick_id = g_ticks[end_idx].id;
-            m->start_time = g_ticks[start_idx].time;
-            m->end_time = g_ticks[end_idx].time;
+            m->start_tick_id = r->start_tick_id;
+            m->end_tick_id = r->end_tick_id;
+            m->start_time = r->start_time;
+            m->end_time = r->end_time;
             resolve_match_meta(m->start_tick_id, &m->scene_no, m->faction_text, sizeof(m->faction_text));
             g_match_count++;
-            start_idx = end_idx + 1;
+        } else {
+            if (g_nonbattle_span_count >= MAX_NONBATTLE_SPANS) continue;
+            NonBattleSpan *s = &g_nonbattle_spans[g_nonbattle_span_count];
+            s->start_tick_id = r->start_tick_id;
+            s->end_tick_id = r->end_tick_id;
+            g_nonbattle_span_count++;
         }
     }
-    if (g_tick_count - 1 - start_idx >= 5 && g_match_count < MAX_MATCHES) {
-        MatchInfo *m = &g_matches[g_match_count];
-        m->start_tick_id = g_ticks[start_idx].id;
-        m->end_tick_id = g_ticks[g_tick_count - 1].id;
-        m->start_time = g_ticks[start_idx].time;
-        m->end_time = g_ticks[g_tick_count - 1].time;
-        resolve_match_meta(m->start_tick_id, &m->scene_no, m->faction_text, sizeof(m->faction_text));
-        g_match_count++;
-    }
     return 0;
+}
+
+/* Full "the database changed out from under us, forget every derived
+ * replay-engine cache and rebuild lazily as before" reset - used after a
+ * checkpoint ROLLBACK TO (sql_checkpoint_revert, sql_terminal.c), since an
+ * arbitrary revert can touch anything: agent positions, tick times, match-
+ * boundary events, roster spawns/kills. Rather than trying to patch each
+ * downstream cache surgically, this tears all of them down and lets the
+ * existing self-healing/lazy-rebuild machinery already used everywhere else
+ * in this file (replay_ensure_battle_ready, resync_roster_to) redo the real
+ * work on next access, against the now-current data - the same philosophy
+ * as a fresh load, just without re-reading the tick/index-creation SQL that
+ * never needed to change. */
+void replay_invalidate_caches_after_revert(void) {
+    replay_detach_generator_views(); // r/b/rb are stale relative to a changed main schema too
+    for (int i = 0; i < g_match_count; i++) replay_evict_battle(i); // finalize statements, drop per-battle indexes
+    memset(g_bounds_known, 0, sizeof(g_bounds_known)); // rowid bounds may have shifted, not just row content
+    g_roster_synced_tick_id = (sqlite3_int64)0x7FFFFFFFFFFFFFFFLL; // forces a full roster rebuild on the next resync, any direction
+    // "b" was just detached above (stale content, possibly a table that no
+    // longer even exists until the next tick change re-attaches it fresh) -
+    // without this reset, a revert that lands back on the SAME tickA_id it
+    // was already "synced" for would wrongly skip re-syncing (sees no tick
+    // change) and read stale/nonexistent "b" tables.
+    g_battledb_synced_tick_id = -1;
+    g_active_match_index = -1;
+    free(g_ticks); g_ticks = 0; g_tick_count = 0;
+    load_tick_index();
+    scan_matches_via_sql();
+    // RENDER_CACHE_NONE slots key their cache on battle index alone (see
+    // ensure_render_query_rows), which a revert can defeat: it can change a
+    // battle's own roster/kills/positions without changing WHICH battle
+    // contains the current tick, so that cache key alone wouldn't notice.
+    // RENDER_CACHE_TICK slots would self-heal anyway (g_battledb_synced_tick_id
+    // reset above forces a real tick resync), but resetting every slot here
+    // uniformly is simpler than reasoning about which modes strictly need it.
+    for (int i = 0; i < g_render_query_count; i++) g_render_slots[i].built_for_tick_id = -1;
 }
 
 /* ---- SQL variable functions (SQL terminal "VARIABLES" feature) ----------
@@ -989,6 +1532,16 @@ static void sqlfn_current_tick(sqlite3_context *ctx, int argc, sqlite3_value **a
 static void sqlfn_current_time(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     (void)argc; (void)argv;
     sqlite3_result_double(ctx, g_relative_time);
+}
+/* See g_current_tick_b_id's own comment - lets a JS-only interpolatable
+ * rendering query (nato_symbol) fetch its "tickB" row set by literally
+ * re-running its own text with CURRENT_TICK() swapped for CURRENT_TICK_B()
+ * (main.js's buildNatoSymbolTickBQuery), rather than needing a dedicated
+ * frame_state_b-style table the way @KIND=dots has. */
+static void sqlfn_current_tick_b(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc; (void)argv;
+    if (g_current_tick_b_id < 0) { sqlite3_result_null(ctx); return; }
+    sqlite3_result_int64(ctx, g_current_tick_b_id);
 }
 static void sqlfn_current_battle(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
     (void)argc; (void)argv;
@@ -1045,6 +1598,7 @@ typedef void (*sql_scalar_fn)(sqlite3_context *, int, sqlite3_value **);
 static int register_sql_variable_functions(void) {
     static const struct { const char *name; sql_scalar_fn fn; } vars[] = {
         { "CURRENT_TICK",              sqlfn_current_tick },
+        { "CURRENT_TICK_B",            sqlfn_current_tick_b },
         { "CURRENT_TIME",              sqlfn_current_time },
         { "CURRENT_BATTLE",            sqlfn_current_battle },
         { "CURRENT_BATTLE_TICK_START", sqlfn_current_battle_tick_start },
@@ -1077,7 +1631,36 @@ static int register_sql_variable_functions(void) {
 static int g_data_generation = 0;
 int replay_get_data_generation(void) { return g_data_generation; }
 static void on_row_changed(void *pArg, int op, const char *zDb, const char *zTable, sqlite3_int64 rowid) {
-    (void)pArg; (void)op; (void)zDb; (void)zTable; (void)rowid;
+    (void)pArg; (void)op; (void)rowid; (void)zTable;
+    // Every write to the "b" schema is this engine's OWN derived output
+    // (replay_export.c's attach_battledb_view/b_cache_compute populating
+    // whatever arbitrary tables the derive script defines - roster_history,
+    // corpses, or anything a user's own edited script adds), never an
+    // independent "the user's SOURCE data changed" event this generation
+    // counter exists to detect - "b" is always computed FROM main, so a
+    // write to it can't be a cause, only an effect. Excluding the whole
+    // schema by zDb (rather than, say, temporarily unregistering the hook
+    // around those writes, or matching specific table names - not viable
+    // now that "b"'s schema is arbitrary/user-editable) keeps this the one
+    // place that decides what counts, instead of every writer needing to
+    // know to suppress it. Also matters for correctness beyond just "b"
+    // itself: without this, populating "b" would bump the counter and make
+    // "r"'s own DbViewState.built_at_generation look stale too, forcing an
+    // unnecessary rebuild of something nothing actually changed.
+    //
+    // The same reasoning extends to every "bcN" battle.db cache slot
+    // (replay_export.c's bc_compute/bc_evict, one attached schema per
+    // MAX_MATCHES index, named "bc0".."bc15" via bc_schema_name) - confirmed
+    // via a real, hand-hit regression: background summary pre-warming for a
+    // battle OTHER than the active one derives straight into its own bcN
+    // schema (never into "b" - see bc_compute's own comment on why), but
+    // without this exclusion those writes still bumped g_data_generation,
+    // so a prewarm cycle landing between "select main" and "re-select
+    // replay" in the SQL terminal made "r"'s cache look stale and forced a
+    // pointless rebuild even though nothing about "r" (or "main", the
+    // source data) had actually changed. No attached schema besides these
+    // bcN slots starts with "bc", so a prefix check is unambiguous.
+    if (zDb && (strcmp(zDb, "b") == 0 || (zDb[0] == 'b' && zDb[1] == 'c'))) return;
     g_data_generation++;
 }
 
@@ -1087,7 +1670,7 @@ static void on_row_changed(void *pArg, int op, const char *zDb, const char *zTab
  * main.db slot g_load_file just finished streaming into, need the same
  * pragmas/indexes/tick-index/prepared-statements, and only
  * diverge on how g_matches[]/g_match_count get populated afterward
- * (scan_matches()'s boundary-event heuristic vs. reading replay.db's own
+ * (scan_matches_via_sql()'s boundary-detection SQL vs. reading replay.db's own
  * replay_meta table directly). Returns 0 on success, matching the negative
  * error-code convention the two callers already use. */
 static int common_finish_load_setup(void) {
@@ -1192,7 +1775,9 @@ static int common_finish_load_setup(void) {
 int replay_finish_load(void) {
     int rc = common_finish_load_setup();
     if (rc != 0) return rc;
-    if (scan_matches() != 0) return -5;
+    if (scan_matches_via_sql() != 0) return -5;
+    if (sql_checkpoint_init_baseline() != 0) return -6; /* "checkpoint #0 = initial state" - always exists from here on */
+    seed_default_render_queries();
     return g_match_count;
 }
 
@@ -1200,7 +1785,7 @@ int replay_finish_load(void) {
  * streamed in via the SAME replay_begin_load()/replay_feed_chunk() calls
  * the full-source path uses (it's still just bytes landing in the OPFS
  * main.db slot) - only the "how do we know what the battle boundaries are"
- * step differs: instead of scan_matches()'s boundary-event heuristic (which
+ * step differs: instead of scan_matches_via_sql()'s boundary-detection SQL (which
  * needs the FULL multi-battle event history to find map/score/faction
  * switches), this reads the single row replay_export.c wrote into
  * replay_meta at export time. g_match_count is always exactly 1 here - an
@@ -1231,6 +1816,8 @@ int replay_finish_load_battle_file(void) {
     m->end_time = g_ticks[tick_index_for_id(end_tick_id)].time;
     resolve_match_meta(m->start_tick_id, &m->scene_no, m->faction_text, sizeof(m->faction_text));
 
+    if (sql_checkpoint_init_baseline() != 0) return -12; /* "checkpoint #0 = initial state" - always exists from here on */
+    seed_default_render_queries();
     return g_match_count;
 }
 

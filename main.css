@@ -29,6 +29,38 @@ canvas {
     top: 0; left: 9px; width: 2px; height: 20px;
 }
 
+/* NATO symbol dom-overlay (Phase 6) - absolutely positioned over the canvas,
+   below every .ui-panel (z-index 10) but above the canvas/crosshair, exactly
+   like the plan's own "z-indexed between the canvas and the UI panels"
+   requirement. pointer-events:none so it never intercepts WASD/drag-pan/
+   Ctrl+Scroll handling already wired to the canvas underneath it. */
+#map-symbol-layer {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    pointer-events: none;
+    z-index: 6;
+    overflow: visible;
+}
+.nato-symbol-frame {
+    fill: none;
+    stroke-width: 2;
+}
+.nato-symbol-glyph {
+    fill: none;
+    stroke-width: 1.5;
+}
+.nato-symbol-amplifier {
+    fill: none;
+    stroke-width: 1.5;
+}
+.nato-symbol-label {
+    font-family: 'Courier New', Courier, monospace;
+    font-size: 9px;
+    fill: #d0d0d0;
+    text-shadow: 0 0 3px #000;
+}
+
 /* Sleek Top Center Header */
 #app-header {
     position: absolute;
@@ -153,7 +185,9 @@ canvas {
 [data-panel-type="sql-terminal-panel"] button, [data-panel-type="sql-terminal-panel"] select,
 [data-panel-type="schema-explorer-panel"] button, [data-panel-type="schema-explorer-panel"] select,
 [data-panel-type="sql-data-viewer-panel"] button,
-[data-panel-type="generator-script-popout-panel"] button {
+[data-panel-type="generator-script-popout-panel"] button,
+[data-panel-type="debug-panel"] button,
+[data-panel-type="render-queries-panel"] button, [data-panel-type="render-queries-panel"] select {
     background: transparent;
     border: 1px solid rgba(0, 255, 0, 0.4);
     color: #00ff00;
@@ -166,7 +200,9 @@ canvas {
 
 [data-panel-type="sql-terminal-panel"] button:hover, [data-panel-type="schema-explorer-panel"] button:hover,
 [data-panel-type="sql-data-viewer-panel"] button:hover,
-[data-panel-type="generator-script-popout-panel"] button:hover {
+[data-panel-type="generator-script-popout-panel"] button:hover,
+[data-panel-type="debug-panel"] button:hover,
+[data-panel-type="render-queries-panel"] button:hover {
     background: rgba(0, 255, 0, 0.15);
 }
 
@@ -218,6 +254,14 @@ canvas {
     color: #888;
     font-size: 10px;
     min-height: 12px; /* reserves its own line so appearing/disappearing text doesn't shift the tree below it */
+}
+
+.schema-explorer-checkpoint-status {
+    margin-top: 2px;
+    margin-bottom: 4px;
+    color: #888;
+    font-size: 10px;
+    min-height: 12px;
 }
 
 .schema-explorer-status.is-error {
@@ -386,7 +430,47 @@ canvas {
    box model EXACTLY (padding/border-width/font/line-height) for the two
    texts to land on the same pixels. Text itself is invisible on the real
    textarea (color:transparent) - only its caret shows - so what's actually
-   visible is always the backdrop's colored spans underneath. */
+   visible is always the backdrop's colored spans underneath.
+
+   white-space:pre, deliberately NOT pre-wrap, on BOTH this backdrop and its
+   real textarea (see .sql-terminal-input below) - every one of this app's
+   backdrop/textarea pairs shares this. A plain <textarea> soft-wraps long
+   lines using the browser's own native text-layout engine; pre-wrap on a
+   <pre> soft-wraps using CSS's OWN separate line-breaking algorithm. These
+   are two genuinely different implementations, and nothing guarantees they
+   ever choose the exact same break point for a given line, even with
+   byte-identical padding/font/line-height/width - a real, hand-reproduced,
+   and initially misdiagnosed bug: colored text visibly drifting from the
+   real (invisible) cursor position specifically on long lines, no matter
+   how precisely the box model itself was tuned, because the box model was
+   never the thing disagreeing - the WRAP POINT was. Turning wrapping off
+   entirely in both elements removes the disagreement at its source rather
+   than trying to keep two independent line-breaking engines in perpetual
+   agreement: with nothing to wrap, there is no wrap point either engine
+   could compute differently. Long lines scroll horizontally instead (the
+   existing scrollLeft-mirroring in main.js's attachSqlHighlighting already
+   covers this, unchanged) - a real regression in wrapping-editor behavior,
+   traded deliberately for eliminating this entire bug class outright.
+
+   overflow:auto, NOT hidden, on this backdrop (see .sql-terminal-input
+   below) - every one of this app's backdrop/textarea pairs shares this too,
+   for a related but distinct reason. Once the real textarea can scroll
+   (needed for the no-wrap fix above), a native scrollbar it shows reserves
+   real width/height that the box's own content area loses - and a plain
+   overflow:hidden backdrop never loses that same space, since it can never
+   show a scrollbar of its own. That gap between the two boxes' actual
+   content-area size is a second, independent way for colored text to drift
+   from the real cursor, on top of the wrap-point issue above - worse in
+   Firefox's classic, space-reserving scrollbars than Chrome's often-overlay
+   ones. The fix is NOT to hide the real scrollbar (it must stay visible and
+   usable - do not reintroduce scrollbar-hiding CSS here); it's to give the
+   backdrop the same overflow:auto so it independently earns an identical
+   scrollbar reservation under the identical overflow condition, since both
+   elements always hold the same mirrored text in the same sized box. The
+   backdrop's own scrollbar is never actually seen or touchable - it sits at
+   z-index:0, directly underneath the real textarea's own scrollbar at
+   z-index:1 (same position, same size), and pointer-events:none already
+   blocks any interaction with it - only the box-model reservation matters. */
 .sql-terminal-editor-wrap {
     position: relative;
 }
@@ -401,9 +485,8 @@ canvas {
     font-family: inherit;
     font-size: 11px;
     line-height: 1.4;
-    white-space: pre-wrap;
-    word-wrap: break-word;
-    overflow: hidden; /* the real textarea owns scrolling - main.js mirrors scrollTop/scrollLeft onto this */
+    white-space: pre;
+    overflow: auto; /* NOT hidden - see this block's own comment above on why the backdrop must earn a matching scrollbar reservation, not just have scrolling hidden */
     color: #0f0;
     pointer-events: none;
     z-index: 0;
@@ -417,6 +500,8 @@ canvas {
     caret-color: #0f0;
     line-height: 1.4;
     padding: 4px;
+    white-space: pre; /* disables native soft-wrap - see .sql-terminal-highlight's own comment on why this must match the backdrop */
+    overflow: auto; /* both axes explicit, not just overflow-x - see .sql-terminal-highlight's own comment on why this must match the backdrop's own overflow */
 }
 
 /* Token colors: distinct HUES per category, not shades of one hue - the
@@ -582,6 +667,39 @@ canvas {
     margin-bottom: 3px;
 }
 
+/* Line-number gutter (task: "add line numbers to... the internal schema sql
+   editor itself") - a plain flex row sibling of .generator-script-editor-wrap,
+   NOT folded into the highlighting backdrop, so that backdrop's own
+   pixel-perfect box model (must match the real textarea exactly, see below)
+   never has to account for a variable-width number column. */
+.generator-script-editor-row {
+    display: flex;
+    align-items: stretch;
+}
+.generator-script-editor-row > .generator-script-editor-wrap {
+    flex: 1 1 auto;
+    min-width: 0; /* let the editor itself shrink instead of overflowing the row */
+}
+
+.generator-script-gutter {
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 4px 6px 4px 4px; /* top/bottom MUST match .generator-script-highlight's padding exactly, so line N here lands on the same row as line N of real text */
+    min-width: 20px;
+    box-sizing: border-box;
+    border: 1px solid rgba(0, 255, 0, 0.3);
+    border-right: none; /* the editor-wrap's own left border sits right next to this, reads as one continuous box */
+    background: #0a0a0a;
+    font-family: inherit;
+    font-size: 10px;
+    line-height: 1.4; /* MUST match .generator-script-highlight/.generator-script-textarea exactly */
+    text-align: right;
+    color: #4a7a4a;
+    white-space: pre;
+    overflow: hidden;
+    user-select: none;
+}
+
 /* Same backdrop-<pre>-behind-transparent-textarea technique as
    #sql-terminal-editor-wrap/#sql-terminal-highlight above, but class-based
    rather than ID-based: several generator-script editors (one per schema)
@@ -605,9 +723,8 @@ canvas {
     font-family: inherit;
     font-size: 10px;
     line-height: 1.4;
-    white-space: pre-wrap;
-    word-wrap: break-word;
-    overflow: hidden;
+    white-space: pre; /* deliberately NOT pre-wrap - see .sql-terminal-highlight's own comment on why */
+    overflow: auto; /* NOT hidden - see .sql-terminal-highlight's own comment on why the backdrop must earn a matching scrollbar reservation */
     color: #0f0;
     pointer-events: none;
     z-index: 0;
@@ -636,6 +753,8 @@ canvas {
     line-height: 1.4;
     padding: 4px;
     resize: vertical;
+    white-space: pre; /* disables native soft-wrap - see .sql-terminal-highlight's own comment on why this must match the backdrop */
+    overflow: auto; /* both axes explicit - see .sql-terminal-highlight's own comment on why this must match the backdrop's own overflow */
 }
 
 .generator-script-status {
@@ -648,6 +767,198 @@ canvas {
     color: #ff5555;
 }
 
+/* Rendering Queries panel - one .render-query-card per renderQueries entry
+   (main.js's buildRenderQueryCard). Editor row/gutter/highlight/textarea
+   mirror .generator-script-* above exactly (same backdrop-behind-
+   transparent-textarea technique, same box-model-must-match-exactly
+   constraint), just under their own class names since a card also carries
+   its own header/controls row the generator-script editor doesn't have. */
+/* width on the PANEL itself (matches [data-panel-type="sql-terminal-panel"]'s
+   own convention), not .panel-content - a fixed width there would fight
+   makeResizable()'s inline panel.style.width on drag-resize, pinning the
+   content at 420px regardless of how wide the user actually makes the
+   panel (confirmed as a real bug this way - the panel border moved but the
+   cards inside never did). Leaving .panel-content's width unset here lets
+   it stretch to fill the (resizable) panel by the same flex-column
+   default-stretch behavior every other panel already relies on. */
+[data-panel-type="render-queries-panel"] {
+    top: 20px;
+    right: 20px;
+    width: 460px;
+}
+
+.render-queries-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 6px;
+}
+
+.render-query-card {
+    padding: 6px;
+    border: 1px solid rgba(0, 255, 0, 0.15);
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.render-query-card.render-query-drop-target {
+    border-color: #0f0;
+}
+
+.render-query-card-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+}
+
+.render-query-drag-handle {
+    cursor: grab;
+    color: #888;
+    user-select: none;
+}
+
+.render-query-name {
+    flex: 1 1 auto;
+    min-width: 0;
+    background: #111;
+    border: 1px solid rgba(0, 255, 0, 0.3);
+    color: #0f0;
+    font-family: inherit;
+    font-size: 11px;
+    padding: 2px 4px;
+}
+
+.render-query-enabled-label {
+    font-size: 10px;
+    color: #ccc;
+    white-space: nowrap;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+}
+
+.render-query-delete-btn {
+    color: #ff5555;
+    font-size: 14px;
+    line-height: 1;
+    padding: 2px 6px;
+}
+
+.render-query-controls-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 4px;
+    font-size: 10px;
+}
+.render-query-controls-row select {
+    background-color: #111;
+    color: #0f0;
+    border: 1px solid rgba(0, 255, 0, 0.3);
+    font-family: inherit;
+    font-size: 10px;
+    /* appearance:none + hand-drawn arrow - same treatment as the SQL
+       Terminal/Schema Explorer's own selects (see that shared rule's own
+       comment on why background-color alone isn't enough: browsers draw
+       native OS widget chrome for a <select> regardless unless appearance
+       is explicitly stripped). Without this, these dropdowns showed the
+       browser's own native control chrome poking out from behind the
+       themed background - confirmed as a real, visible bug this way. */
+    appearance: none;
+    -webkit-appearance: none;
+    -moz-appearance: none;
+    padding: 2px 18px 2px 4px;
+    background-image: linear-gradient(45deg, transparent 50%, #00ff00 50%), linear-gradient(135deg, #00ff00 50%, transparent 50%);
+    background-position: calc(100% - 11px) center, calc(100% - 7px) center;
+    background-size: 5px 5px, 5px 5px;
+    background-repeat: no-repeat;
+}
+.render-query-controls-row label {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    color: #ccc;
+    white-space: nowrap;
+}
+
+.render-query-editor-row {
+    display: flex;
+    align-items: stretch;
+}
+.render-query-editor-row > .render-query-editor-wrap {
+    flex: 1 1 auto;
+    min-width: 0;
+}
+
+.render-query-gutter {
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 4px 6px 4px 4px;
+    min-width: 20px;
+    box-sizing: border-box;
+    border: 1px solid rgba(0, 255, 0, 0.3);
+    border-right: none;
+    background: #0a0a0a;
+    font-family: inherit;
+    font-size: 10px;
+    line-height: 1.4;
+    text-align: right;
+    color: #4a7a4a;
+    white-space: pre;
+    overflow: hidden;
+    user-select: none;
+}
+
+.render-query-editor-wrap {
+    position: relative;
+    background: #111;
+    border: 1px solid rgba(0, 255, 0, 0.3);
+}
+
+.render-query-highlight {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    margin: 0;
+    padding: 4px;
+    border: 1px solid transparent;
+    box-sizing: border-box;
+    font-family: inherit;
+    font-size: 10px;
+    line-height: 1.4;
+    white-space: pre; /* deliberately NOT pre-wrap - see .sql-terminal-highlight's own comment on why */
+    overflow: auto; /* NOT hidden - see .sql-terminal-highlight's own comment on why the backdrop must earn a matching scrollbar reservation */
+    color: #0f0;
+    pointer-events: none;
+    z-index: 0;
+}
+
+.render-query-textarea {
+    position: relative;
+    z-index: 1;
+    width: 100%;
+    box-sizing: border-box;
+    background: transparent; /* see .generator-script-textarea's comment - same rule applies */
+    color: transparent;
+    caret-color: #0f0;
+    border: 1px solid rgba(0, 255, 0, 0.3);
+    font-family: inherit;
+    font-size: 10px;
+    line-height: 1.4;
+    padding: 4px;
+    resize: vertical;
+    white-space: pre; /* disables native soft-wrap - see .sql-terminal-highlight's own comment on why this must match the backdrop */
+    overflow: auto; /* both axes explicit - see .sql-terminal-highlight's own comment on why this must match the backdrop's own overflow */
+}
+
+.render-query-status {
+    font-size: 10px;
+    color: #888;
+    margin-top: 3px;
+}
+.render-query-status.is-error {
+    color: #ff5555;
+}
+
 /* Pop-out generator script window: a genuinely separate, larger "proper text
    editor" layout, NOT the compact tree-embedded .generator-script-editor
    above reused verbatim. No buttons anywhere - the editor fills the whole
@@ -656,13 +967,15 @@ canvas {
    an Emacs-style minibuffer line pinned to the bottom instead of a toolbar.
    Still shares the exact same backdrop-<pre>-behind-transparent-textarea
    technique as the compact version - only the DOM/box layout differs. */
-[data-panel-type="generator-script-popout-panel"] {
+[data-panel-type="generator-script-popout-panel"],
+[data-panel-type="render-query-popout-panel"] {
     top: 20px;
     right: 20px;
     width: 640px;
 }
 
-[data-panel-type="generator-script-popout-panel"] .panel-content {
+[data-panel-type="generator-script-popout-panel"] .panel-content,
+[data-panel-type="render-query-popout-panel"] .panel-content {
     /* height, not just max-height: an editor area sized via height:100% below
        it (.panel-zoom-wrap/.generator-popout-root/-editor-wrap) needs a
        genuinely DEFINITE parent height to resolve that percentage against -
@@ -679,29 +992,60 @@ canvas {
 /* Same reasoning as .sql-terminal-content > .panel-zoom-wrap above: the flex
    column lives on the zoom wrap, not .panel-content itself, so Ctrl+Scroll
    zooming can never touch .panel-content's own resize/max-height box. */
-[data-panel-type="generator-script-popout-panel"] .panel-content > .panel-zoom-wrap {
+[data-panel-type="generator-script-popout-panel"] .panel-content > .panel-zoom-wrap,
+[data-panel-type="render-query-popout-panel"] .panel-content > .panel-zoom-wrap {
     display: flex;
     flex-direction: column;
     height: 100%;
 }
 
-.generator-popout-root {
+.generator-popout-root, .render-query-popout-root {
     display: flex;
     flex-direction: column;
     height: 100%;
 }
 
-.generator-popout-editor-wrap {
+/* Line-number gutter (task: "add line numbers to schema pop out editor...")
+   - a flex row wrapping the gutter + the existing backdrop/textarea pair,
+   taking over the flex:1 1 auto/min-height:0 role .generator-popout-editor-wrap
+   used to carry directly as a column-child of .generator-popout-root. */
+.generator-popout-editor-row, .render-query-popout-editor-row {
+    display: flex;
+    align-items: stretch;
+    flex: 1 1 auto;
+    min-height: 0; /* let flex actually shrink/grow with the window instead of overflowing it */
+}
+
+.generator-popout-gutter, .render-query-popout-gutter {
+    flex: 0 0 auto;
+    margin: 0;
+    padding: 8px 8px 8px 8px; /* MUST match .generator-popout-highlight's padding exactly, so line N here lands on the same row as line N of real text */
+    min-width: 28px;
+    box-sizing: border-box;
+    border: none;
+    border-right: 1px solid rgba(0, 255, 0, 0.2);
+    background: rgba(0, 0, 0, 0.35);
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.5; /* MUST match .generator-popout-highlight/.generator-popout-textarea exactly */
+    text-align: right;
+    color: #4a7a4a;
+    white-space: pre;
+    overflow: hidden;
+    user-select: none;
+}
+
+.generator-popout-editor-wrap, .render-query-popout-editor-wrap {
     position: relative;
     background: #111;
     flex: 1 1 auto;
-    min-height: 0; /* let flex actually shrink/grow with the window instead of overflowing it */
+    min-width: 0; /* let the editor itself shrink instead of overflowing the row */
 }
 
 /* Emacs-style minibuffer/echo area: a thin status+error line pinned to the
    bottom of the window - the ONLY chrome around the editor, replacing the
    old button toolbar entirely. */
-.generator-popout-minibuffer {
+.generator-popout-minibuffer, .render-query-popout-minibuffer {
     flex: 0 0 auto;
     font-size: 11px;
     color: #888;
@@ -713,11 +1057,11 @@ canvas {
     text-overflow: ellipsis;
 }
 
-.generator-popout-minibuffer.is-error {
+.generator-popout-minibuffer.is-error, .render-query-popout-minibuffer.is-error {
     color: #ff5555;
 }
 
-.generator-popout-highlight {
+.generator-popout-highlight, .render-query-popout-highlight {
     position: absolute;
     top: 0; left: 0; right: 0; bottom: 0;
     margin: 0;
@@ -727,15 +1071,14 @@ canvas {
     font-family: inherit;
     font-size: 13px;
     line-height: 1.5;
-    white-space: pre-wrap;
-    word-wrap: break-word;
-    overflow: hidden;
+    white-space: pre; /* deliberately NOT pre-wrap - see .sql-terminal-highlight's own comment on why */
+    overflow: auto; /* NOT hidden - see .sql-terminal-highlight's own comment on why the backdrop must earn a matching scrollbar reservation */
     color: #0f0;
     pointer-events: none;
     z-index: 0;
 }
 
-.generator-popout-textarea {
+.generator-popout-textarea, .render-query-popout-textarea {
     position: relative;
     z-index: 1;
     width: 100%;
@@ -750,6 +1093,8 @@ canvas {
     line-height: 1.5;
     padding: 8px;
     resize: none; /* window resize handles govern size, not the textarea's own handle */
+    white-space: pre; /* disables native soft-wrap - see .sql-terminal-highlight's own comment on why this must match the backdrop */
+    overflow: auto; /* both axes explicit - see .sql-terminal-highlight's own comment on why this must match the backdrop's own overflow */
 }
 
 [data-panel-type="sql-docs-panel"] {
@@ -815,6 +1160,20 @@ canvas {
    click. user-select:none also matters more now - without it, a fast drag
    would select the header's text underneath the cursor. */
 .panel-header {
+    /* position+z-index: the 'n'/'ne'/'nw' resize hit-zones (.resize-handle
+       below) straddle the panel's own top border (top:-4px, extending 4px
+       INTO the panel too) to get a real, grabbable edge with no visible
+       affordance at rest - and main.js's makeResizable() appends them to
+       the panel AFTER the header already exists, so with no z-index of its
+       own the header would just lose to them in DOM-order paint order
+       wherever they overlap. Confirmed as a real bug this way: hovering the
+       minimize/maximize/close icons showed the resize cursor and swallowed
+       clicks meant for them, not because the icons themselves lacked
+       cursor:pointer, but because an invisible resize handle was sitting
+       on top of them the whole time. z-index only takes effect on a
+       positioned element, hence position:relative here too. */
+    position: relative;
+    z-index: 2;
     padding: 8px 12px;
     background: rgba(20, 20, 20, 0.9);
     cursor: move;
@@ -837,6 +1196,14 @@ canvas {
     gap: 10px;
 }
 
+/* Explicit pointer, not left to inherit .panel-header's own cursor:move -
+   without this the minimize toggle showed the 4-way move cursor while
+   hovering it, same underlying "looks undraggable/unclickable" complaint
+   the resize-handle z-index fix above addresses for a different reason. */
+.toggle-icon {
+    cursor: pointer;
+}
+
 /* Close (x): hides the original singleton instance of a panel (same as
    unchecking its hamburger checkbox), or fully removes a cloned instance
    from the document (main.js's closePanelInstance). stopPropagation in the
@@ -852,6 +1219,46 @@ canvas {
 .panel-close-btn:hover {
     opacity: 1;
     color: #ff5555;
+}
+
+/* Maximize: a real drawn square (border-box, not a Unicode glyph like
+   toggle-icon's -/+ or close's x) - a glyph's actual rendered shape/size
+   varies by font/OS in a way a hand-drawn box never does, and "should be
+   square" is exactly the one property that has to hold reliably. Sits
+   between toggle-icon (minimize) and panel-close-btn (close), matching
+   every real OS window manager's left-to-right ordering. */
+.panel-maximize-btn {
+    display: inline-block;
+    box-sizing: border-box;
+    width: 10px;
+    height: 10px;
+    border: 1.5px solid currentColor;
+    cursor: pointer;
+    opacity: 0.7;
+}
+
+.panel-maximize-btn:hover {
+    opacity: 1;
+}
+
+.maximized .panel-maximize-btn {
+    /* Restore affordance: two overlapping squares, the standard "un-maximize"
+       icon - a second smaller square offset up-left of the first, drawn with
+       one extra pseudo-element rather than swapping to a different glyph. */
+    width: 8px;
+    height: 8px;
+    margin: 2px 0 0 2px;
+    position: relative;
+}
+.maximized .panel-maximize-btn::before {
+    content: '';
+    position: absolute;
+    box-sizing: border-box;
+    top: -3px; left: -3px;
+    width: 8px;
+    height: 8px;
+    border: 1.5px solid currentColor;
+    background: #050505; /* match .ui-panel's own background so the overlap reads as two distinct squares, not a see-through overlay */
 }
 
 .panel-content {
@@ -870,14 +1277,50 @@ canvas {
     max-height: 174px;
     overflow-y: auto;
     font-size: 11px;
-    transition: max-height 0.2s ease-out, padding 0.2s ease-out;
+    /* Deliberately NO transition on max-height/height here, and deliberately
+       no CSS-side max-height/height override for .minimized/.maximized
+       below either - main.js's toggleMinimize/toggleMaximize set this
+       element's min/max/height directly as plain inline styles, always, on
+       every transition, so there is exactly ONE mechanism deciding this
+       box's size (inline styles) rather than two (inline AND a competing
+       !important stylesheet rule) that could ever disagree with each
+       other. An animated transition would also reopen a timing hazard this
+       design avoids on purpose: state changes are synchronous, so
+       offsetHeight/getComputedStyle already reflect the true final size
+       the instant toggleMinimize/toggleMaximize return, in every browser,
+       with no in-between frame anything could observe or need to wait for. */
+}
+
+/* Maximized only: let .panel-content actually GROW to fill whatever's left
+   of the panel below the header, instead of just shrink-wrapping its own
+   content at whatever height main.js's applyContentForMode('maximized')
+   inline-sets (height:auto, max-height:none). This is deliberately a
+   SEPARATE property (flex-grow) from the height/max-height the comment
+   above already claims sole ownership of for .panel-content's own box size,
+   not a competing override of it - flex-grow only decides how EXTRA space
+   gets distributed among a flex row's children, so it composes with
+   height:auto (used as the flex-basis) rather than fighting it. Without
+   this, height:auto alone gives .panel-content no genuinely DEFINITE
+   height for a percentage-height descendant to resolve against (per spec -
+   confirmed as a real, hand-reported bug specifically for the pop-out
+   generator-script/rendering-query editor's height:100% chain, which left
+   its textarea not filling/resizing with a maximized window at all - see
+   .panel-content's own height:480px comment above, which already
+   identifies and fixes the identical problem for the un-maximized/resized
+   case the exact same way, just via an inline pixel height instead of flex
+   since maximized has no fixed pixel size to give it). min-height:0 lets it
+   actually shrink to fit (a flex item's default min-height is auto, i.e.
+   "never smaller than its content" - without this override a tall block of
+   text could force the panel past the screen instead of scrolling inside
+   its own overflow-y:auto box, which is exactly the box model this rule is
+   trying to preserve for every panel type, not just the pop-out editor). */
+.ui-panel.maximized > .panel-content {
+    flex: 1 1 auto;
+    min-height: 0;
 }
 
 .minimized .panel-content {
-    max-height: 0;
-    padding: 0 12px;
-    overflow: hidden;
-    border-top: none;
+    border-top: none; /* purely cosmetic, not size-related - main.js's toggleMinimize owns the actual collapse via inline min/max/height */
 }
 
 .minimized .panel-header {
@@ -1054,16 +1497,23 @@ canvas {
 
 /* Minimalist Overlays */
 .overlay {
-    position: absolute; 
-    top: 0; 
-    left: 0; 
-    width: 100%; 
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
     height: 100%;
     background: #0a0a0a;
-    display: flex; 
-    justify-content: center; 
+    display: flex;
+    justify-content: center;
     align-items: center;
-    z-index: 20; 
+    /* Was 20 - panelZIndexCounter (main.js) starts at 11 and climbs by 1 on
+       every single panel click for the rest of the session, so after only a
+       handful of clicks a panel's own z-index legitimately exceeds this,
+       letting it render OVER the "load a different replay" screen even
+       though it's fully opaque and meant to cover everything. This must
+       always win regardless of how high that counter has climbed - same
+       "must always be on top, no exceptions" reasoning as .autocomplete-list. */
+    z-index: 2147483000;
     color: #ffffff;
 }
 
