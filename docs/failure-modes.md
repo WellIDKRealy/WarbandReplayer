@@ -66,8 +66,8 @@ for malformed input; native differential tests feed it the same corruption corpu
 ## Validation strategy (consequence of measurements)
 - Load-time gate is O(1)/small: magic, page size, header page count vs file size, schema/column check, scans of the small tables
   (`ticks`, `events`, switches) for monotonicity/plausibility. A full `integrity_check` is NOT possible at load (1.1 GB = ~73 s quick_check).
-- The per-battle extraction pass reads every page of `agent_states` exactly once, so it doubles as the integrity pass for that
-  table: `SQLITE_CORRUPT` raised there is mapped to the battles whose rowid ranges touch the damaged page.
+- Extracting a battle reads exactly that battle's rowid range of `agent_states`, so extraction doubles as the integrity pass for those
+  rows: `SQLITE_CORRUPT` raised there is mapped to that battle (and any battle whose range touches the damaged page).
 - **Damage isolation:** a damaged battle is marked "damaged (rows lo..hi, reason)" and stays visible in the timeline; every
   other battle remains playable. One bad page never takes down the whole replay.
 - Real corpus has no naturally corrupted file (all 39 pass `quick_check`), so every FAULT test uses injected corruption.
